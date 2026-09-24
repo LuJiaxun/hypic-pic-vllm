@@ -9,6 +9,14 @@ The implementation is based on the official
 `vllm/vllm-openai:v0.22.1-cu129` container and the vLLM baseline commit
 `0decac0d96c42b49572498019f0a0e3600f50398`.
 
+## Relationship to the original HYPIC implementation
+
+The design is informed by the original
+[HYPIC implementation for SGLang](https://github.com/redai-studio/HYPIC).
+This repository is an independent vLLM implementation. It adapts the HYPIC
+PIC design to vLLM's scheduler, GPU worker, native KV pool, block table and
+attention metadata; it does not directly reuse the SGLang runtime code.
+
 ## What is implemented
 
 - PIC segment parsing and non-prefix lookup.
@@ -135,6 +143,12 @@ please treat the current implementation as experimental.
 
 本仓库是在 vLLM 0.22.1 基础上实现的 HYPIC PIC 研究版本，目标是为混合注意力
 模型提供非前缀 segment 复用能力，同时保持普通 vLLM 请求继续使用原生执行路径。
+
+本项目参考了
+[SGLang 版本的 HYPIC 实现](https://github.com/redai-studio/HYPIC)。
+当前仓库是独立的 vLLM 版本：将 HYPIC 的 PIC 设计适配到 vLLM 的 scheduler、
+GPU worker、native KV pool、block table 和 attention metadata，而不是直接复用
+SGLang 的运行时代码。
 
 ## 已实现能力
 

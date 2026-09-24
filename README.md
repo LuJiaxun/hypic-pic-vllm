@@ -7,6 +7,20 @@ models while keeping ordinary requests on the native vLLM execution path.
 中文：这是基于 vLLM 0.22.1 的 HYPIC PIC 研究实现，面向混合注意力模型提供
 非前缀 segment 复用，同时保持普通请求继续使用 vLLM 原生执行路径。
 
+## Relationship to the original HYPIC implementation
+
+The design is informed by the original
+[HYPIC implementation for SGLang](https://github.com/redai-studio/HYPIC).
+This repository is an independent vLLM implementation: the PIC ideas are
+adapted to vLLM's scheduler, GPU worker, native KV pool, block table and
+attention metadata rather than reusing the SGLang runtime code directly.
+
+中文：本项目的设计参考了
+[SGLang 版本的 HYPIC 实现](https://github.com/redai-studio/HYPIC)。
+这里不是直接复制 SGLang 代码，而是将 HYPIC 的 PIC 思路重新适配到 vLLM 的
+scheduler、GPU worker、native KV pool、block table 和 attention metadata，形成
+独立的 vLLM 版本实现。
+
 ## Highlights
 
 - Hybrid GDN/Mamba recurrent-state and convolution-tail transitions.
