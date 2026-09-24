@@ -4,7 +4,7 @@ An experimental research implementation of HYPIC PIC on top of vLLM 0.22.1.
 The project targets non-prefix segment reuse for hybrid-attention language
 models while keeping ordinary requests on the native vLLM execution path.
 
-中文：这是基于 vLLM 0.22.1 的 HYPIC PIC 研究实现，面向混合注意力模型提供
+这是基于 vLLM 0.22.1 的 HYPIC PIC 研究实现，面向混合注意力模型提供
 非前缀 segment 复用，同时保持普通请求继续使用 vLLM 原生执行路径。
 
 ## Relationship to the original HYPIC implementation
