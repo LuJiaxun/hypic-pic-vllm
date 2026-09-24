@@ -139,8 +139,6 @@ please treat the current implementation as experimental.
 
 ---
 
-# 中文说明
-
 本仓库是在 vLLM 0.22.1 基础上实现的 HYPIC PIC 研究版本，目标是为混合注意力
 模型提供非前缀 segment 复用能力，同时保持普通 vLLM 请求继续使用原生执行路径。
 
@@ -250,7 +248,7 @@ vllm serve /path/to/Qwen3.5-2B \
 ## 项目定位
 
 这是基于 vLLM 的个人研究分支，不是官方 vLLM 功能，也不会直接提交到 vLLM
-upstream。代码主要用于复现和研究 HYPIC PIC 的执行路径，当前版本仍属于实验性实现。
+上游仓库。代码主要用于复现和研究 HYPIC PIC 的执行路径，当前版本仍属于实验性实现。
 
 ## TODO
 

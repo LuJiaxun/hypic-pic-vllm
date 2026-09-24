@@ -4,9 +4,6 @@ An experimental research implementation of HYPIC PIC on top of vLLM 0.22.1.
 The project targets non-prefix segment reuse for hybrid-attention language
 models while keeping ordinary requests on the native vLLM execution path.
 
-这是基于 vLLM 0.22.1 的 HYPIC PIC 研究实现，面向混合注意力模型提供
-非前缀 segment 复用，同时保持普通请求继续使用 vLLM 原生执行路径。
-
 ## Relationship to the original HYPIC implementation
 
 The design is informed by the original
@@ -15,9 +12,12 @@ This repository is an independent vLLM implementation: the PIC ideas are
 adapted to vLLM's scheduler, GPU worker, native KV pool, block table and
 attention metadata rather than reusing the SGLang runtime code directly.
 
-中文：本项目的设计参考了
+这是基于 vLLM 0.22.1 的 HYPIC PIC 研究实现，面向混合注意力模型提供非前缀
+segment 复用，同时保持普通请求继续使用 vLLM 原生执行路径。
+
+本项目的设计参考了
 [SGLang 版本的 HYPIC 实现](https://github.com/redai-studio/HYPIC)。
-这里不是直接复制 SGLang 代码，而是将 HYPIC 的 PIC 思路重新适配到 vLLM 的
+本项目并非直接复制 SGLang 代码，而是将 HYPIC 的 PIC 思路重新适配到 vLLM 的
 scheduler、GPU worker、native KV pool、block table 和 attention metadata，形成
 独立的 vLLM 版本实现。
 
@@ -105,7 +105,7 @@ Example request metadata:
 - `vllm/v1/core/sched/scheduler.py`: scheduler-side lookup and metadata flow.
 - `tests/v1/pic/`: PIC unit and runtime tests.
 
-完整的中英双语说明、限制和更多使用细节见：[HYPIC.md](HYPIC.md)。
+完整的中英文说明、限制和更多使用细节见：[HYPIC.md](HYPIC.md)。
 
 ## Scope and limitations
 
