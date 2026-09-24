@@ -1,4 +1,17 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+> **HYPIC PIC research branch**
+>
+> This personal branch contains an experimental HYPIC PIC integration for
+> vLLM 0.22.1, including hybrid-state transition, non-prefix segment reuse,
+> native KV-slot mapping and mixed-request execution. See the
+> [bilingual HYPIC overview](HYPIC.md) for architecture, usage and validation
+> results.
+>
+> **HYPIC PIC 研究分支**：本个人分支包含基于 vLLM 0.22.1 的实验性 HYPIC PIC
+> 实现，涉及混合状态 transition、非前缀 segment 复用、原生 KV slot 映射和混合
+> 请求执行。架构、使用方法和验证结果请见[双语说明](HYPIC.md)。
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
