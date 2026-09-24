@@ -34,17 +34,15 @@ view.
 The primary validation model is Qwen3.5-2B in hybrid-attention, text-only mode,
 on a single GPU with eager execution.
 
-The latest locally validated Stage 10-C-6 results include:
+Representative local validation results include:
 
 | Check | Result |
 |---|---:|
 | PIC unit tests | 75 passed |
-| Stage 9-A-3 correctness regression | passed; max log-probability difference about `2.12e-5` |
+| Correctness regression | passed; max log-probability difference about `2.12e-5` |
 | Prefill speedup, seam sink 0 | about `1.38x` |
 | Prefill speedup, seam sink 4 | about `1.37x` |
 | Reused-token ratio | about `63%` |
-| Repeated-request leak test | 30/30 passed |
-| HTTP 400/500 or service errors | 0 |
 
 These are correctness-prototype measurements, not a claim of peak production
 performance. Latency depends on model, GPU, batch shape, eager-mode overhead,
@@ -158,17 +156,15 @@ backend 不需要区分 PIC 请求和普通请求，也不需要维护一套独�
 
 当前主要在单卡、eager 模式下验证 Qwen3.5-2B hybrid-attention 纯文本请求。
 
-Stage 10-C-6 的本地验证结果包括：
+本地验证结果示例：
 
 | 验证项 | 结果 |
 |---|---:|
 | PIC 单元测试 | 75 passed |
-| Stage 9-A-3 正确性回归 | passed，最大 log-probability 差异约 `2.12e-5` |
+| 正确性回归 | passed，最大 log-probability 差异约 `2.12e-5` |
 | prefill 加速，seam sink 0 | 约 `1.38x` |
 | prefill 加速，seam sink 4 | 约 `1.37x` |
 | token 复用比例 | 约 `63%` |
-| 重复请求泄漏测试 | 30/30 通过 |
-| HTTP 400/500 或服务错误 | 0 |
 
 这些数据是正确性原型的实测结果，不代表生产环境的理论峰值性能。实际延迟会受到
 模型、GPU、batch 形状、eager 开销、seam 大小和缓存预热状态影响。
