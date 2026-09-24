@@ -1,4 +1,4 @@
-# HYPIC PIC for vLLM
+# Hybrid-Attention PIC for vLLM
 
 An experimental research implementation of HYPIC PIC on top of vLLM 0.22.1.
 The project targets non-prefix segment reuse for hybrid-attention language

@@ -1,4 +1,4 @@
-# HYPIC PIC for vLLM
+# Hybrid-Attention PIC for vLLM
 
 This repository contains a personal research implementation of HYPIC PIC on top
 of vLLM 0.22.1. It explores non-prefix segment reuse for hybrid-attention
