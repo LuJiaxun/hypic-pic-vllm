@@ -1,123 +1,110 @@
-<!-- markdownlint-disable MD001 MD041 -->
+# HYPIC PIC for vLLM
 
-> **HYPIC PIC research branch**
->
-> This personal branch contains an experimental HYPIC PIC integration for
-> vLLM 0.22.1, including hybrid-state transition, non-prefix segment reuse,
-> native KV-slot mapping and mixed-request execution. See the
-> [bilingual HYPIC overview](HYPIC.md) for architecture, usage and validation
-> results.
->
-> **HYPIC PIC 研究分支**：本个人分支包含基于 vLLM 0.22.1 的实验性 HYPIC PIC
-> 实现，涉及混合状态 transition、非前缀 segment 复用、原生 KV slot 映射和混合
-> 请求执行。架构、使用方法和验证结果请见[双语说明](HYPIC.md)。
+An experimental research implementation of HYPIC PIC on top of vLLM 0.22.1.
+The project targets non-prefix segment reuse for hybrid-attention language
+models while keeping ordinary requests on the native vLLM execution path.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+中文：这是基于 vLLM 0.22.1 的 HYPIC PIC 研究实现，面向混合注意力模型提供
+非前缀 segment 复用，同时保持普通请求继续使用 vLLM 原生执行路径。
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+## Highlights
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+- Hybrid GDN/Mamba recurrent-state and convolution-tail transitions.
+- Native vLLM KV-slot mapping for full-attention layers.
+- Seam-window recomputation and single-request skip/recompute.
+- Mixed PIC and ordinary-request execution with request-local isolation.
+- Persistent private KV materialization with lease/ref-count cleanup.
+- Fail-closed fallback for unsupported or unsafe request conditions.
+- External native-KV provider boundary for future Mooncake integration.
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+PIC ultimately uses vLLM native KV slots and attention metadata, so the normal
+attention backend does not need a separate external KV view.
 
----
+## Validation snapshot
 
-## About
+The primary validation target is Qwen3.5-2B hybrid-attention, text-only mode,
+single GPU and eager execution.
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+| Check | Result |
+|---|---:|
+| PIC unit tests | 75 passed |
+| Correctness regression | passed; max log-probability difference about `2.12e-5` |
+| Prefill speedup, seam sink 0 | about `1.38x` |
+| Prefill speedup, seam sink 4 | about `1.37x` |
+| Reused-token ratio | about `63%` |
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+These measurements represent a correctness-oriented prototype. Latency depends
+on the model, GPU, batch shape, eager-mode overhead, seam size and cache state.
 
-vLLM is fast with:
+## Quick start
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+The implementation was validated from the official CUDA 12.9 image:
 
-vLLM is flexible and easy to use with:
-
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
-
-```bash
-uv pip install vllm
+```text
+vllm/vllm-openai:v0.22.1-cu129
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+Start the server with PIC controls enabled:
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+```bash
+vllm serve /path/to/Qwen3.5-2B \
+  --served-model-name qwen3.5-2b \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.75 \
+  --enforce-eager \
+  --pic-enable \
+  --pic-auto-enable \
+  --pic-zero-copy \
+  --pic-single-request \
+  --pic-capture-live \
+  --pic-restore-live \
+  --pic-max-cache-bytes 2147483648 \
+  --pic-debug
+```
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+Example request metadata:
 
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
+```json
+{
+  "model": "qwen3.5-2b",
+  "prompt": "left <<PIC_SEP>> reusable segment <<PIC_SEP>> right",
+  "max_tokens": 4,
+  "temperature": 0,
+  "vllm_xargs": {
+    "pic_enabled": true,
+    "pic_separator": "<<PIC_SEP>>",
+    "pic_seam_sink": 4,
+    "pic_mode": "transition_rope_recompute"
+  }
 }
 ```
 
-## Contact Us
+## Code map
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+- `vllm/v1/pic/`: segmentation, cache, transitions, native KV, runtime,
+  lifecycle and external-provider interfaces.
+- `vllm/v1/worker/gpu_model_runner.py`: capture, restore, skip/recompute and
+  packed execution integration.
+- `vllm/v1/worker/gpu_input_batch.py`: request-local native slot and batch
+  metadata handling.
+- `vllm/v1/core/sched/scheduler.py`: scheduler-side lookup and metadata flow.
+- `tests/v1/pic/`: PIC unit and runtime tests.
 
-## Media Kit
+完整的中英双语说明、限制和更多使用细节见：[HYPIC.md](HYPIC.md)。
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+## Scope and limitations
+
+- Current validation focuses on single-GPU, eager, text-only hybrid models.
+- Unsafe state layouts, cursor mappings or batch shapes fall back per request.
+- `--pic-mooncake` is an external native-KV provider boundary; it does not
+  bundle a Mooncake server, RDMA transport or remote provider.
+- Remote KV import requires a separately registered provider implementation.
+- This is an independent research branch, not an official vLLM feature and
+  not a submission to the vLLM upstream repository.
+
+## License and upstream
+
+The codebase is derived from vLLM 0.22.1 and retains the upstream license and
+notices. See the upstream project at
+[vllm-project/vllm](https://github.com/vllm-project/vllm).
