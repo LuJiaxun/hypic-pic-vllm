@@ -117,6 +117,23 @@ Example request metadata:
 - This is an independent research branch, not an official vLLM feature and
   not a submission to the vLLM upstream repository.
 
+## TODO
+
+- Profile Python/Torch metadata, transition application, KV materialization and
+  kernel-launch overhead on representative hybrid models.
+- Implement and benchmark custom Triton/CUDA kernels for transition application,
+  native-KV gather/scatter, slot mapping and seam-window execution.
+- Fuse transition, state update and KV metadata preparation where profiling
+  shows measurable benefit, while preserving the native vLLM attention path.
+- Explore CUDA Graph compatibility for steady-state decode and packed mixed
+  batches.
+- Add a real Mooncake provider and run complete connectivity validation:
+  provider registration, external native-KV import, cross-process transfer,
+  lease/ref-count lifecycle, remote KV correctness, RDMA/Transfer Engine
+  behavior and safe fallback when the provider is unavailable.
+- Re-run correctness, mixed-batch isolation, lifecycle and acceleration
+  benchmarks after each kernel or provider optimization.
+
 ## License and upstream
 
 The codebase is derived from vLLM 0.22.1 and retains the upstream license and

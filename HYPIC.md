@@ -251,3 +251,18 @@ vllm serve /path/to/Qwen3.5-2B \
 
 这是基于 vLLM 的个人研究分支，不是官方 vLLM 功能，也不会直接提交到 vLLM
 upstream。代码主要用于复现和研究 HYPIC PIC 的执行路径，当前版本仍属于实验性实现。
+
+## TODO
+
+- 对 Python/Torch metadata、transition 应用、KV materialization 和 kernel launch
+  开销进行 profiling；
+- 为 transition、native KV gather/scatter、slot mapping 和 seam window 执行实现并
+  benchmark Triton/CUDA kernel；
+- 在保持 vLLM 原生 attention 路径的前提下，融合 transition、state update 和 KV
+  metadata 准备过程；
+- 探索稳定 decode 和 packed mixed batch 的 CUDA Graph 支持；
+- 接入真实 Mooncake provider，并完成完整连接性测试：provider 注册、external
+  native KV 导入、跨进程传输、lease/ref-count 生命周期、远程 KV 正确性、
+  RDMA/Transfer Engine 行为，以及 provider 不可用时的安全回退；
+- 每次 kernel 或 provider 优化后，重新执行正确性、混合 batch 隔离、生命周期和
+  加速比测试。
