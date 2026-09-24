@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.request import Request
+    from vllm.v1.pic.cache import PICCachePlan
+    from vllm.v1.pic.segmenter import PICSegment
+    from vllm.v1.pic.execution import PICExecutionPlan
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
@@ -25,6 +28,9 @@ else:
     PoolingParams = object
     SamplingParams = object
     Request = object
+    PICCachePlan = object
+    PICSegment = object
+    PICExecutionPlan = object
 
 
 @dataclass
@@ -42,6 +48,15 @@ class NewRequestData:
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
+
+    # HYPIC/PIC metadata.  These fields are inert unless the request-level PIC
+    # feature flag is enabled and are propagated so the worker can later build
+    # a range-based execution plan without changing the normal path.
+    pic_enabled: bool = False
+    pic_segments: tuple[PICSegment, ...] = ()
+    pic_cache_plan: PICCachePlan | None = None
+    pic_execution_plan: PICExecutionPlan | None = None
+    pic_public_block_ids: tuple[tuple[int, int, tuple[int, ...]], ...] = ()
 
     @classmethod
     def from_request(
@@ -62,6 +77,11 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            pic_enabled=request.pic_enabled,
+            pic_segments=tuple(request.pic_segments or ()),
+            pic_cache_plan=request.pic_cache_plan,
+            pic_execution_plan=request.pic_execution_plan,
+            pic_public_block_ids=request.pic_public_block_ids,
         )
 
     def __repr__(self) -> str:

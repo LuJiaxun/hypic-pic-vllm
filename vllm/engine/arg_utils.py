@@ -51,6 +51,7 @@ from vllm.config import (
     ObservabilityConfig,
     OffloadConfig,
     ParallelConfig,
+    PICConfig,
     PoolerConfig,
     PrefetchOffloadConfig,
     ProfilerConfig,
@@ -517,6 +518,23 @@ class EngineArgs:
     offload_params: set[str] = get_field(PrefetchOffloadConfig, "offload_params")
     gpu_memory_utilization: float = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
+    pic_enable: bool = PICConfig.enabled
+    pic_auto_enable: bool = PICConfig.auto_enable
+    pic_mode: str = PICConfig.mode
+    pic_separator: str = PICConfig.separator
+    pic_seam_sink: int = PICConfig.seam_sink
+    pic_exclusive_batch: bool = PICConfig.exclusive_batch
+    pic_allow_fallback: bool = PICConfig.allow_fallback
+    pic_max_cache_bytes: int | None = PICConfig.max_cache_bytes
+    pic_capture_live: bool = PICConfig.capture_live
+    pic_restore_live: bool = PICConfig.restore_live
+    pic_copyback_kv: bool = PICConfig.copyback_kv
+    pic_zero_copy: bool = PICConfig.zero_copy
+    pic_single_request: bool = PICConfig.single_request
+    pic_batch: bool = PICConfig.batch
+    pic_packed_batch: bool = PICConfig.packed_batch
+    pic_mooncake: bool = PICConfig.mooncake
+    pic_debug: bool = PICConfig.debug
     max_num_batched_tokens: int | None = None
     max_num_partial_prefills: int = SchedulerConfig.max_num_partial_prefills
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
@@ -1162,6 +1180,47 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-offloading-backend", **cache_kwargs["kv_offloading_backend"]
         )
+
+        pic_kwargs = get_kwargs(PICConfig)
+        pic_group = parser.add_argument_group(
+            title="PICConfig",
+            description=PICConfig.__doc__,
+        )
+        pic_group.add_argument("--pic-enable", **pic_kwargs["enabled"])
+        pic_group.add_argument("--pic-auto-enable", **pic_kwargs["auto_enable"])
+        pic_group.add_argument("--pic-mode", **pic_kwargs["mode"])
+        pic_group.add_argument("--pic-separator", **pic_kwargs["separator"])
+        pic_group.add_argument("--pic-seam-sink", **pic_kwargs["seam_sink"])
+        pic_group.add_argument(
+            "--pic-exclusive-batch", **pic_kwargs["exclusive_batch"]
+        )
+        pic_group.add_argument(
+            "--pic-allow-fallback", **pic_kwargs["allow_fallback"]
+        )
+        pic_group.add_argument(
+            "--pic-max-cache-bytes", **pic_kwargs["max_cache_bytes"]
+        )
+        pic_group.add_argument(
+            "--pic-capture-live", **pic_kwargs["capture_live"]
+        )
+        pic_group.add_argument(
+            "--pic-restore-live", **pic_kwargs["restore_live"]
+        )
+        pic_group.add_argument(
+            "--pic-copyback-kv", **pic_kwargs["copyback_kv"]
+        )
+        pic_group.add_argument(
+            "--pic-zero-copy", **pic_kwargs["zero_copy"]
+        )
+        pic_group.add_argument(
+            "--pic-single-request", **pic_kwargs["single_request"]
+        )
+        pic_group.add_argument("--pic-batch", **pic_kwargs["batch"])
+        pic_group.add_argument(
+            "--pic-packed-batch", **pic_kwargs["packed_batch"]
+        )
+        pic_group.add_argument("--pic-mooncake", **pic_kwargs["mooncake"])
+        pic_group.add_argument("--pic-debug", **pic_kwargs["debug"])
 
         # Model weight offload related configs
         offload_kwargs = get_kwargs(OffloadConfig)
@@ -2224,6 +2283,25 @@ class EngineArgs:
         config = VllmConfig(
             model_config=model_config,
             cache_config=cache_config,
+            pic_config=PICConfig(
+                enabled=self.pic_enable,
+                auto_enable=self.pic_auto_enable,
+                mode=self.pic_mode,
+                separator=self.pic_separator,
+                seam_sink=self.pic_seam_sink,
+                exclusive_batch=self.pic_exclusive_batch,
+                allow_fallback=self.pic_allow_fallback,
+                max_cache_bytes=self.pic_max_cache_bytes,
+                capture_live=self.pic_capture_live,
+                restore_live=self.pic_restore_live,
+                copyback_kv=self.pic_copyback_kv,
+                zero_copy=self.pic_zero_copy,
+                single_request=self.pic_single_request,
+                batch=self.pic_batch,
+                packed_batch=self.pic_packed_batch,
+                mooncake=self.pic_mooncake,
+                debug=self.pic_debug,
+            ),
             parallel_config=parallel_config,
             scheduler_config=scheduler_config,
             device_config=device_config,

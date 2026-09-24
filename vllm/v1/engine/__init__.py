@@ -129,6 +129,14 @@ class EngineCoreRequest(
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
 
+    # HYPIC/PIC request metadata. Appended to preserve existing array-like
+    # EngineCoreRequest positional fields.
+    pic_enabled: bool = False
+    pic_separator_token_ids: list[int] | None = None
+    pic_segment_ranges: list[tuple[int, int]] | None = None
+    pic_mode: str | None = None
+    pic_seam_sink: int | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""

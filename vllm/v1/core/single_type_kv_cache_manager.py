@@ -352,6 +352,94 @@ class SingleTypeKVCacheManager(ABC):
         self.block_pool.free_blocks(ordered_blocks)
         self.num_cached_block.pop(request_id, None)
 
+    def validate_pic_native_blocks(
+        self,
+        request_id: str,
+        *,
+        target_start: int,
+        token_count: int,
+        block_ids: Sequence[int],
+        block_size: int,
+    ) -> None:
+        """Validate a block-aligned PIC native-slot attachment.
+
+        PIC reuses complete native blocks.  Partial edge blocks are rejected
+        here because replacing such a block would also expose tokens outside
+        the matched segment to the attention backend.
+        """
+        if target_start < 0 or token_count <= 0:
+            raise ValueError("PIC native attachment has an invalid token range")
+        if block_size != self.block_size:
+            raise ValueError(
+                "PIC native block size does not match the KV manager block size"
+            )
+        target_end = target_start + token_count
+        if target_start % block_size != 0 or target_end % block_size != 0:
+            raise ValueError(
+                "PIC native attachment requires block-aligned segment boundaries"
+            )
+        expected_blocks = token_count // block_size
+        if len(block_ids) != expected_blocks:
+            raise ValueError(
+                "PIC native attachment block count does not match token range"
+            )
+        req_blocks = self.req_to_blocks.get(request_id)
+        if req_blocks is None:
+            raise ValueError("PIC native attachment request has no allocated blocks")
+        first_block = target_start // block_size
+        last_block = first_block + expected_blocks
+        if last_block > len(req_blocks):
+            raise ValueError("PIC native attachment exceeds request block table")
+        if any(block_id < 0 or block_id >= len(self.block_pool.blocks)
+               for block_id in block_ids):
+            raise ValueError("PIC native attachment contains an invalid block ID")
+
+    def attach_pic_native_blocks(
+        self,
+        request_id: str,
+        *,
+        target_start: int,
+        token_count: int,
+        block_ids: Sequence[int],
+        block_size: int,
+    ) -> None:
+        """Attach native KV blocks to a request's logical block positions.
+
+        The request keeps ownership of the attached blocks until its normal
+        ``free`` path runs.  The caller must hold a separate cache lease for
+        published PIC entries; this method only adds the request ownership
+        reference and releases the blocks allocated for the replaced range.
+        """
+        self.validate_pic_native_blocks(
+            request_id,
+            target_start=target_start,
+            token_count=token_count,
+            block_ids=block_ids,
+            block_size=block_size,
+        )
+        req_blocks = self.req_to_blocks[request_id]
+        first_block = target_start // block_size
+        native_blocks = [self.block_pool.blocks[block_id] for block_id in block_ids]
+
+        replacements: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+        for offset, native_block in enumerate(native_blocks):
+            old_block = req_blocks[first_block + offset]
+            if old_block is native_block:
+                continue
+            replacements.append((old_block, native_block))
+
+        # Touch all native blocks before releasing any old block.  This keeps
+        # the operation safe when a reference happens to point at a block that
+        # is currently owned by this request or is the last eviction candidate.
+        self.block_pool.touch([native for _, native in replacements])
+        for offset, native_block in enumerate(native_blocks):
+            req_index = first_block + offset
+            old_block = req_blocks[req_index]
+            if old_block is native_block:
+                continue
+            self.block_pool.free_blocks((old_block,))
+            req_blocks[req_index] = native_block
+
     @abstractmethod
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """

@@ -265,11 +265,13 @@ class ResponsesRequest(OpenAIBaseModel):
     seed: int | None = Field(None, ge=_INT64_MIN, le=_INT64_MAX)
     stop: str | list[str] | None = []
     ignore_eos: bool = False
-    vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
+    vllm_xargs: dict[
+        str, bool | str | int | float | list[str | int | float]
+    ] | None = Field(
         default=None,
         description=(
-            "Additional request parameters with (list of) string or "
-            "numeric values, used by custom extensions."
+            "Additional request parameters with (list of) string, boolean, "
+            "or numeric values, used by custom extensions."
         ),
     )
     kv_transfer_params: dict[str, Any] | None = Field(

@@ -167,10 +167,10 @@ class CompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
-    vllm_xargs: dict[str, str | int | float] | None = Field(
+    vllm_xargs: dict[str, bool | str | int | float] | None = Field(
         default=None,
         description=(
-            "Additional request parameters with string or "
+            "Additional request parameters with string, boolean, or "
             "numeric values, used by custom extensions."
         ),
     )

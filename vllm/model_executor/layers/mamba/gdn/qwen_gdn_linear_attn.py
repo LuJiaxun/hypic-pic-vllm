@@ -1321,6 +1321,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
+        pic_conv_input = mixed_qkv
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
@@ -1425,6 +1426,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             value_non_spec = value_non_spec.unsqueeze(0)
             g_non_spec = g_non_spec.unsqueeze(0)
             beta_non_spec = beta_non_spec.unsqueeze(0)
+
+            # Stage 9-A-1: capture the actual post-convolution GDN inputs
+            # needed to compose a segment transition.  The capture context is
+            # injected by GPUModelRunner only for a single PIC prefill; the
+            # ordinary forward path has no additional callback or work.
+            pic_capture = forward_context.additional_kwargs.get(
+                "pic_transition_capture"
+            )
+            if pic_capture is not None:
+                pic_capture.record_gdn_layer(
+                    self.prefix,
+                    key_non_spec.squeeze(0),
+                    value_non_spec.squeeze(0),
+                    g_non_spec.squeeze(0),
+                    beta_non_spec.squeeze(0),
+                    state_dtype=self.get_state_dtype()[1],
+                    conv_input=pic_conv_input,
+                    conv_kernel_size=self.conv_kernel_size,
+                    backend=self.gdn_prefill_backend,
+                )
         else:
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec
@@ -1485,6 +1506,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            pic_capture = forward_context.additional_kwargs.get(
+                "pic_transition_capture"
+            )
+            if pic_capture is not None:
+                pic_capture.validate_gdn_layer(
+                    self.prefix,
+                    initial_state,
+                    last_recurrent_state,
+                    token_start=0,
+                    token_end=int(num_actual_tokens),
+                )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(

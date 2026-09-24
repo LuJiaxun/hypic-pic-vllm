@@ -44,6 +44,7 @@ from .model import ModelConfig
 from .observability import ObservabilityConfig
 from .offload import OffloadConfig
 from .parallel import ParallelConfig
+from .pic import PICConfig
 from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
@@ -306,6 +307,8 @@ class VllmConfig:
     """Attention configuration."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
     """Mamba configuration."""
+    pic_config: PICConfig = Field(default_factory=PICConfig)
+    """Position-independent segment-cache configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
     """Kernel configuration."""
     lora_config: LoRAConfig | None = None
@@ -423,6 +426,10 @@ class VllmConfig:
             vllm_factors.append("None")
         if self.offload_config:
             vllm_factors.append(self.offload_config.compute_hash())
+        else:
+            vllm_factors.append("None")
+        if self.pic_config:
+            vllm_factors.append(self.pic_config.compute_hash())
         else:
             vllm_factors.append("None")
         if self.attention_config:

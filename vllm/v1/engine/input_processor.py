@@ -5,6 +5,7 @@ import time
 from collections.abc import Mapping
 from typing import Any, Literal
 
+import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.inputs import (
@@ -29,6 +30,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.pic.segmenter import split_text_and_tokenize
 
 logger = init_logger(__name__)
 
@@ -305,6 +307,7 @@ class InputProcessor:
         if isinstance(params, SamplingParams):
             # TODO: can we avoid cloning here in multiproc case?
             sampling_params = params.clone()
+            max_tokens_was_unset = sampling_params.max_tokens is None
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
                 seq_len = length_from_prompt_token_ids_or_embeds(
@@ -320,6 +323,23 @@ class InputProcessor:
                 sampling_params.update_from_tokenizer(self.tokenizer)
         else:
             pooling_params = params.clone()
+            max_tokens_was_unset = False
+
+        pic_enabled, pic_prompt_token_ids, pic_segment_ranges, pic_mode, pic_seam_sink = (
+            self._prepare_pic_request(
+                prompt_token_ids,
+                prompt_embeds,
+                decoder_inputs.get("prompt"),
+                sampling_params,
+            )
+        )
+        if pic_enabled:
+            assert pic_prompt_token_ids is not None
+            prompt_token_ids = pic_prompt_token_ids
+            if max_tokens_was_unset and sampling_params is not None:
+                sampling_params.max_tokens = (
+                    self.model_config.max_model_len - len(prompt_token_ids)
+                )
 
         # Multimodal related.
         mm_features: list[MultiModalFeatureSpec] | None = None
@@ -374,6 +394,110 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            pic_enabled=pic_enabled,
+            pic_separator_token_ids=None,
+            pic_segment_ranges=pic_segment_ranges,
+            pic_mode=pic_mode,
+            pic_seam_sink=pic_seam_sink,
+        )
+
+    @staticmethod
+    def _coerce_pic_bool(value: Any) -> bool:
+        """Normalize JSON/Pydantic bool-like values used by ``vllm_xargs``."""
+        if isinstance(value, str):
+            return value.strip().lower() not in {"", "0", "false", "no", "off"}
+        return bool(value)
+
+    def _prepare_pic_request(
+        self,
+        prompt_token_ids: list[int] | None,
+        prompt_embeds: torch.Tensor | None,
+        prompt_text: str | None,
+        sampling_params: SamplingParams | None,
+    ) -> tuple[
+        bool,
+        list[int] | None,
+        list[tuple[int, int]] | None,
+        str | None,
+        int | None,
+    ]:
+        """Classify a request for the isolated PIC path."""
+        pic_config = self.vllm_config.pic_config
+        if (
+            not pic_config.enabled
+            or prompt_token_ids is None
+            or prompt_embeds is not None
+        ):
+            return False, None, None, None, None
+
+        extra_args = (
+            sampling_params.extra_args if sampling_params is not None else None
+        )
+        extra_args = extra_args or {}
+        requested_value = extra_args.get("pic_enabled")
+        explicitly_requested = requested_value is not None
+        requested = (
+            self._coerce_pic_bool(requested_value)
+            if explicitly_requested
+            else bool(pic_config.auto_enable)
+        )
+
+        separator = extra_args.get("pic_separator", pic_config.separator)
+        separator_text = "" if separator is None else str(separator)
+
+        if pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] input prompt_len=%d requested=%s explicit=%s "
+                "separator=%r raw_text=%s",
+                len(prompt_token_ids),
+                requested,
+                explicitly_requested,
+                separator,
+                prompt_text is not None,
+            )
+
+        if not requested:
+            if pic_config.debug:
+                logger.warning(
+                    "[PIC-DEBUG] input result pic_enabled=False segments=not_created"
+                )
+            return False, None, None, None, None
+
+        if self.tokenizer is None or not isinstance(prompt_text, str):
+            message = (
+                "PIC requires a textual prompt so it can split PIC_SEP before "
+                "tokenization; token-only and embedding inputs are unsupported"
+            )
+            if explicitly_requested:
+                raise ValueError(message)
+            if pic_config.debug:
+                logger.warning("[PIC-DEBUG] input result pic_enabled=False reason=%s", message)
+            return False, None, None, None, None
+
+        pic_prompt_token_ids, pic_segment_ranges = split_text_and_tokenize(
+            prompt_text,
+            self.tokenizer,
+            separator_text,
+        )
+        if not pic_segment_ranges:
+            message = "PIC prompt has no non-empty tokenized segments"
+            if explicitly_requested:
+                raise ValueError(message)
+            return False, None, None, None, None
+
+        if pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] input result pic_enabled=True token_len=%d ranges=%s",
+                len(pic_prompt_token_ids),
+                pic_segment_ranges,
+            )
+
+        return (
+            True,
+            pic_prompt_token_ids,
+            pic_segment_ranges,
+            str(extra_args.get("pic_mode", pic_config.mode)),
+            int(extra_args.get("pic_seam_sink", pic_config.seam_sink)),
         )
 
     def _validate_prompt_len(

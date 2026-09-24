@@ -3,6 +3,7 @@
 
 import numpy as np
 import torch
+from collections.abc import Sequence
 
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
@@ -126,6 +127,31 @@ class BlockTable:
         if num_blocks > 0:
             self.block_table.np[row_idx, :num_blocks] = 0
         self.num_blocks_per_row[row_idx] = 0
+
+    def attach_pic_native_blocks(
+        self,
+        logical_block_ids: Sequence[int],
+        physical_block_ids: Sequence[int],
+        row_idx: int,
+    ) -> None:
+        """Patch complete logical blocks with PIC native block IDs.
+
+        The caller must have validated that the references belong to this
+        kernel block size and that the logical blocks are block aligned.  This
+        only changes the request-local block-table row; ordinary rows and the
+        scheduler's ``num_computed_tokens`` remain untouched.
+        """
+        if len(logical_block_ids) != len(physical_block_ids):
+            raise ValueError("PIC native logical/physical block counts differ")
+        if any(block_id < 0 for block_id in logical_block_ids):
+            raise ValueError("PIC native logical block ID must be non-negative")
+        if any(block_id < 0 for block_id in physical_block_ids):
+            raise ValueError("PIC native physical block ID must be non-negative")
+        num_blocks = int(self.num_blocks_per_row[row_idx])
+        if any(block_id >= num_blocks for block_id in logical_block_ids):
+            raise ValueError("PIC native logical block exceeds request row")
+        for logical, physical in zip(logical_block_ids, physical_block_ids):
+            self.block_table.np[row_idx, logical] = physical
 
     def move_row(self, src: int, tgt: int) -> None:
         num_blocks = self.num_blocks_per_row[src]
@@ -291,6 +317,20 @@ class MultiGroupBlockTable:
     def clear_row(self, row_idx: int) -> None:
         for block_table in self.block_tables:
             block_table.clear_row(row_idx)
+
+    def attach_pic_native_blocks(
+        self,
+        group_id: int,
+        logical_block_ids: Sequence[int],
+        physical_block_ids: Sequence[int],
+        row_idx: int,
+    ) -> None:
+        """Patch one KV group's request row with native PIC blocks."""
+        self.block_tables[group_id].attach_pic_native_blocks(
+            logical_block_ids,
+            physical_block_ids,
+            row_idx,
+        )
 
     def move_row(self, src: int, tgt: int) -> None:
         for block_table in self.block_tables:

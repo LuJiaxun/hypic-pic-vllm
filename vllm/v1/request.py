@@ -21,6 +21,9 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.metrics.stats import PrefillStats
+from vllm.v1.pic.cache import PICCachePlan
+from vllm.v1.pic.execution import PICExecutionPlan
+from vllm.v1.pic.segmenter import PICSegment, segments_from_ranges
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
@@ -77,6 +80,11 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        pic_enabled: bool = False,
+        pic_separator_token_ids: list[int] | None = None,
+        pic_segment_ranges: list[tuple[int, int]] | None = None,
+        pic_mode: str | None = None,
+        pic_seam_sink: int | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -156,6 +164,28 @@ class Request:
         # trace_headers
         self.trace_headers = trace_headers
 
+        self.pic_enabled = (
+            pic_enabled and prompt_token_ids is not None and prompt_embeds is None
+        )
+        self.pic_mode = pic_mode if self.pic_enabled else None
+        self.pic_seam_sink = pic_seam_sink if self.pic_enabled else None
+        if self.pic_enabled and prompt_token_ids is not None:
+            if pic_segment_ranges is None:
+                raise ValueError(
+                    "PIC requests require explicit segment ranges from the "
+                    "raw-text split path"
+                )
+            self.pic_segments = segments_from_ranges(
+                prompt_token_ids, pic_segment_ranges
+            )
+        else:
+            self.pic_segments = None
+        self.pic_cache_plan: PICCachePlan | None = None
+        self.pic_execution_plan: PICExecutionPlan | None = None
+        # Scheduler-owned native blocks reserved for canonical public PIC KV.
+        # Entries are (segment index, KV group id, allocator block IDs).
+        self.pic_public_block_ids: tuple[tuple[int, int, tuple[int, ...]], ...] = ()
+
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
 
@@ -211,6 +241,11 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            pic_enabled=request.pic_enabled,
+            pic_separator_token_ids=request.pic_separator_token_ids,
+            pic_segment_ranges=request.pic_segment_ranges,
+            pic_mode=request.pic_mode,
+            pic_seam_sink=request.pic_seam_sink,
         )
 
     def append_output_token_ids(

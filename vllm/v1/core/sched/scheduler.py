@@ -49,10 +49,22 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    CrossAttentionSpec,
+    EncoderOnlyAttentionSpec,
+    KVCacheConfig,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.pic.cache import PICSegmentCache
+from vllm.v1.pic.execution import compile_execution_plan
+from vllm.v1.pic.materialization import PICMaterialization
+from vllm.v1.pic.native_kv import PICNativeKVLease
+from vllm.v1.pic.native_kv import get_full_local_block_span
+from vllm.v1.pic.native_kv import has_complete_native_kv_reference
+from vllm.v1.pic.native_kv import is_pic_public_segment_cacheable
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -235,6 +247,26 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
         )
+        pic_config = vllm_config.pic_config
+        self.pic_cache: PICSegmentCache | None = (
+            PICSegmentCache(
+                enabled=True,
+                max_cache_bytes=pic_config.max_cache_bytes,
+            )
+            if pic_config.enabled
+            else None
+        )
+        # Native KV references are intentionally lease-free in the
+        # scheduler/worker message.  Keep the actual BlockPool leases here so
+        # a published segment cannot be evicted while a later request uses its
+        # physical slots.
+        self._pic_native_leases: dict[tuple[bytes, int], PICNativeKVLease] = {}
+        # Public canonical KV is allocated independently from a request's
+        # ordinary blocks.  The allocation owner is transferred to
+        # ``_pic_native_leases`` only after the worker has materialized it.
+        self._pic_public_allocations: dict[
+            tuple[str, bytes, int], tuple[Any, ...]
+        ] = {}
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -346,6 +378,12 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        pic_batch_mode: bool | None = None
+        pic_exclusive_batch = self.vllm_config.pic_config.exclusive_batch
+        pic_batch_execution = (
+            self.vllm_config.pic_config.batch
+            or self.vllm_config.pic_config.packed_batch
+        )
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -365,6 +403,15 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if (
+                pic_exclusive_batch
+                and not pic_batch_execution
+                and pic_batch_mode is not None
+                and request.pic_enabled != pic_batch_mode
+            ):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -492,6 +539,12 @@ class Scheduler(SchedulerInterface):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            if (
+                pic_exclusive_batch
+                and not pic_batch_execution
+                and pic_batch_mode is None
+            ):
+                pic_batch_mode = request.pic_enabled
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -554,6 +607,16 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if (
+                    pic_exclusive_batch
+                    and not pic_batch_execution
+                    and pic_batch_mode is not None
+                    and request.pic_enabled != pic_batch_mode
+                ):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -795,6 +858,12 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
+                if (
+                    pic_exclusive_batch
+                    and not pic_batch_execution
+                    and pic_batch_mode is None
+                ):
+                    pic_batch_mode = request.pic_enabled
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
@@ -1294,6 +1363,8 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        self._update_pic_materializations(model_runner_output.pic_materializations)
+
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
@@ -1602,6 +1673,163 @@ class Scheduler(SchedulerInterface):
 
         return engine_core_outputs
 
+    def _update_pic_materializations(
+        self, materializations: list[PICMaterialization]
+    ) -> None:
+        """Publish worker-owned PIC handles into the scheduler-side index."""
+        if self.vllm_config.pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] scheduler materializations received count=%d cache=%s",
+                len(materializations),
+                self.pic_cache is not None,
+            )
+        if not materializations or self.pic_cache is None:
+            return
+        for item in materializations:
+            if item.evicted:
+                self._evict_pic_segment(item.seg_hash)
+                continue
+            request = self.requests.get(item.request_id)
+            if request is None or request.pic_segments is None:
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler materialization SKIP request=%s "
+                        "reason=unknown_or_non_pic",
+                        item.request_id,
+                    )
+                logger.warning(
+                    "Ignoring PIC materialization for unknown/non-PIC request %s",
+                    item.request_id,
+                )
+                continue
+            if item.segment_index < 0 or item.segment_index >= len(
+                request.pic_segments
+            ):
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler materialization SKIP request=%s "
+                        "segment=%d reason=invalid_segment_index",
+                        item.request_id,
+                        item.segment_index,
+                    )
+                logger.warning(
+                    "Ignoring PIC materialization with invalid segment index %s for %s",
+                    item.segment_index,
+                    item.request_id,
+                )
+                continue
+            segment = request.pic_segments[item.segment_index]
+            if segment.seg_hash != item.seg_hash:
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler materialization SKIP request=%s "
+                        "segment=%d reason=stale_hash expected=%s got=%s",
+                        item.request_id,
+                        item.segment_index,
+                        segment.seg_hash[:12],
+                        item.seg_hash[:12],
+                    )
+                logger.warning(
+                    "Ignoring stale PIC materialization for request %s segment %s",
+                    item.request_id,
+                    item.segment_index,
+                )
+                continue
+            native_kv_refs = item.native_kv_refs
+            lease_failed = False
+            for reference in item.native_kv_refs:
+                lease_key = (item.seg_hash, reference.kv_cache_group_id)
+                old_lease = self._pic_native_leases.pop(lease_key, None)
+                if old_lease is not None:
+                    old_lease.release()
+                try:
+                    allocation_key = (
+                        item.request_id,
+                        item.seg_hash,
+                        reference.kv_cache_group_id,
+                    )
+                    owned_blocks = self._pic_public_allocations.pop(
+                        allocation_key, None
+                    )
+                    if owned_blocks is not None:
+                        owned_ids = tuple(int(block.block_id) for block in owned_blocks)
+                        if owned_ids != reference.block_ids:
+                            self.kv_cache_manager.block_pool.free_blocks(owned_blocks)
+                            raise ValueError(
+                                "PIC public allocation does not match worker reference"
+                            )
+                        lease = PICNativeKVLease.from_owned_block_pool(
+                            self.kv_cache_manager.block_pool,
+                            reference.block_ids,
+                        )
+                    else:
+                        # Compatibility path for metadata produced without a
+                        # scheduler reservation; it remains conservative and
+                        # pins the referenced native blocks.
+                        lease = PICNativeKVLease.from_block_pool(
+                            self.kv_cache_manager.block_pool, reference.block_ids
+                        )
+                    self._pic_native_leases[lease_key] = lease
+                except Exception:
+                    lease_failed = True
+                    logger.warning(
+                        "PIC native KV lease failed for segment %s group %s; "
+                        "native-slot execution will fall back",
+                        item.seg_hash[:12],
+                        reference.kv_cache_group_id,
+                        exc_info=True,
+                    )
+
+            if lease_failed:
+                for reference in item.native_kv_refs:
+                    lease = self._pic_native_leases.pop(
+                        (item.seg_hash, reference.kv_cache_group_id), None
+                    )
+                    if lease is not None:
+                        lease.release()
+                native_kv_refs = ()
+                self.pic_cache.clear_native_kv(segment)
+
+            self.pic_cache.insert(
+                segment,
+                full_kv_handles=item.full_kv_handles,
+                recurrent_state_handle=item.recurrent_state_handle,
+                transition_state_handle=item.transition_state_handle,
+                conv_tail_handle=item.conv_tail_handle,
+                native_kv_refs=native_kv_refs,
+            )
+            if self.vllm_config.pic_config.debug:
+                logger.warning(
+                    "[PIC-DEBUG] scheduler materialization PUBLISHED request=%s "
+                    "segment=%d hash=%s recurrent=%s conv_tail=%s full_kv=%s "
+                    "native_kv_groups=%s",
+                    item.request_id,
+                    item.segment_index,
+                    item.seg_hash[:12],
+                    item.recurrent_state_handle,
+                    item.conv_tail_handle,
+                    item.full_kv_handles,
+                    tuple(reference.kv_cache_group_id for reference in item.native_kv_refs),
+                )
+
+    def _evict_pic_segment(self, seg_hash: bytes) -> None:
+        """Drop worker-invalidated PIC metadata and all scheduler leases."""
+        if self.pic_cache is not None:
+            self.pic_cache.evict_hash(seg_hash)
+        for lease_key, lease in tuple(self._pic_native_leases.items()):
+            if lease_key[0] == seg_hash:
+                self._pic_native_leases.pop(lease_key, None)
+                lease.release()
+        for allocation_key, blocks in tuple(self._pic_public_allocations.items()):
+            if allocation_key[1] == seg_hash:
+                self._pic_public_allocations.pop(allocation_key, None)
+                self.kv_cache_manager.block_pool.free_blocks(blocks)
+        if self.vllm_config.pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] scheduler evicted segment hash=%s",
+                seg_hash[:12],
+            )
+
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
         return status in (
@@ -1767,6 +1995,40 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if (
+                request.pic_enabled
+                and request.pic_segments is not None
+                and self.pic_cache is not None
+            ):
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler lookup request=%s segments=%d",
+                        request.request_id,
+                        len(request.pic_segments),
+                    )
+                request.pic_cache_plan = self.pic_cache.build_plan(
+                    request.pic_segments,
+                    mode=request.pic_mode or self.vllm_config.pic_config.mode,
+                    seam_sink=(
+                        request.pic_seam_sink
+                        if request.pic_seam_sink is not None
+                        else self.vllm_config.pic_config.seam_sink
+                    ),
+                )
+                request.pic_execution_plan = compile_execution_plan(
+                    request.pic_segments, request.pic_cache_plan
+                )
+                self._ensure_pic_public_blocks(request)
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler lookup %s request=%s reused=%s "
+                        "recompute=%s matches=%s",
+                        "HIT" if request.pic_cache_plan.reused_segments else "MISS",
+                        request.request_id,
+                        request.pic_cache_plan.reused_segments,
+                        request.pic_cache_plan.recompute_segments,
+                        [i for i, _ in request.pic_cache_plan.matches],
+                    )
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
@@ -1775,6 +2037,98 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+
+    def _ensure_pic_public_blocks(self, request: Request) -> None:
+        """Reserve independent native blocks for first-seen PIC segments.
+
+        These blocks are the canonical/public copy described by SGLang's PIC
+        allocator.  They are never installed in the request's private block
+        table.  The worker writes canonical-position KV into them, then the
+        scheduler adopts their initial allocation reference when publishing
+        the cache entry.
+        """
+        request.pic_public_block_ids = ()
+        if (
+            not request.pic_enabled
+            or request.pic_segments is None
+            or request.pic_cache_plan is None
+            or self.pic_cache is None
+            or request.mm_features
+            or request.prompt_embeds is not None
+        ):
+            return
+
+        matched_entries = dict(request.pic_cache_plan.matches)
+        records: list[tuple[int, int, tuple[int, ...]]] = []
+        allocated: list[tuple[tuple[str, bytes, int], tuple[Any, ...]]] = []
+        try:
+            for segment_index, segment in enumerate(request.pic_segments):
+                if not is_pic_public_segment_cacheable(
+                    segment_index, len(request.pic_segments)
+                ):
+                    continue
+                for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                    spec = group.kv_cache_spec
+                    if not isinstance(spec, AttentionSpec) or isinstance(
+                        spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
+                    ):
+                        continue
+                    span = get_full_local_block_span(
+                        segment.end - segment.start, int(spec.block_size)
+                    )
+                    if span.block_count <= 0:
+                        continue
+                    # A lookup hit may contain only live state (for example an
+                    # entry warmed by the single-segment prefill path).  It is
+                    # not usable by the 9-A native-slot runtime until its
+                    # complete canonical KV span has been materialized.  The
+                    # A single-segment warmup is reserved here even though its
+                    # only segment is not looked up by the current request. It
+                    # can be an interior hit in a later request. For a
+                    # multi-segment request, the final continuation segment was
+                    # filtered above, matching SGLang PIC semantics.
+                    entry = matched_entries.get(segment_index)
+                    if entry is not None and has_complete_native_kv_reference(
+                        entry.native_kv_refs,
+                        kv_cache_group_id=group_id,
+                        block_count=span.block_count,
+                        token_count=span.reusable_token_count,
+                    ):
+                        continue
+                    key = (request.request_id, segment.seg_hash, group_id)
+                    blocks = tuple(
+                        self.kv_cache_manager.block_pool.get_new_blocks(
+                            span.block_count
+                        )
+                    )
+                    self._pic_public_allocations[key] = blocks
+                    allocated.append((key, blocks))
+                    records.append(
+                        (
+                            segment_index,
+                            group_id,
+                            tuple(int(block.block_id) for block in blocks),
+                        )
+                    )
+        except Exception:
+            for key, blocks in allocated:
+                self._pic_public_allocations.pop(key, None)
+                self.kv_cache_manager.block_pool.free_blocks(blocks)
+            if self.vllm_config.pic_config.debug:
+                logger.warning(
+                    "[PIC-DEBUG] public native allocation failed request=%s; "
+                    "native KV publication disabled",
+                    request.request_id,
+                    exc_info=True,
+                )
+            return
+        request.pic_public_block_ids = tuple(records)
+        if records and self.vllm_config.pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] reserved public native KV request=%s records=%s",
+                request.request_id,
+                records,
+            )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -1859,6 +2213,15 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        # A request may finish before a worker reaches the capture boundary.
+        # Release public blocks that were reserved but never published.
+        for segment in request.pic_segments or ():
+            for group_id in range(len(self.kv_cache_config.kv_cache_groups)):
+                allocation = self._pic_public_allocations.pop(
+                    (request.request_id, segment.seg_hash, group_id), None
+                )
+                if allocation is not None:
+                    self.kv_cache_manager.block_pool.free_blocks(allocation)
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
 
@@ -1930,6 +2293,11 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if reset_successful and self.pic_cache is not None:
+            self.pic_cache.clear()
+            for lease in self._pic_native_leases.values():
+                lease.release()
+            self._pic_native_leases.clear()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "

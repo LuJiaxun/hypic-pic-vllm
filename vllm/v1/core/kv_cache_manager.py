@@ -436,6 +436,46 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    def validate_pic_native_blocks(
+        self,
+        request_id: str,
+        *,
+        kv_cache_group_id: int,
+        target_start: int,
+        token_count: int,
+        block_ids: Sequence[int],
+        block_size: int,
+    ) -> None:
+        """Validate one scheduler-side PIC native block attachment."""
+        self.coordinator.validate_pic_native_blocks(
+            request_id,
+            kv_cache_group_id=kv_cache_group_id,
+            target_start=target_start,
+            token_count=token_count,
+            block_ids=block_ids,
+            block_size=block_size,
+        )
+
+    def attach_pic_native_blocks(
+        self,
+        request_id: str,
+        *,
+        kv_cache_group_id: int,
+        target_start: int,
+        token_count: int,
+        block_ids: Sequence[int],
+        block_size: int,
+    ) -> None:
+        """Replace request logical blocks with published PIC native blocks."""
+        self.coordinator.attach_pic_native_blocks(
+            request_id,
+            kv_cache_group_id=kv_cache_group_id,
+            target_start=target_start,
+            token_count=token_count,
+            block_ids=block_ids,
+            block_size=block_size,
+        )
+
     def remove_skipped_blocks(
         self, request_id: str, total_computed_tokens: int
     ) -> None:
