@@ -40,7 +40,7 @@ The primary validation target is Qwen3.5-2B hybrid-attention, text-only mode,
 single GPU and eager execution.
 
 | Check | Result |
-|---|---:|
+| --- | ---: |
 | PIC unit tests | 75 passed |
 | Correctness regression | passed; max log-probability difference about `2.12e-5` |
 | Prefill speedup, seam sink 0 | about `1.38x` |

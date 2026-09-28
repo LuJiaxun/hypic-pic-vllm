@@ -45,7 +45,7 @@ on a single GPU with eager execution.
 Representative local validation results include:
 
 | Check | Result |
-|---|---:|
+| --- | ---: |
 | PIC unit tests | 75 passed |
 | Correctness regression | passed; max log-probability difference about `2.12e-5` |
 | Prefill speedup, seam sink 0 | about `1.38x` |
@@ -171,7 +171,7 @@ backend 不需要区分 PIC 请求和普通请求，也不需要维护一套独�
 本地验证结果示例：
 
 | 验证项 | 结果 |
-|---|---:|
+| --- | ---: |
 | PIC 单元测试 | 75 passed |
 | 正确性回归 | passed，最大 log-probability 差异约 `2.12e-5` |
 | prefill 加速，seam sink 0 | 约 `1.38x` |
