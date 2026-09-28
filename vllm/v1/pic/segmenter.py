@@ -4,8 +4,9 @@
 """Token-based segmentation for position-independent prompt reuse."""
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -56,8 +57,7 @@ def split_text_and_tokenize(
     ranges: list[tuple[int, int]] = []
     for part in parts:
         segment_ids = [
-            int(token)
-            for token in tokenizer.encode(part, add_special_tokens=False)
+            int(token) for token in tokenizer.encode(part, add_special_tokens=False)
         ]
         if not segment_ids:
             continue

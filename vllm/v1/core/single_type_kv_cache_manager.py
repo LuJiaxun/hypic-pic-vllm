@@ -390,8 +390,10 @@ class SingleTypeKVCacheManager(ABC):
         last_block = first_block + expected_blocks
         if last_block > len(req_blocks):
             raise ValueError("PIC native attachment exceeds request block table")
-        if any(block_id < 0 or block_id >= len(self.block_pool.blocks)
-               for block_id in block_ids):
+        if any(
+            block_id < 0 or block_id >= len(self.block_pool.blocks)
+            for block_id in block_ids
+        ):
             raise ValueError("PIC native attachment contains an invalid block ID")
 
     def attach_pic_native_blocks(

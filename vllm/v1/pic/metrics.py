@@ -25,9 +25,7 @@ class PICMetrics:
     """
 
     _counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    _fallback_reasons: dict[str, int] = field(
-        default_factory=lambda: defaultdict(int)
-    )
+    _fallback_reasons: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     _lock: Lock = field(default_factory=Lock, repr=False)
 
     def _increment(self, key: str, value: int = 1) -> None:
@@ -61,22 +59,23 @@ class PICMetrics:
             self._counts["fallbacks"] += 1
             # Prevent an exception string containing request data from growing
             # this diagnostic map without bound.
-            if normalized not in self._fallback_reasons and len(
-                self._fallback_reasons
-            ) >= 32:
+            if (
+                normalized not in self._fallback_reasons
+                and len(self._fallback_reasons) >= 32
+            ):
                 normalized = "other"
             self._fallback_reasons[normalized] += 1
 
     def record_materialization(self, *, kind: str, reused: bool = False) -> None:
-        key = f"{kind}_kv_materialization_reused" if reused else (
-            f"{kind}_kv_materialized"
+        key = (
+            f"{kind}_kv_materialization_reused"
+            if reused
+            else (f"{kind}_kv_materialized")
         )
         self._increment(key)
 
     def record_capture(self, *, deduplicated: bool = False) -> None:
-        self._increment(
-            "capture_deduplicated" if deduplicated else "capture_stored"
-        )
+        self._increment("capture_deduplicated" if deduplicated else "capture_stored")
 
     def record_eviction(self) -> None:
         self._increment("evictions")
@@ -118,9 +117,7 @@ class PICMetrics:
         """Return a stable metrics snapshot with optional resource gauges."""
         with self._lock:
             result: dict[str, Any] = dict(sorted(self._counts.items()))
-            result["fallback_reasons"] = dict(
-                sorted(self._fallback_reasons.items())
-            )
+            result["fallback_reasons"] = dict(sorted(self._fallback_reasons.items()))
         if lease_snapshot is not None:
             result["leases"] = dict(lease_snapshot)
         if pool_capacity_bytes is not None or pool_free_bytes is not None:

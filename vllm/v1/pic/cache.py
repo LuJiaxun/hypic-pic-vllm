@@ -3,9 +3,9 @@
 
 """Independent metadata cache and matching plan for PIC requests."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from time import monotonic
-from typing import Sequence
 
 from vllm.v1.pic.native_kv import PICNativeKVReference
 from vllm.v1.pic.segmenter import PICSegment

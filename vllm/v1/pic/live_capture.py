@@ -13,32 +13,33 @@ ordinary model forward path by itself.
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.v1.pic.cache import PICSegmentEntry
+from vllm.v1.pic.gdn_transition import build_gdn_transition_operator
+from vllm.v1.pic.lifecycle import PICLeaseRegistry, PICLeaseToken
 from vllm.v1.pic.materialization import PICMaterialization
 from vllm.v1.pic.metrics import PICMetrics
 from vllm.v1.pic.native_kv import (
+    PICKVPositionMode,
     PICNativeKVKind,
     PICNativeKVReference,
-    PICKVPositionMode,
     get_full_local_block_span,
 )
 from vllm.v1.pic.pool import PICPhysicalPool
 from vllm.v1.pic.segmenter import PICSegment
 from vllm.v1.pic.snapshot import PICPhysicalSnapshot, PICSnapshotStore
-from vllm.v1.pic.gdn_transition import build_gdn_transition_operator
-from vllm.v1.pic.lifecycle import PICLeaseRegistry, PICLeaseToken
-from vllm.v1.pic.worker_plan import PICWorkerUnsupported
 from vllm.v1.pic.state import (
     PICConvTransition,
     PICStateLayout,
     PICTransitionOperator,
 )
+from vllm.v1.pic.worker_plan import PICWorkerUnsupported
 
 logger = init_logger(__name__)
 
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
 
 
 def ordered_gdn_layer_names(
-    kv_cache_config: "KVCacheConfig",
+    kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
 ) -> tuple[str, ...]:
     """Return GDN layers in the same order as live state collection.
@@ -90,14 +91,14 @@ class PICGDNTransitionCapture:
     state blocks and attached to ``CachedRequestState``.
     """
 
-    request_state: "CachedRequestState"
+    request_state: CachedRequestState
     segments: tuple[PICSegment, ...]
     layer_names: tuple[str, ...]
     debug: bool = False
     _operators: dict[int, dict[str, PICTransitionOperator]] = field(
         default_factory=dict, init=False
     )
-    _zero_conv_tails: dict[int, dict[str, "torch.Tensor"]] = field(
+    _zero_conv_tails: dict[int, dict[str, torch.Tensor]] = field(
         default_factory=dict, init=False
     )
     _conv_transitions: dict[int, dict[str, PICConvTransition]] = field(
@@ -111,13 +112,13 @@ class PICGDNTransitionCapture:
     def record_gdn_layer(
         self,
         layer_name: str,
-        key: "torch.Tensor",
-        value: "torch.Tensor",
-        log_decay: "torch.Tensor",
-        beta: "torch.Tensor",
+        key: torch.Tensor,
+        value: torch.Tensor,
+        log_decay: torch.Tensor,
+        beta: torch.Tensor,
         *,
-        state_dtype: "torch.dtype",
-        conv_input: "torch.Tensor",
+        state_dtype: torch.dtype,
+        conv_input: torch.Tensor,
         conv_kernel_size: int,
         backend: str | None = None,
     ) -> None:
@@ -149,9 +150,7 @@ class PICGDNTransitionCapture:
             conv_tokens = conv_input[segment.start : segment.end]
             state_len = max(conv_kernel_size - 1, 0)
             if state_len == 0:
-                zero_conv_tail = conv_tokens.new_empty(
-                    (conv_tokens.shape[1], 0)
-                )
+                zero_conv_tail = conv_tokens.new_empty((conv_tokens.shape[1], 0))
             elif conv_tokens.shape[0] >= state_len:
                 zero_conv_tail = conv_tokens[-state_len:].transpose(0, 1)
             else:
@@ -171,12 +170,12 @@ class PICGDNTransitionCapture:
             )
             layer_operators = self._operators.setdefault(segment_index, {})
             layer_operators[layer_name] = operator
-            self._conv_transitions.setdefault(segment_index, {})[
-                layer_name
-            ] = conv_transition
-            self._zero_conv_tails.setdefault(segment_index, {})[
-                layer_name
-            ] = zero_conv_tail
+            self._conv_transitions.setdefault(segment_index, {})[layer_name] = (
+                conv_transition
+            )
+            self._zero_conv_tails.setdefault(segment_index, {})[layer_name] = (
+                zero_conv_tail
+            )
             if all(name in layer_operators for name in self.layer_names):
                 transitions = tuple(
                     transition
@@ -203,8 +202,8 @@ class PICGDNTransitionCapture:
     def validate_gdn_layer(
         self,
         layer_name: str,
-        initial_state: "torch.Tensor",
-        final_state: "torch.Tensor",
+        initial_state: torch.Tensor,
+        final_state: torch.Tensor,
         *,
         token_start: int,
         token_end: int,
@@ -245,12 +244,16 @@ class PICGDNTransitionCapture:
         actual_f = actual.float()
         error = (expected_f - actual_f).abs()
         max_abs = float(error.max().item()) if error.numel() else 0.0
-        max_rel = float(
-            (error / actual_f.abs().clamp_min(1e-6)).max().item()
-        ) if error.numel() else 0.0
-        relative_l2 = float(
-            error.norm().item() / actual_f.norm().clamp_min(1e-6).item()
-        ) if error.numel() else 0.0
+        max_rel = (
+            float((error / actual_f.abs().clamp_min(1e-6)).max().item())
+            if error.numel()
+            else 0.0
+        )
+        relative_l2 = (
+            float(error.norm().item() / actual_f.norm().clamp_min(1e-6).item())
+            if error.numel()
+            else 0.0
+        )
         passed = bool(torch.allclose(expected_f, actual_f, rtol=5e-2, atol=5e-2))
         self.request_state.pic_transition_validation[layer_name] = passed
         self._debug(
@@ -397,9 +400,9 @@ class PICLiveCaptureManager:
         self,
         segment: PICSegment,
         *,
-        recurrent_state: Sequence["torch.Tensor"],
-        conv_tail: Sequence["torch.Tensor"],
-        full_kv: Sequence["torch.Tensor"],
+        recurrent_state: Sequence[torch.Tensor],
+        conv_tail: Sequence[torch.Tensor],
+        full_kv: Sequence[torch.Tensor],
         native_kv_refs: Sequence[PICNativeKVReference],
         transition_operator: PICTransitionOperator | None,
     ) -> PICPhysicalSnapshot:
@@ -454,9 +457,9 @@ class PICLiveCaptureManager:
         segment_index: int,
         segment: PICSegment,
         *,
-        recurrent_state: Sequence["torch.Tensor"] = (),
-        conv_tail: Sequence["torch.Tensor"] = (),
-        full_kv: Sequence["torch.Tensor"] = (),
+        recurrent_state: Sequence[torch.Tensor] = (),
+        conv_tail: Sequence[torch.Tensor] = (),
+        full_kv: Sequence[torch.Tensor] = (),
         native_kv_refs: Sequence[PICNativeKVReference] = (),
         transition_operator: PICTransitionOperator | None = None,
     ) -> PICMaterialization | None:
@@ -622,11 +625,11 @@ class PICLiveCaptureManager:
     def apply_transition(
         self,
         transition_handle: int,
-        recurrent_state: Sequence["torch.Tensor"],
+        recurrent_state: Sequence[torch.Tensor],
         *,
         local_start: int | None = None,
         local_end: int | None = None,
-    ) -> tuple["torch.Tensor", ...]:
+    ) -> tuple[torch.Tensor, ...]:
         """Apply a worker-local transition handle to the current state.
 
         The handle is deliberately not sufficient to reconstruct the operator
@@ -647,11 +650,11 @@ class PICLiveCaptureManager:
     def apply_conv_transition(
         self,
         transition_handle: int,
-        conv_state: Sequence["torch.Tensor"],
+        conv_state: Sequence[torch.Tensor],
         *,
         local_start: int | None = None,
         local_end: int | None = None,
-    ) -> tuple["torch.Tensor", ...]:
+    ) -> tuple[torch.Tensor, ...]:
         """Apply the rolling conv-state part of a worker-local transition."""
         operator = self._transitions.get(transition_handle)
         if operator is None:
@@ -676,7 +679,7 @@ class PICLiveCaptureManager:
     def restore_conv_tail(
         self,
         conv_tail_handle: int | None,
-        conv_tail: Sequence["torch.Tensor"],
+        conv_tail: Sequence[torch.Tensor],
     ) -> None:
         """Restore only the cached conv tail without touching transition state."""
         if conv_tail_handle is None:
@@ -689,9 +692,9 @@ class PICLiveCaptureManager:
         entry: PICSegmentEntry,
         *,
         request_id: str,
-        recurrent_state: Sequence["torch.Tensor"] = (),
-        transition_state: Sequence["torch.Tensor"] = (),
-        conv_tail: Sequence["torch.Tensor"] = (),
+        recurrent_state: Sequence[torch.Tensor] = (),
+        transition_state: Sequence[torch.Tensor] = (),
+        conv_tail: Sequence[torch.Tensor] = (),
     ) -> None:
         """Restore a scheduler materialization into caller-owned state tensors."""
         self._debug(
@@ -768,15 +771,15 @@ def _collect_mamba_state_tensors(
     *,
     request_id: str,
     segment: PICSegment,
-    request_state: "CachedRequestState",
-    kv_cache_config: "KVCacheConfig",
+    request_state: CachedRequestState,
+    kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
     state_position: int | None = None,
-) -> tuple[tuple["torch.Tensor", ...], tuple["torch.Tensor", ...]]:
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """Collect state tensors for one request and one exact segment boundary."""
     layout = PICStateLayout.from_kv_cache_config(kv_cache_config)
-    recurrent: list["torch.Tensor"] = []
-    conv_tail: list["torch.Tensor"] = []
+    recurrent: list[torch.Tensor] = []
+    conv_tail: list[torch.Tensor] = []
 
     for group_id, group_layout in enumerate(layout.groups):
         if not group_layout:
@@ -843,8 +846,8 @@ def apply_matched_mamba_transition(
     segment_index: int,
     segment: PICSegment,
     entry: PICSegmentEntry,
-    request_state: "CachedRequestState",
-    kv_cache_config: "KVCacheConfig",
+    request_state: CachedRequestState,
+    kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
     state_position: int,
     local_start: int = 0,
@@ -904,8 +907,7 @@ def apply_matched_mamba_transition(
             for target, source in zip(conv_tail, updated_conv):
                 target.copy_(source)
     manager._debug(
-        "transition applied request=%s segment=%d range=[%d,%d) "
-        "state_position=%d",
+        "transition applied request=%s segment=%d range=[%d,%d) state_position=%d",
         request_id,
         segment_index,
         segment.start + local_start,
@@ -921,8 +923,8 @@ def capture_completed_mamba_segment(
     segment_index: int,
     segment: PICSegment,
     completed_end: int,
-    request_state: "CachedRequestState",
-    kv_cache_config: "KVCacheConfig",
+    request_state: CachedRequestState,
+    kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
     transition_operator: PICTransitionOperator | None = None,
 ) -> PICMaterialization | None:
@@ -969,8 +971,8 @@ def _collect_native_kv_references(
     request_id: str,
     segment_index: int,
     segment: PICSegment,
-    request_state: "CachedRequestState",
-    kv_cache_config: "KVCacheConfig",
+    request_state: CachedRequestState,
+    kv_cache_config: KVCacheConfig,
 ) -> tuple[PICNativeKVReference, ...]:
     """Describe complete *segment-local* attention blocks.
 
@@ -999,14 +1001,10 @@ def _collect_native_kv_references(
     }
     for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
         spec = group.kv_cache_spec
-        if not isinstance(spec, AttentionSpec) or isinstance(
-            spec, CrossAttentionSpec
-        ):
+        if not isinstance(spec, AttentionSpec) or isinstance(spec, CrossAttentionSpec):
             continue
         block_size = int(spec.block_size)
-        local_span = get_full_local_block_span(
-            segment.end - segment.start, block_size
-        )
+        local_span = get_full_local_block_span(segment.end - segment.start, block_size)
         if local_span.block_count == 0:
             continue
 
@@ -1045,10 +1043,10 @@ def capture_transition_operator_segment(
     request_id: str,
     segment_index: int,
     segment: PICSegment,
-    request_state: "CachedRequestState",
-    kv_cache_config: "KVCacheConfig",
+    request_state: CachedRequestState,
+    kv_cache_config: KVCacheConfig,
     operator: PICTransitionOperator,
-    conv_tail: Sequence["torch.Tensor"] = (),
+    conv_tail: Sequence[torch.Tensor] = (),
 ) -> PICMaterialization | None:
     """Publish a captured operator when no live end-state page is available."""
     native_kv_refs = _collect_native_kv_references(
@@ -1075,8 +1073,8 @@ def restore_matched_mamba_segment(
     segment_index: int,
     segment: PICSegment,
     entry: PICSegmentEntry,
-    request_state: "CachedRequestState",
-    kv_cache_config: "KVCacheConfig",
+    request_state: CachedRequestState,
+    kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
 ) -> None:
     """Restore a matched scheduler entry into the target request's state block."""

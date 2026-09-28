@@ -10,9 +10,10 @@ block ID.  Later stages may attach a backend payload (for example, a set of
 non-contiguous GPU slots) without changing request or scheduler interfaces.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any
 
 
 class PICHandleKind(str, Enum):

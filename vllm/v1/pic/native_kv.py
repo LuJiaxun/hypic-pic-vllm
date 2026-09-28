@@ -115,7 +115,7 @@ class PICNativeKVLease:
         cls,
         block_pool: Any,
         block_ids: Sequence[int],
-    ) -> "PICNativeKVLease":
+    ) -> PICNativeKVLease:
         ids = tuple(int(block_id) for block_id in block_ids)
         if not ids:
             raise ValueError("PIC native KV lease requires at least one block")
@@ -137,7 +137,7 @@ class PICNativeKVLease:
         cls,
         block_pool: Any,
         block_ids: Sequence[int],
-    ) -> "PICNativeKVLease":
+    ) -> PICNativeKVLease:
         """Adopt blocks allocated by the caller without touching twice.
 
         ``BlockPool.get_new_blocks`` already gives the allocator owner one
@@ -231,9 +231,10 @@ class PICNativeKVReference:
                     "external PIC KV references cannot carry a local lease"
                 )
         else:
-            expected_blocks = ceil(
-                (source_token_start + self.token_count) / self.block_size
-            ) - source_block_start
+            expected_blocks = (
+                ceil((source_token_start + self.token_count) / self.block_size)
+                - source_block_start
+            )
             if len(self.block_ids) != expected_blocks:
                 raise ValueError(
                     "PIC native KV reference does not cover the canonical range: "
@@ -262,7 +263,7 @@ class PICNativeKVReference:
     def release(self) -> bool:
         return self.lease.release() if self.lease is not None else False
 
-    def with_lease(self, lease: PICNativeKVLease) -> "PICNativeKVReference":
+    def with_lease(self, lease: PICNativeKVLease) -> PICNativeKVReference:
         if lease.block_ids != self.block_ids:
             raise ValueError("native KV lease does not match reference block IDs")
         return PICNativeKVReference(
@@ -281,13 +282,14 @@ class PICNativeKVReference:
             external_provider=self.external_provider,
             external_key=self.external_key,
         )
-    def attach_to_block_pool(self, block_pool: Any) -> "PICNativeKVReference":
+
+    def attach_to_block_pool(self, block_pool: Any) -> PICNativeKVReference:
         """Pin this reference in a vLLM ``BlockPool`` for request lifetime."""
         return self.with_lease(
             PICNativeKVLease.from_block_pool(block_pool, self.block_ids)
         )
 
-    def without_lease(self) -> "PICNativeKVReference":
+    def without_lease(self) -> PICNativeKVReference:
         """Return the serializable scheduler-side form of this reference."""
         return PICNativeKVReference(
             kv_cache_group_id=self.kv_cache_group_id,
@@ -357,7 +359,7 @@ class PICNativeKVSlotPlan:
     block_size: int
     logical_block_ids: tuple[int, ...]
     physical_block_ids: tuple[int, ...]
-    slot_mapping: "torch.Tensor"
+    slot_mapping: torch.Tensor
     block_table_compatible: bool
     requires_private_materialization: bool = False
     fallback_reason: str | None = None
@@ -447,8 +449,9 @@ class PICNativeKVAllocation:
     @property
     def edge_prefix_tokens(self) -> int:
         """Tokens before the first complete native block in the target range."""
-        first_complete = ((self.target_start + self.block_size - 1)
-                          // self.block_size) * self.block_size
+        first_complete = (
+            (self.target_start + self.block_size - 1) // self.block_size
+        ) * self.block_size
         return max(0, min(self.target_end, first_complete) - self.target_start)
 
     @property
@@ -467,7 +470,7 @@ class PICNativeKVAllocation:
         slot_plan: PICNativeKVSlotPlan,
         *,
         private_block_ids: Sequence[int] = (),
-    ) -> "PICNativeKVAllocation":
+    ) -> PICNativeKVAllocation:
         """Bind a slot plan to its allocation owner at attach time.
 
         Whole-block plans alias the public physical blocks.  All other plans
@@ -488,9 +491,8 @@ class PICNativeKVAllocation:
 
         private = tuple(int(block_id) for block_id in private_block_ids)
         required_blocks = (
-            (slot_plan.target_end + slot_plan.block_size - 1)
-            // slot_plan.block_size
-        )
+            slot_plan.target_end + slot_plan.block_size - 1
+        ) // slot_plan.block_size
         if len(private) < required_blocks:
             raise ValueError(
                 "PIC private allocation row does not cover target range: "
@@ -545,7 +547,7 @@ def build_native_kv_slot_plan(
     reference: PICNativeKVReference,
     *,
     target_start: int,
-    device: "torch.device | str",
+    device: torch.device | str,
     kernel_block_size: int | None = None,
     local_start: int | None = None,
     token_count: int | None = None,
@@ -568,9 +570,7 @@ def build_native_kv_slot_plan(
     if target_start < 0:
         raise ValueError("PIC native KV target start must be non-negative")
     effective_local_start = (
-        reference.canonical_start
-        if local_start is None
-        else int(local_start)
+        reference.canonical_start if local_start is None else int(local_start)
     )
     effective_token_count = (
         reference.token_count if token_count is None else int(token_count)
@@ -578,8 +578,7 @@ def build_native_kv_slot_plan(
     if (
         effective_local_start < reference.canonical_start
         or effective_token_count <= 0
-        or effective_local_start + effective_token_count
-        > reference.canonical_end
+        or effective_local_start + effective_token_count > reference.canonical_end
     ):
         raise ValueError("PIC native KV local subrange is outside the reference")
     allocator_block_size = reference.block_size
@@ -593,8 +592,10 @@ def build_native_kv_slot_plan(
         )
     blocks_per_allocator_block = allocator_block_size // kernel_block_size
     target_end = target_start + effective_token_count
-    source_token_start = int(reference.source_token_start)
-    source_block_start = int(reference.source_block_start)
+    assert reference.source_token_start is not None
+    assert reference.source_block_start is not None
+    source_token_start = reference.source_token_start
+    source_block_start = reference.source_block_start
 
     local_positions = torch.arange(
         effective_local_start,
@@ -605,15 +606,15 @@ def build_native_kv_slot_plan(
     source_positions = source_token_start + (
         local_positions - reference.canonical_start
     )
-    allocator_block_indices = torch.div(
-        source_positions, allocator_block_size, rounding_mode="floor"
-    ) - source_block_start
+    allocator_block_indices = (
+        torch.div(source_positions, allocator_block_size, rounding_mode="floor")
+        - source_block_start
+    )
     physical_allocator_blocks = torch.as_tensor(
         reference.block_ids, dtype=torch.int64, device=device
     )
     physical_kernel_block_indices = (
-        physical_allocator_blocks[allocator_block_indices]
-        * blocks_per_allocator_block
+        physical_allocator_blocks[allocator_block_indices] * blocks_per_allocator_block
         + (source_positions % allocator_block_size) // kernel_block_size
     )
     slot_mapping = physical_kernel_block_indices * kernel_block_size + (
@@ -647,7 +648,8 @@ def build_native_kv_slot_plan(
         logical_blocks = tuple(
             first_logical_block + index
             for index in range(
-                effective_token_count // allocator_block_size
+                effective_token_count
+                // allocator_block_size
                 * blocks_per_allocator_block
             )
         )
@@ -659,11 +661,14 @@ def build_native_kv_slot_plan(
             dtype=torch.int64,
             device=device,
         )
-        source_allocator_indices = torch.div(
-            source_block_positions,
-            allocator_block_size,
-            rounding_mode="floor",
-        ) - source_block_start
+        source_allocator_indices = (
+            torch.div(
+                source_block_positions,
+                allocator_block_size,
+                rounding_mode="floor",
+            )
+            - source_block_start
+        )
         source_kernel_blocks = (
             physical_allocator_blocks[source_allocator_indices]
             * blocks_per_allocator_block
@@ -697,12 +702,12 @@ def build_native_kv_slot_plan(
 
 
 def gather_native_kv_slots(
-    kv_cache: "torch.Tensor",
-    slot_mapping: "torch.Tensor",
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
     *,
     block_size: int,
     layout: str,
-) -> tuple["torch.Tensor", "torch.Tensor"]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather K/V vectors from an existing vLLM native KV cache.
 
     The helper deliberately handles only the unquantized five-dimensional
@@ -748,12 +753,12 @@ def gather_native_kv_slots(
 
 
 def rerotate_native_key(
-    key: "torch.Tensor",
+    key: torch.Tensor,
     *,
     rotary_emb: Any,
-    source_positions: "torch.Tensor",
-    target_positions: "torch.Tensor",
-) -> "torch.Tensor":
+    source_positions: torch.Tensor,
+    target_positions: torch.Tensor,
+) -> torch.Tensor:
     """Move a cached RoPE key from source to target absolute positions.
 
     vLLM stores the already-rotated key in its native cache.  For a private
@@ -835,8 +840,8 @@ class PICRoPERerotationPlan:
         return self.target_start + self.token_count
 
     def positions(
-        self, device: "torch.device | str"
-    ) -> tuple["torch.Tensor", "torch.Tensor"]:
+        self, device: torch.device | str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         import torch
 
         source = torch.arange(
@@ -849,12 +854,10 @@ class PICRoPERerotationPlan:
 
 
 def materialize_private_rope_key(
-    public_key: "torch.Tensor",
+    public_key: torch.Tensor,
     plan: PICRoPERerotationPlan,
-    rerotate: Callable[
-        ["torch.Tensor", "torch.Tensor", "torch.Tensor"], "torch.Tensor"
-    ],
-) -> "torch.Tensor":
+    rerotate: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
     """Apply a caller-provided RoPE transform without mutating public K.
 
     The model/backend supplies ``rerotate`` because rotary variants differ

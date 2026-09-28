@@ -167,20 +167,25 @@ from vllm.v1.outputs import (
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
-from vllm.v1.pic.worker_plan import (
-    PICWorkerCapabilities,
-    PICWorkerPlan,
-    PICWorkerUnsupported,
-    build_worker_plan,
+from vllm.v1.pic.attention import (
+    PICAttentionBackendUnsupported,
+    build_pic_packed_attention_round,
 )
 from vllm.v1.pic.batch import (
     build_pic_batch_runtime_plan,
     build_pic_packed_batch_plan,
 )
-from vllm.v1.pic.attention import (
-    PICAttentionBackendUnsupported,
-    build_pic_packed_attention_round,
+from vllm.v1.pic.external_kv import (
+    PICExternalKVImportError,
+    PICExternalKVProvider,
+    PICExternalKVRegistry,
 )
+from vllm.v1.pic.kv_copyback import (
+    PICAttentionKVCacheCopyBack,
+    PICKVLayerTarget,
+    build_kv_slot_mapping,
+)
+from vllm.v1.pic.lifecycle import PICLeaseRegistry, PICLeaseToken
 from vllm.v1.pic.live_capture import (
     PICGDNTransitionCapture,
     PICLiveCaptureManager,
@@ -190,18 +195,7 @@ from vllm.v1.pic.live_capture import (
     ordered_gdn_layer_names,
     restore_matched_mamba_segment,
 )
-from vllm.v1.pic.runtime import (
-    PICRuntimeRange,
-    PICSingleRequestRuntimePlan,
-    build_single_request_runtime_plan,
-)
-from vllm.v1.pic.state import PICRequestStateBinding
-from vllm.v1.pic.single_request import build_single_request_plan
-from vllm.v1.pic.kv_copyback import (
-    PICAttentionKVCacheCopyBack,
-    PICKVLayerTarget,
-    build_kv_slot_mapping,
-)
+from vllm.v1.pic.metrics import PICMetrics
 from vllm.v1.pic.native_kv import (
     PICNativeKVAllocation,
     PICNativeKVRequestMapping,
@@ -209,15 +203,21 @@ from vllm.v1.pic.native_kv import (
     get_full_local_block_span,
     rerotate_native_key,
 )
-from vllm.v1.pic.lifecycle import PICLeaseRegistry, PICLeaseToken
-from vllm.v1.pic.metrics import PICMetrics
-from vllm.v1.pic.external_kv import (
-    PICExternalKVImportError,
-    PICExternalKVProvider,
-    PICExternalKVRegistry,
-)
 from vllm.v1.pic.pool import PICPhysicalPool
+from vllm.v1.pic.runtime import (
+    PICRuntimeRange,
+    PICSingleRequestRuntimePlan,
+    build_single_request_runtime_plan,
+)
 from vllm.v1.pic.segmenter import PICSegment
+from vllm.v1.pic.single_request import build_single_request_plan
+from vllm.v1.pic.state import PICRequestStateBinding
+from vllm.v1.pic.worker_plan import (
+    PICWorkerCapabilities,
+    PICWorkerPlan,
+    PICWorkerUnsupported,
+    build_worker_plan,
+)
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -507,9 +507,7 @@ class GPUModelRunner(
         self.pic_kv_copyback: PICAttentionKVCacheCopyBack | None = None
         pic_config = self.vllm_config.pic_config
         if pic_config.enabled and (
-            pic_config.capture_live
-            or pic_config.restore_live
-            or pic_config.copyback_kv
+            pic_config.capture_live or pic_config.restore_live or pic_config.copyback_kv
         ):
             if pic_config.max_cache_bytes is None:
                 logger.warning(
@@ -1334,8 +1332,8 @@ class GPUModelRunner(
             else:
                 generator = None
 
-            pic_worker_plan, pic_worker_fallback = (
-                self._build_pic_worker_plan(new_req_data)
+            pic_worker_plan, pic_worker_fallback = self._build_pic_worker_plan(
+                new_req_data
             )
 
             if self.is_pooling_model:
@@ -1712,14 +1710,12 @@ class GPUModelRunner(
             ),
             allow_fallback=self.vllm_config.pic_config.allow_fallback,
         )
-        did_fallback = (
-            worker_plan is None
-            and bool(new_req_data.pic_execution_plan.reused_ranges)
+        did_fallback = worker_plan is None and bool(
+            new_req_data.pic_execution_plan.reused_ranges
         )
         if did_fallback:
             logger.debug(
-                "PIC worker backend unavailable; request %s uses ordinary "
-                "forward",
+                "PIC worker backend unavailable; request %s uses ordinary forward",
                 new_req_data.req_id,
             )
         return worker_plan, did_fallback
@@ -1746,7 +1742,8 @@ class GPUModelRunner(
             return None
         if request_state.mm_features or request_state.prompt_embeds is not None:
             self._pic_debug(
-                "single-request runtime skipped request=%s reason=request_has_mm_inputs",
+                "single-request runtime skipped "
+                "request=%s reason=request_has_mm_inputs",
                 request_state.req_id,
             )
             return None
@@ -1903,7 +1900,9 @@ class GPUModelRunner(
             transition_cursor=transition_cursor,
         )
 
-    def _validate_pic_decode_bindings(self, scheduler_output: "SchedulerOutput") -> None:
+    def _validate_pic_decode_bindings(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
         """Keep decode on the request-owned native mapping when it is safe."""
         for req_id in self.input_batch.req_ids:
             request_state = self.requests.get(req_id)
@@ -1914,9 +1913,7 @@ class GPUModelRunner(
                 or request_state.num_computed_tokens <= 0
             ):
                 continue
-            scheduled_tokens = int(
-                scheduler_output.num_scheduled_tokens.get(req_id, 0)
-            )
+            scheduled_tokens = int(scheduler_output.num_scheduled_tokens.get(req_id, 0))
             binding = request_state.pic_state_binding
             if not binding.mark_decode_step(
                 num_computed_tokens=request_state.num_computed_tokens,
@@ -1972,9 +1969,7 @@ class GPUModelRunner(
 
     def _release_pic_request_leases(self, request_state: CachedRequestState) -> None:
         """Release request and in-flight references exactly once."""
-        for resource_key, token in tuple(
-            request_state.pic_native_kv_leases.items()
-        ):
+        for resource_key, token in tuple(request_state.pic_native_kv_leases.items()):
             self.pic_lease_registry.release(token)
             # Private blocks are owned by this request row. Once its request
             # reference is gone there is no later cache entry that can reuse
@@ -2049,9 +2044,7 @@ class GPUModelRunner(
                         row_idx,
                     )
             except Exception:
-                self._disable_pic_runtime(
-                    request_state, "native_slot_attach_failed"
-                )
+                self._disable_pic_runtime(request_state, "native_slot_attach_failed")
                 request_state.pic_worker_fallback = True
                 logger.warning(
                     "PIC native slot attach failed for request %s; falling back "
@@ -2094,9 +2087,7 @@ class GPUModelRunner(
                 spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
             ):
                 continue
-            public_ids = self._pic_public_blocks(
-                request_state, segment_index, group_id
-            )
+            public_ids = self._pic_public_blocks(request_state, segment_index, group_id)
             if not public_ids:
                 continue
             span = get_full_local_block_span(
@@ -2294,7 +2285,8 @@ class GPUModelRunner(
                 copy_impl = getattr(layer.impl, "do_kv_cache_update", None)
                 if kv_cache is None or copy_impl is None:
                     raise PICWorkerUnsupported(
-                        f"PIC private materialization has no KV update path for {layer_name}"
+                        "PIC private materialization has no KV update path "
+                        f"for {layer_name}"
                     )
                 key, value = gather_native_kv_slots(
                     kv_cache,
@@ -2305,7 +2297,8 @@ class GPUModelRunner(
                 rotary_emb = self._pic_rotary_embedding(layer_name, layer)
                 if rotary_emb is None:
                     raise PICWorkerUnsupported(
-                        f"PIC private materialization cannot resolve RoPE for {layer_name}"
+                        "PIC private materialization cannot resolve RoPE "
+                        f"for {layer_name}"
                     )
                 key = rerotate_native_key(
                     key,
@@ -2351,7 +2344,7 @@ class GPUModelRunner(
         # changing the model or backend interfaces.
         if not layer_name.endswith(".attn"):
             return None
-        rotary_name = layer_name[:-len(".attn")] + ".rotary_emb"
+        rotary_name = layer_name[: -len(".attn")] + ".rotary_emb"
         for root in (
             self.model,
             getattr(self.model, "model", None),
@@ -2398,7 +2391,9 @@ class GPUModelRunner(
         if intermediate_tensors is not None:
             raise PICWorkerUnsupported("PIC runtime does not support PP tensors")
         if self.speculative_config is not None:
-            raise PICWorkerUnsupported("PIC runtime does not support speculative decoding")
+            raise PICWorkerUnsupported(
+                "PIC runtime does not support speculative decoding"
+            )
         if request_id is None:
             if self.input_batch.num_reqs != 1:
                 raise PICWorkerUnsupported(
@@ -2415,11 +2410,11 @@ class GPUModelRunner(
             )
         if self.is_pooling_model:
             raise PICWorkerUnsupported("PIC runtime requires generation, not pooling")
-        if self.kv_cache_config.has_mamba_layers:
-            if self.pic_live_capture is None or not self.vllm_config.pic_config.restore_live:
-                raise PICWorkerUnsupported(
-                    "hybrid PIC runtime requires live state restore"
-                )
+        if self.kv_cache_config.has_mamba_layers and (
+            self.pic_live_capture is None
+            or not self.vllm_config.pic_config.restore_live
+        ):
+            raise PICWorkerUnsupported("hybrid PIC runtime requires live state restore")
         # The Stage 9-B prototype must not emulate a one-request microbatch by
         # leaving zero-token rows in the persistent InputBatch.  Attention
         # metadata and several model backends still use the batch row count,
@@ -2445,7 +2440,8 @@ class GPUModelRunner(
                     )
                     segment = (
                         request_state.pic_segments[runtime_range.segment_index]
-                        if 0 <= runtime_range.segment_index
+                        if 0
+                        <= runtime_range.segment_index
                         < len(request_state.pic_segments)
                         else None
                     )
@@ -2581,7 +2577,9 @@ class GPUModelRunner(
                 result = {
                     "model_output": model_output,
                     "attn_metadata": attn_metadata,
-                    "spec_decode_common_attn_metadata": spec_decode_common_attn_metadata,
+                    "spec_decode_common_attn_metadata": (
+                        spec_decode_common_attn_metadata
+                    ),
                     "spec_decode_metadata": spec_decode_metadata,
                     "input_ids": input_ids,
                     "inputs_embeds": inputs_embeds,
@@ -2695,9 +2693,11 @@ class GPUModelRunner(
                 "PIC packed runtime does not support multimodal requests"
             )
         if any(
-            int(self.input_batch.num_computed_tokens_cpu[
-                self.input_batch.req_id_to_index[req_id]
-            ])
+            int(
+                self.input_batch.num_computed_tokens_cpu[
+                    self.input_batch.req_id_to_index[req_id]
+                ]
+            )
             > 0
             for req_id in req_ids
         ):
@@ -2755,13 +2755,10 @@ class GPUModelRunner(
                             raise PICWorkerUnsupported(
                                 "PIC packed transition cache plan is missing"
                             )
-                        matched_entry = dict(cache_plan.matches).get(
-                            item.segment_index
-                        )
+                        matched_entry = dict(cache_plan.matches).get(item.segment_index)
                         segment = (
                             request_state.pic_segments[item.segment_index]
-                            if 0 <= item.segment_index
-                            < len(request_state.pic_segments)
+                            if 0 <= item.segment_index < len(request_state.pic_segments)
                             else None
                         )
                         if matched_entry is None or segment is None:
@@ -2923,8 +2920,7 @@ class GPUModelRunner(
                             local_end=item.end - segment.start,
                         )
                     self._pic_debug(
-                        "packed transition applied request=%s segment=%d "
-                        "range=[%d,%d)",
+                        "packed transition applied request=%s segment=%d range=[%d,%d)",
                         req_id,
                         item.segment_index,
                         item.start,
@@ -2966,7 +2962,9 @@ class GPUModelRunner(
                 last_result = {
                     "model_output": model_output,
                     "attn_metadata": attn_metadata,
-                    "spec_decode_common_attn_metadata": spec_decode_common_attn_metadata,
+                    "spec_decode_common_attn_metadata": (
+                        spec_decode_common_attn_metadata
+                    ),
                     "spec_decode_metadata": spec_decode_metadata,
                     "input_ids": input_ids,
                     "inputs_embeds": inputs_embeds,
@@ -3048,9 +3046,11 @@ class GPUModelRunner(
         # remain in vLLM's ordinary mixed decode/prefill path.  Do not turn it
         # into a synthetic one-token PIC recompute range.
         if any(
-            int(self.input_batch.num_computed_tokens_cpu[
-                self.input_batch.req_id_to_index[req_id]
-            ])
+            int(
+                self.input_batch.num_computed_tokens_cpu[
+                    self.input_batch.req_id_to_index[req_id]
+                ]
+            )
             > 0
             for req_id in self.input_batch.req_ids
         ):
@@ -3063,7 +3063,9 @@ class GPUModelRunner(
             tuple(self.input_batch.req_ids), runtime_plans
         )
         if not batch_plan.runtime_plans:
-            raise PICWorkerUnsupported("PIC batch runtime has no executable PIC request")
+            raise PICWorkerUnsupported(
+                "PIC batch runtime has no executable PIC request"
+            )
 
         # Every request, including ordinary/fallback requests, is executed via
         # the same isolated helper.  PIC requests use their range plan; the
@@ -3137,15 +3139,11 @@ class GPUModelRunner(
 
     def _pic_debug(self, message: str, *args: object) -> None:
         if self.vllm_config.pic_config.debug:
-            logger.warning("[PIC-DEBUG] " + message, *args)
+            logger.warning("[PIC-DEBUG] %s", message, *args)
 
     def get_pic_metrics(self) -> dict[str, Any]:
         """Return worker-local PIC counters and current resource gauges."""
-        pool = (
-            self.pic_live_capture.pool
-            if self.pic_live_capture is not None
-            else None
-        )
+        pool = self.pic_live_capture.pool if self.pic_live_capture is not None else None
         return self.pic_metrics.snapshot(
             lease_snapshot=self.pic_lease_registry.snapshot(),
             pool_capacity_bytes=(pool.capacity_bytes if pool is not None else None),
@@ -3208,7 +3206,10 @@ class GPUModelRunner(
         if manager is None or get_pp_group().world_size != 1:
             return
 
-        for req_id, num_scheduled_tokens in scheduler_output.num_scheduled_tokens.items():
+        for (
+            req_id,
+            num_scheduled_tokens,
+        ) in scheduler_output.num_scheduled_tokens.items():
             request_state = self.requests.get(req_id)
             if (
                 request_state is None
@@ -3490,7 +3491,8 @@ class GPUModelRunner(
                     targets = self._build_pic_kv_targets(req_index, segment)
                     copied_layers = copyback.copy_entry(segment, entry, targets)
                     logger.debug(
-                        "PIC KV copy-back restored request %s segment %s into %d layers",
+                        "PIC KV copy-back restored request %s segment %s "
+                        "into %d layers",
                         req_id,
                         segment_index,
                         copied_layers,
@@ -6190,10 +6192,7 @@ class GPUModelRunner(
             # output to the unchanged sampling/bookkeeping code.
             pic_runtime_result: dict[str, Any] | None = None
             pic_transition_capture: PICGDNTransitionCapture | None = None
-            if (
-                num_reqs > 1
-                and self.vllm_config.pic_config.packed_batch
-            ):
+            if num_reqs > 1 and self.vllm_config.pic_config.packed_batch:
                 batch_runtime_plans = {
                     req_id: request_state.pic_runtime_plan
                     for req_id in req_ids
@@ -6257,7 +6256,8 @@ class GPUModelRunner(
                                 intermediate_tensors,
                             )
                         self._pic_debug(
-                            "batch runtime executed pic_requests=%s ordinary_requests=%s",
+                            "batch runtime executed pic_requests=%s "
+                            "ordinary_requests=%s",
                             tuple(batch_runtime_plans),
                             tuple(
                                 req_id
@@ -6298,7 +6298,9 @@ class GPUModelRunner(
                             "single-request runtime executed miss ranges=%s",
                             [
                                 (item.start, item.end)
-                                for item in runtime_request.pic_runtime_plan.recompute_ranges
+                                for item in (
+                                    runtime_request.pic_runtime_plan.recompute_ranges
+                                )
                             ],
                         )
                     except PICWorkerUnsupported as exc:
@@ -9376,21 +9378,16 @@ class GPUModelRunner(
         # support, but the request-level gate above keeps actual image/video
         # requests on the ordinary path.
         pic_config = self.vllm_config.pic_config
-        hybrid_state_supported = (
-            not self.kv_cache_config.has_mamba_layers
-            or (
-                self.pic_live_capture is not None
-                and pic_config.restore_live
-                and pic_config.max_cache_bytes is not None
-            )
+        hybrid_state_supported = not self.kv_cache_config.has_mamba_layers or (
+            self.pic_live_capture is not None
+            and pic_config.restore_live
+            and pic_config.max_cache_bytes is not None
         )
         capability_reasons: list[str] = []
         if not pic_config.zero_copy:
             capability_reasons.append("zero_copy_disabled")
         if not (
-            pic_config.single_request
-            or pic_config.batch
-            or pic_config.packed_batch
+            pic_config.single_request or pic_config.batch or pic_config.packed_batch
         ):
             capability_reasons.append("runtime_execution_disabled")
         if self.speculative_config is not None:
@@ -9415,13 +9412,8 @@ class GPUModelRunner(
                 continue
             allocator_block_size = int(spec.block_size)
             kernel_block_size = int(kernel_block_size)
-            if (
-                kernel_block_size <= 0
-                or allocator_block_size % kernel_block_size != 0
-            ):
-                capability_reasons.append(
-                    f"group_{group_id}_kernel_block_not_divisor"
-                )
+            if kernel_block_size <= 0 or allocator_block_size % kernel_block_size != 0:
+                capability_reasons.append(f"group_{group_id}_kernel_block_not_divisor")
             attention_block_layouts.append(
                 (
                     group_id,

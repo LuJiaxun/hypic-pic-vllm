@@ -14,16 +14,16 @@ from vllm.v1.pic.worker_plan import PICWorkerUnsupported
 def apply_native_gdn_transition(
     *,
     backend: str,
-    key: "torch.Tensor",
-    value: "torch.Tensor",
-    log_decay: "torch.Tensor",
-    beta: "torch.Tensor",
-    chunk_w: "torch.Tensor | None",
-    chunk_u: "torch.Tensor | None",
-    chunk_g: "torch.Tensor | None",
+    key: torch.Tensor,
+    value: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_w: torch.Tensor | None,
+    chunk_u: torch.Tensor | None,
+    chunk_g: torch.Tensor | None,
     chunk_size: int,
-    state: "torch.Tensor",
-) -> "torch.Tensor":
+    state: torch.Tensor,
+) -> torch.Tensor:
     """Apply a cached transition using the model's active GDN backend."""
     if not state.is_cuda:
         raise PICWorkerUnsupported("native GDN transition requires CUDA tensors")
@@ -41,7 +41,7 @@ def apply_native_gdn_transition(
         # Triton/FLA GDN prefill path.  PIC does not run a separate Python
         # recurrence on the production CUDA path.
         with torch.no_grad():
-            _, _, final_state = chunk_gated_delta_rule_fwd_h(
+            outputs = chunk_gated_delta_rule_fwd_h(
                 k=key.unsqueeze(0).contiguous(),
                 w=chunk_w.unsqueeze(0).contiguous(),
                 u=chunk_u.unsqueeze(0).contiguous(),
@@ -50,6 +50,7 @@ def apply_native_gdn_transition(
                 output_final_state=True,
                 chunk_size=chunk_size,
             )
+        final_state = outputs[-1]
         if final_state is None:
             raise PICWorkerUnsupported(
                 "Triton GDN transition did not return final state"
@@ -89,17 +90,16 @@ def apply_native_gdn_transition(
         return final_state[0].to(dtype=state.dtype)
 
     raise PICWorkerUnsupported(
-        "PIC transition does not support the active GDN backend: "
-        f"{backend!r}"
+        f"PIC transition does not support the active GDN backend: {backend!r}"
     )
 
 
 def _build_fla_chunk_reference(
-    key: "torch.Tensor",
-    value: "torch.Tensor",
-    log_decay: "torch.Tensor",
-    beta: "torch.Tensor",
-) -> tuple["torch.Tensor", "torch.Tensor", "torch.Tensor", int] | None:
+    key: torch.Tensor,
+    value: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
     """Build the same WY tensors consumed by vLLM's native GDN path.
 
     This deliberately reuses existing vLLM FLA/Triton helpers.  No kernel is
@@ -156,14 +156,14 @@ def _build_fla_chunk_reference(
 
 
 def build_gdn_transition_operator(
-    key: "torch.Tensor",
-    value: "torch.Tensor",
-    log_decay: "torch.Tensor",
-    beta: "torch.Tensor",
+    key: torch.Tensor,
+    value: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
     *,
     token_start: int,
     token_end: int,
-    state_dtype: "torch.dtype | None" = None,
+    state_dtype: torch.dtype | None = None,
     use_fla_reference: bool | None = None,
     backend: str | None = None,
 ) -> PICTransitionOperator:

@@ -1,36 +1,40 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import pytest
 from types import SimpleNamespace
+from typing import Any
 
-from vllm.v1.pic.cache import PICSegmentCache, PICSegmentEntry
-from vllm.v1.pic.handles import PICHandleKind, PICHandlePool
-from vllm.v1.pic.execution import compile_execution_plan
-from vllm.v1.pic.live_capture import (
-    PICGDNTransitionCapture,
-    PICLiveCaptureManager,
-    ordered_gdn_layer_names,
+import pytest
+
+from vllm.v1.pic.attention import (
+    PICAttentionBackendUnsupported,
+    build_pic_packed_attention_round,
 )
+from vllm.v1.pic.batch import (
+    build_pic_batch_runtime_plan,
+    build_pic_packed_batch_plan,
+)
+from vllm.v1.pic.cache import PICSegmentCache, PICSegmentEntry
+from vllm.v1.pic.execution import compile_execution_plan
+from vllm.v1.pic.external_kv import (
+    PICExternalKVImportError,
+    PICExternalKVImportResult,
+    PICExternalKVRegistry,
+)
+from vllm.v1.pic.gdn_transition import build_gdn_transition_operator
+from vllm.v1.pic.handles import PICHandleKind, PICHandlePool
 from vllm.v1.pic.kv_copyback import (
     PICAttentionKVCacheCopyBack,
     PICKVLayerTarget,
     build_kv_slot_mapping,
 )
-from vllm.v1.pic.segmenter import split_text_and_tokenize, split_token_ids
-from vllm.v1.pic.pool import PICPhysicalPool, PICSlotMapping
-from vllm.v1.pic.snapshot import PICSnapshotStore
-from vllm.v1.pic.state import (
-    PICAffineTransition,
-    PICConvTransition,
-    PICGDNTransition,
-    PICStateLayout,
-    PICStateSpec,
-    PICTransitionOperator,
-    PICRequestStateBinding,
+from vllm.v1.pic.lifecycle import PICLeaseRegistry
+from vllm.v1.pic.live_capture import (
+    PICGDNTransitionCapture,
+    PICLiveCaptureManager,
+    ordered_gdn_layer_names,
 )
-from vllm.v1.pic.gdn_transition import build_gdn_transition_operator
-from vllm.v1.pic.worker_plan import build_worker_plan
+from vllm.v1.pic.metrics import PICMetrics
 from vllm.v1.pic.native_kv import (
     PICKVPositionMode,
     PICNativeKVAllocation,
@@ -38,8 +42,8 @@ from vllm.v1.pic.native_kv import (
     PICNativeKVLease,
     PICNativeKVReference,
     PICNativeKVRequestMapping,
-    PICRoPERerotationPlan,
     PICNativeKVSlotPlan,
+    PICRoPERerotationPlan,
     build_native_kv_slot_plan,
     gather_native_kv_slots,
     get_full_local_block_span,
@@ -48,27 +52,25 @@ from vllm.v1.pic.native_kv import (
     materialize_private_rope_key,
     rerotate_native_key,
 )
-from vllm.v1.pic.single_request import build_single_request_plan
+from vllm.v1.pic.pool import PICPhysicalPool, PICSlotMapping
 from vllm.v1.pic.runtime import (
     PICRuntimeRange,
     PICSingleRequestRuntimePlan,
     build_single_request_runtime_plan,
 )
-from vllm.v1.pic.batch import (
-    build_pic_batch_runtime_plan,
-    build_pic_packed_batch_plan,
+from vllm.v1.pic.segmenter import split_text_and_tokenize, split_token_ids
+from vllm.v1.pic.single_request import build_single_request_plan
+from vllm.v1.pic.snapshot import PICSnapshotStore
+from vllm.v1.pic.state import (
+    PICAffineTransition,
+    PICConvTransition,
+    PICGDNTransition,
+    PICRequestStateBinding,
+    PICStateLayout,
+    PICStateSpec,
+    PICTransitionOperator,
 )
-from vllm.v1.pic.attention import (
-    PICAttentionBackendUnsupported,
-    build_pic_packed_attention_round,
-)
-from vllm.v1.pic.lifecycle import PICLeaseRegistry
-from vllm.v1.pic.metrics import PICMetrics
-from vllm.v1.pic.external_kv import (
-    PICExternalKVImportError,
-    PICExternalKVImportResult,
-    PICExternalKVRegistry,
-)
+from vllm.v1.pic.worker_plan import build_worker_plan
 
 
 def test_pic_metrics_tracks_plan_and_request_local_fallback() -> None:
@@ -98,9 +100,7 @@ def test_pic_metrics_tracks_plan_and_request_local_fallback() -> None:
     assert snapshot["recompute_tokens"] == 3
     assert snapshot["seam_tokens"] == 2
     assert snapshot["fallbacks"] == 1
-    assert snapshot["fallback_reasons"] == {
-        "request-local-mapping-mismatch": 1
-    }
+    assert snapshot["fallback_reasons"] == {"request-local-mapping-mismatch": 1}
     assert snapshot["decode_mapping_reused"] == 1
     assert snapshot["leases"] == {"tokens": 1}
     assert snapshot["pool"] == {"capacity_bytes": 1024, "free_bytes": 768}
@@ -496,7 +496,7 @@ def test_handle_pool_is_reference_counted() -> None:
 
 def test_state_layout_has_no_states_for_attention_only_config() -> None:
     class AttentionOnlyConfig:
-        kv_cache_groups = []
+        kv_cache_groups: list[Any] = []
 
     layout = PICStateLayout.from_kv_cache_config(AttentionOnlyConfig())
     assert not layout.has_state
@@ -525,9 +525,7 @@ def test_execution_plan_preserves_nonprefix_ranges() -> None:
 
 
 def test_slot_mapping_allows_noncontiguous_physical_slots() -> None:
-    mapping = PICSlotMapping(
-        logical_positions=(4, 5, 6), physical_slots=(17, 2, 31)
-    )
+    mapping = PICSlotMapping(logical_positions=(4, 5, 6), physical_slots=(17, 2, 31))
     assert mapping.logical_positions == (4, 5, 6)
     assert mapping.physical_slots == (17, 2, 31)
 
@@ -624,12 +622,15 @@ def test_worker_plan_falls_back_without_range_execution() -> None:
     execution_plan = compile_execution_plan(
         segments, cache.build_plan(segments, seam_sink=1)
     )
-    assert build_worker_plan(
-        execution_plan,
-        prompt_len=4,
-        range_execution_supported=False,
-        allow_fallback=True,
-    ) is None
+    assert (
+        build_worker_plan(
+            execution_plan,
+            prompt_len=4,
+            range_execution_supported=False,
+            allow_fallback=True,
+        )
+        is None
+    )
 
 
 def test_worker_plan_builds_skip_and_recompute_positions() -> None:
@@ -671,9 +672,7 @@ def test_live_capture_publishes_and_releases_state_materialization() -> None:
     assert manager.take_pending() == [materialization]
 
     restored = torch.zeros_like(recurrent)
-    pool.restore_tensor_snapshot(
-        materialization.recurrent_state_handle, (restored,)
-    )
+    pool.restore_tensor_snapshot(materialization.recurrent_state_handle, (restored,))
     assert torch.equal(recurrent, restored)
 
     manager.release_request("request-1")
@@ -718,9 +717,7 @@ def test_gdn_transition_matches_torch_recurrent_update() -> None:
         [[[2.0, 3.0]], [[4.0, 5.0]]],
         dtype=torch.float32,
     )
-    log_decay = torch.log(
-        torch.tensor([[0.5], [0.25]], dtype=torch.float32)
-    )
+    log_decay = torch.log(torch.tensor([[0.5], [0.25]], dtype=torch.float32))
     beta = torch.tensor([[0.2], [0.4]], dtype=torch.float32)
     operator = build_gdn_transition_operator(
         key,
@@ -742,8 +739,7 @@ def test_gdn_transition_matches_torch_recurrent_update() -> None:
         expected = (
             decay * expected
             + beta_value
-            * (value_value - (expected * key_value).sum(dim=-1))
-            .unsqueeze(-1)
+            * (value_value - (expected * key_value).sum(dim=-1)).unsqueeze(-1)
             * key_value
         )
 
@@ -760,8 +756,7 @@ def test_gdn_transition_matches_torch_recurrent_update() -> None:
         zero_expected = (
             decay * zero_expected
             + beta_value
-            * (value_value - (zero_expected * key_value).sum(dim=-1))
-            .unsqueeze(-1)
+            * (value_value - (zero_expected * key_value).sum(dim=-1)).unsqueeze(-1)
             * key_value
         )
     assert torch.allclose(zero_state, zero_expected)
@@ -792,6 +787,7 @@ def test_gdn_transition_keeps_storage_dtype_and_gqa_compact() -> None:
         state_dtype=torch.float32,
     )
     transition = operator.transitions[0]
+    assert isinstance(transition, PICGDNTransition)
     assert transition.key.dtype == torch.bfloat16
     assert transition.value.dtype == torch.bfloat16
     assert transition.key.shape[1] == 1
@@ -840,9 +836,7 @@ def test_gdn_chunked_reference_matches_chunk_delta_h_ordering() -> None:
         ],
         dtype=torch.bfloat16,
     )
-    chunk_g = torch.tensor(
-        [[-0.25], [-0.5], [-0.75]], dtype=torch.float32
-    )
+    chunk_g = torch.tensor([[-0.25], [-0.5], [-0.75]], dtype=torch.float32)
     zero_state = torch.zeros((1, 2, 2), dtype=torch.float32)
     transition = PICGDNTransition(
         key=key,
@@ -877,9 +871,7 @@ def test_gdn_chunked_reference_matches_chunk_delta_h_ordering() -> None:
 
 def test_gdn_transition_slice_matches_full_transition_suffix() -> None:
     torch = pytest.importorskip("torch")
-    key = torch.tensor(
-        [[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]], dtype=torch.float32
-    )
+    key = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]], [[1.0, 1.0]]], dtype=torch.float32)
     value = torch.tensor(
         [[[2.0, 3.0]], [[4.0, 5.0]], [[6.0, 7.0]]], dtype=torch.float32
     )
@@ -903,9 +895,7 @@ def test_gdn_transition_slice_matches_full_transition_suffix() -> None:
         key_token = key[token_index, 0]
         value_token = value[token_index, 0]
         expected = expected + (
-            (value_token - (expected * key_token).sum(dim=-1))
-            .unsqueeze(-1)
-            * key_token
+            (value_token - (expected * key_token).sum(dim=-1)).unsqueeze(-1) * key_token
         )
     actual = sliced.apply((full_after_first,))[0]
     assert torch.allclose(actual, expected)
@@ -920,9 +910,7 @@ def test_conv_transition_slice_updates_dim_first_and_state_first_layouts() -> No
 
     expected = inputs[-2:]
     assert torch.equal(transition.slice(1, 3).apply(state_sd), expected)
-    assert torch.equal(
-        transition.slice(1, 3).apply(state_ds), expected.transpose(0, 1)
-    )
+    assert torch.equal(transition.slice(1, 3).apply(state_ds), expected.transpose(0, 1))
 
 
 def test_gdn_capture_hook_publishes_operator_and_zero_conv_tail() -> None:
@@ -965,14 +953,10 @@ def test_gdn_capture_hook_publishes_operator_and_zero_conv_tail() -> None:
         conv_input[-2:].transpose(0, 1),
     )
     conv_state = torch.zeros((2, 4), dtype=torch.float32)
-    conv_result = request_state.pic_transition_operators[0].apply_conv(
-        (conv_state,)
-    )[0]
+    conv_result = request_state.pic_transition_operators[0].apply_conv((conv_state,))[0]
     assert torch.equal(conv_result, conv_input[-2:])
     zero_state = torch.zeros((1, 2, 2), dtype=torch.float32)
-    final_state = request_state.pic_transition_operators[0].apply(
-        (zero_state,)
-    )[0]
+    final_state = request_state.pic_transition_operators[0].apply((zero_state,))[0]
     assert capture.validate_gdn_layer(
         "model.layers.0.linear_attn",
         zero_state.unsqueeze(0),
@@ -1261,7 +1245,7 @@ def test_kv_copyback_restores_snapshot_through_existing_target_callback() -> Non
         token_ids=segments[0].token_ids,
         full_kv_handles=snapshot.full_kv_handles,
     )
-    copied: list[torch.Tensor] = []
+    copied: list[Any] = []
     target = PICKVLayerTarget(
         layer_name="layer.0",
         slot_mapping=torch.tensor([0, 1], dtype=torch.int64),
@@ -1431,20 +1415,14 @@ def test_native_slot_plan_tracks_absolute_source_offsets() -> None:
 def test_native_kv_gather_supports_nhd_and_hnd_layouts() -> None:
     torch = pytest.importorskip("torch")
     # Three blocks, two tokens per block, one KV head, two head dimensions.
-    nhd = torch.arange(2 * 3 * 2 * 1 * 2, dtype=torch.float32).reshape(
-        2, 3, 2, 1, 2
-    )
+    nhd = torch.arange(2 * 3 * 2 * 1 * 2, dtype=torch.float32).reshape(2, 3, 2, 1, 2)
     hnd = nhd.permute(0, 1, 3, 2, 4).contiguous()
     slots = torch.tensor([0, 3, 4], dtype=torch.int64)
     expected_key = torch.stack((nhd[0, 0, 0], nhd[0, 1, 1], nhd[0, 2, 0]))
     expected_value = torch.stack((nhd[1, 0, 0], nhd[1, 1, 1], nhd[1, 2, 0]))
 
-    nhd_key, nhd_value = gather_native_kv_slots(
-        nhd, slots, block_size=2, layout="NHD"
-    )
-    hnd_key, hnd_value = gather_native_kv_slots(
-        hnd, slots, block_size=2, layout="HND"
-    )
+    nhd_key, nhd_value = gather_native_kv_slots(nhd, slots, block_size=2, layout="NHD")
+    hnd_key, hnd_value = gather_native_kv_slots(hnd, slots, block_size=2, layout="HND")
 
     assert torch.equal(nhd_key, expected_key)
     assert torch.equal(nhd_value, expected_value)
@@ -1753,8 +1731,9 @@ def test_single_request_runtime_allows_partial_hybrid_range_with_transition() ->
     assert any(item.action == "reuse" for item in runtime_plan.ranges)
 
 
-def test_single_request_runtime_allows_partial_conv_tail_reuse_with_transition(
-) -> None:
+def test_single_request_runtime_allows_partial_conv_tail_reuse_with_transition() -> (
+    None
+):
     segments = split_token_ids([1, 2, 3, 4, 5, 9, 6, 9, 7], [9])
     reference = PICNativeKVReference(
         kv_cache_group_id=0,
@@ -1798,8 +1777,9 @@ def test_single_request_runtime_allows_partial_conv_tail_reuse_with_transition(
     assert any(item.action == "reuse" for item in runtime_plan.ranges)
 
 
-def test_single_request_runtime_plan_uses_private_copy_for_unaligned_native_range(
-) -> None:
+def test_single_request_runtime_plan_uses_private_copy_for_unaligned_native_range() -> (
+    None
+):
     segments = split_token_ids([1, 2, 9, 3, 4, 5, 9, 6], [9])
     reference = PICNativeKVReference(
         kv_cache_group_id=0,

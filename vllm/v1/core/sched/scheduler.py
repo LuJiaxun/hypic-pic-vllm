@@ -61,10 +61,12 @@ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.pic.cache import PICSegmentCache
 from vllm.v1.pic.execution import compile_execution_plan
 from vllm.v1.pic.materialization import PICMaterialization
-from vllm.v1.pic.native_kv import PICNativeKVLease
-from vllm.v1.pic.native_kv import get_full_local_block_span
-from vllm.v1.pic.native_kv import has_complete_native_kv_reference
-from vllm.v1.pic.native_kv import is_pic_public_segment_cacheable
+from vllm.v1.pic.native_kv import (
+    PICNativeKVLease,
+    get_full_local_block_span,
+    has_complete_native_kv_reference,
+    is_pic_public_segment_cacheable,
+)
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -264,9 +266,7 @@ class Scheduler(SchedulerInterface):
         # Public canonical KV is allocated independently from a request's
         # ordinary blocks.  The allocation owner is transferred to
         # ``_pic_native_leases`` only after the worker has materialized it.
-        self._pic_public_allocations: dict[
-            tuple[str, bytes, int], tuple[Any, ...]
-        ] = {}
+        self._pic_public_allocations: dict[tuple[str, bytes, int], tuple[Any, ...]] = {}
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -1782,11 +1782,11 @@ class Scheduler(SchedulerInterface):
 
             if lease_failed:
                 for reference in item.native_kv_refs:
-                    lease = self._pic_native_leases.pop(
-                        (item.seg_hash, reference.kv_cache_group_id), None
-                    )
-                    if lease is not None:
-                        lease.release()
+                    lease_key = (item.seg_hash, reference.kv_cache_group_id)
+                    failed_lease = self._pic_native_leases.get(lease_key)
+                    if failed_lease is not None:
+                        self._pic_native_leases.pop(lease_key)
+                        failed_lease.release()
                 native_kv_refs = ()
                 self.pic_cache.clear_native_kv(segment)
 
@@ -1810,8 +1810,7 @@ class Scheduler(SchedulerInterface):
                     item.conv_tail_handle,
                     item.full_kv_handles,
                     tuple(
-                        reference.kv_cache_group_id
-                        for reference in item.native_kv_refs
+                        reference.kv_cache_group_id for reference in item.native_kv_refs
                     ),
                 )
 

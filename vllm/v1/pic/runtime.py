@@ -12,8 +12,9 @@ request-local execution view.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 from vllm.v1.pic.native_kv import (
     PICNativeKVKind,
@@ -82,7 +83,7 @@ def build_single_request_runtime_plan(
     plan: PICSingleRequestPlan | None,
     *,
     native_kv_refs_by_group: Sequence[PICNativeKVReference],
-    device: "torch.device | str",
+    device: torch.device | str,
     prompt_len: int,
     allow_fallback: bool,
     kernel_block_sizes: Sequence[int] | None = None,
@@ -180,9 +181,7 @@ def build_single_request_runtime_plan(
                     alignment = reference.block_size
                 else:
                     try:
-                        alignment = int(
-                            kernel_block_sizes[reference.kv_cache_group_id]
-                        )
+                        alignment = int(kernel_block_sizes[reference.kv_cache_group_id])
                     except IndexError as exc:
                         raise PICWorkerUnsupported(
                             "worker kernel block-size list has no entry for "
@@ -192,11 +191,10 @@ def build_single_request_runtime_plan(
                     raise PICWorkerUnsupported(
                         "PIC kernel block size must divide the allocator block size"
                     )
+                assert reference.source_token_start is not None
                 origin = reference.canonical_start
                 target_phase = (-item.start) % alignment
-                source_phase = (
-                    -int(reference.source_token_start) + origin
-                ) % alignment
+                source_phase = (-reference.source_token_start + origin) % alignment
                 # Canonical public KV is copied into a request-private row,
                 # so its token-level gather/rerotation path does not require
                 # the source and target request phases to coincide.  A
@@ -213,12 +211,12 @@ def build_single_request_runtime_plan(
                     aligned_start = candidate_start
                     aligned_end = candidate_end
                 else:
-                    aligned_start = candidate_start + (
-                        target_phase - candidate_start
-                    ) % alignment
-                    aligned_end = candidate_end - (
-                        candidate_end - target_phase
-                    ) % alignment
+                    aligned_start = (
+                        candidate_start + (target_phase - candidate_start) % alignment
+                    )
+                    aligned_end = (
+                        candidate_end - (candidate_end - target_phase) % alignment
+                    )
                 reusable_starts.append(aligned_start)
                 reusable_ends.append(aligned_end)
             reusable_local_start = max(reusable_starts)

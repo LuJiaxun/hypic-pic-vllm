@@ -43,7 +43,7 @@ class PICPackedAttentionRound:
 
     request_ids: tuple[str, ...]
     query_lengths: tuple[int, ...]
-    query_start_loc: "torch.Tensor"
+    query_start_loc: torch.Tensor
     absolute_ranges: tuple[tuple[int, int], ...]
     positions_shape: tuple[int, ...]
     num_tokens: int
@@ -55,8 +55,8 @@ def build_pic_packed_attention_round(
     request_ids: Sequence[str],
     active_ranges: Mapping[str, PICRuntimeRange],
     *,
-    positions: "torch.Tensor",
-    slot_mappings_by_group: Mapping[int, "torch.Tensor"] | None,
+    positions: torch.Tensor,
+    slot_mappings_by_group: Mapping[int, torch.Tensor] | None,
     num_tokens_padded: int,
 ) -> PICPackedAttentionRound:
     """Validate and describe one native attention packed round.
@@ -121,9 +121,7 @@ def build_pic_packed_attention_round(
         )
     for group_id, slot_mapping in slot_mappings_by_group.items():
         if not isinstance(group_id, int):
-            raise PICAttentionBackendUnsupported(
-                "PIC KV group IDs must be integers"
-            )
+            raise PICAttentionBackendUnsupported("PIC KV group IDs must be integers")
         if not isinstance(slot_mapping, torch.Tensor):
             raise PICAttentionBackendUnsupported(
                 f"PIC slot mapping for group {group_id} is not a tensor"

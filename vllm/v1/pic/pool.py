@@ -9,8 +9,9 @@ mapping layer.  The pool stores opaque tensor snapshots; attention backends
 may later copy them into the model KV cache or consume their slot metadata.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 from vllm.v1.pic.handles import PICHandle, PICHandleKind, PICHandlePool
 
@@ -106,7 +107,6 @@ class PICPhysicalPool:
         token_end: int = 0,
     ) -> PICHandle:
         """Allocate storage and copy a sequence of tensors into it."""
-        import torch
 
         if not tensors:
             raise ValueError("PIC snapshot must contain at least one tensor")
@@ -219,9 +219,7 @@ class PICPhysicalPool:
                 )
                 for region in regions
             )
-            return PICPhysicalAllocation(
-                aligned_offset, size_bytes, absolute_regions
-            )
+            return PICPhysicalAllocation(aligned_offset, size_bytes, absolute_regions)
 
         raise MemoryError(
             f"PIC physical pool exhausted: requested {size_bytes} bytes, "

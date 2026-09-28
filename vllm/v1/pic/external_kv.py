@@ -16,10 +16,10 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from vllm.v1.pic.native_kv import (
+    PICKVPositionMode,
     PICNativeKVKind,
     PICNativeKVLease,
     PICNativeKVReference,
-    PICKVPositionMode,
 )
 
 

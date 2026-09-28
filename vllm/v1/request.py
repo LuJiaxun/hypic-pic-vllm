@@ -169,6 +169,7 @@ class Request:
         )
         self.pic_mode = pic_mode if self.pic_enabled else None
         self.pic_seam_sink = pic_seam_sink if self.pic_enabled else None
+        self.pic_segments: list[PICSegment] | None
         if self.pic_enabled and prompt_token_ids is not None:
             if pic_segment_ranges is None:
                 raise ValueError(

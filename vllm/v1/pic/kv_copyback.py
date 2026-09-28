@@ -27,8 +27,8 @@ class PICKVLayerTarget:
     """One existing vLLM attention layer that can receive restored KV data."""
 
     layer_name: str
-    slot_mapping: "torch.Tensor"
-    copy_kv: Callable[["torch.Tensor", "torch.Tensor"], None]
+    slot_mapping: torch.Tensor
+    copy_kv: Callable[[torch.Tensor, torch.Tensor], None]
 
 
 def build_kv_slot_mapping(
@@ -37,8 +37,8 @@ def build_kv_slot_mapping(
     block_size: int,
     token_start: int,
     token_end: int,
-    device: "torch.device | str",
-) -> "torch.Tensor":
+    device: torch.device | str,
+) -> torch.Tensor:
     """Build vLLM kernel slots for a contiguous logical token range.
 
     ``block_ids`` must already be in the attention kernel's block-id space.
@@ -64,8 +64,9 @@ def build_kv_slot_mapping(
             f"last_block={int(block_indices.max().item())}, "
             f"num_blocks={len(block_ids)}"
         )
-    blocks = torch.as_tensor(tuple(int(block) for block in block_ids),
-                             dtype=torch.int64, device=device)
+    blocks = torch.as_tensor(
+        tuple(int(block) for block in block_ids), dtype=torch.int64, device=device
+    )
     return blocks[block_indices] * block_size + torch.remainder(positions, block_size)
 
 

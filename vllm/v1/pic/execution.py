@@ -10,8 +10,9 @@ metadata result into that description without changing vLLM's existing
 ``num_computed_tokens`` semantics.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, Sequence
+from typing import Literal
 
 from vllm.v1.pic.cache import PICCachePlan, PICSegmentEntry
 from vllm.v1.pic.native_kv import PICKVPositionMode

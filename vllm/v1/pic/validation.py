@@ -12,9 +12,10 @@ returned generation logprobs.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from math import isclose
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -102,9 +103,7 @@ def compare_completion_responses(
         else:
             diffs = [
                 abs(reference_value - pic_value)
-                for reference_value, pic_value in zip(
-                    reference_logprobs, pic_logprobs
-                )
+                for reference_value, pic_value in zip(reference_logprobs, pic_logprobs)
             ]
             max_diff = max(diffs, default=0.0)
             logprobs_equal = all(
@@ -114,9 +113,7 @@ def compare_completion_responses(
                     rel_tol=logprob_rtol,
                     abs_tol=logprob_atol,
                 )
-                for reference_value, pic_value in zip(
-                    reference_logprobs, pic_logprobs
-                )
+                for reference_value, pic_value in zip(reference_logprobs, pic_logprobs)
             )
 
     reference_prompt_tokens = _usage_value(reference, "prompt_tokens")

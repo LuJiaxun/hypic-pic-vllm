@@ -16,6 +16,17 @@ from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import swap_dict_values
 from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.pic.cache import PICCachePlan
+from vllm.v1.pic.execution import PICExecutionPlan
+from vllm.v1.pic.lifecycle import PICLeaseToken
+from vllm.v1.pic.native_kv import (
+    PICNativeKVAllocation,
+    PICNativeKVRequestMapping,
+)
+from vllm.v1.pic.runtime import PICSingleRequestRuntimePlan
+from vllm.v1.pic.segmenter import PICSegment
+from vllm.v1.pic.state import PICRequestStateBinding, PICTransitionOperator
+from vllm.v1.pic.worker_plan import PICWorkerPlan
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import (
     BatchUpdateBuilder,
@@ -28,17 +39,6 @@ from vllm.v1.sample.thinking_budget_state import (
 )
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
-from vllm.v1.pic.cache import PICCachePlan
-from vllm.v1.pic.segmenter import PICSegment
-from vllm.v1.pic.execution import PICExecutionPlan
-from vllm.v1.pic.worker_plan import PICWorkerPlan
-from vllm.v1.pic.runtime import PICSingleRequestRuntimePlan
-from vllm.v1.pic.state import PICRequestStateBinding, PICTransitionOperator
-from vllm.v1.pic.native_kv import (
-    PICNativeKVAllocation,
-    PICNativeKVRequestMapping,
-)
-from vllm.v1.pic.lifecycle import PICLeaseToken
 
 
 @dataclass
@@ -88,9 +88,9 @@ class CachedRequestState:
     pic_native_kv_mapping: PICNativeKVRequestMapping | None = None
     # Allocation-time ownership records. Public canonical blocks and the
     # request-private row are kept separate across scheduler row moves.
-    pic_native_kv_allocations: dict[
-        tuple[int, int, int], PICNativeKVAllocation
-    ] = field(default_factory=dict)
+    pic_native_kv_allocations: dict[tuple[int, int, int], PICNativeKVAllocation] = (
+        field(default_factory=dict)
+    )
     # Worker-side references for native public/private allocations. The
     # scheduler owns the real public BlockPool lease; these tokens protect the
     # worker request view until finish/fallback/plan refresh.

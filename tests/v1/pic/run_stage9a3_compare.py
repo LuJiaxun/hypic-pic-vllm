@@ -94,9 +94,7 @@ def main() -> int:
     reference = dict(common)
     reference["prompt"] = pic_token_ids
     reference["vllm_xargs"] = {"pic_enabled": False}
-    reference_response = _post(
-        f"{args.base_url.rstrip('/')}/v1/completions", reference
-    )
+    reference_response = _post(f"{args.base_url.rstrip('/')}/v1/completions", reference)
 
     pic = dict(common)
     pic["prompt"] = prompt

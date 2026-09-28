@@ -1191,34 +1191,16 @@ class EngineArgs:
         pic_group.add_argument("--pic-mode", **pic_kwargs["mode"])
         pic_group.add_argument("--pic-separator", **pic_kwargs["separator"])
         pic_group.add_argument("--pic-seam-sink", **pic_kwargs["seam_sink"])
-        pic_group.add_argument(
-            "--pic-exclusive-batch", **pic_kwargs["exclusive_batch"]
-        )
-        pic_group.add_argument(
-            "--pic-allow-fallback", **pic_kwargs["allow_fallback"]
-        )
-        pic_group.add_argument(
-            "--pic-max-cache-bytes", **pic_kwargs["max_cache_bytes"]
-        )
-        pic_group.add_argument(
-            "--pic-capture-live", **pic_kwargs["capture_live"]
-        )
-        pic_group.add_argument(
-            "--pic-restore-live", **pic_kwargs["restore_live"]
-        )
-        pic_group.add_argument(
-            "--pic-copyback-kv", **pic_kwargs["copyback_kv"]
-        )
-        pic_group.add_argument(
-            "--pic-zero-copy", **pic_kwargs["zero_copy"]
-        )
-        pic_group.add_argument(
-            "--pic-single-request", **pic_kwargs["single_request"]
-        )
+        pic_group.add_argument("--pic-exclusive-batch", **pic_kwargs["exclusive_batch"])
+        pic_group.add_argument("--pic-allow-fallback", **pic_kwargs["allow_fallback"])
+        pic_group.add_argument("--pic-max-cache-bytes", **pic_kwargs["max_cache_bytes"])
+        pic_group.add_argument("--pic-capture-live", **pic_kwargs["capture_live"])
+        pic_group.add_argument("--pic-restore-live", **pic_kwargs["restore_live"])
+        pic_group.add_argument("--pic-copyback-kv", **pic_kwargs["copyback_kv"])
+        pic_group.add_argument("--pic-zero-copy", **pic_kwargs["zero_copy"])
+        pic_group.add_argument("--pic-single-request", **pic_kwargs["single_request"])
         pic_group.add_argument("--pic-batch", **pic_kwargs["batch"])
-        pic_group.add_argument(
-            "--pic-packed-batch", **pic_kwargs["packed_batch"]
-        )
+        pic_group.add_argument("--pic-packed-batch", **pic_kwargs["packed_batch"])
         pic_group.add_argument("--pic-mooncake", **pic_kwargs["mooncake"])
         pic_group.add_argument("--pic-debug", **pic_kwargs["debug"])
 

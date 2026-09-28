@@ -3,8 +3,8 @@
 
 """Worker-side PIC execution gate and skip/recompute descriptors."""
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 
 from vllm.v1.pic.execution import PICExecutionPlan, PICExecutionRange
 
@@ -87,8 +87,7 @@ def build_worker_plan(
         if allow_fallback:
             return None
         raise PICWorkerUnsupported(
-            "PIC plan contains reused ranges without materialized physical "
-            "handles"
+            "PIC plan contains reused ranges without materialized physical handles"
         )
 
     if execution_plan.reused_ranges and not range_execution_supported:

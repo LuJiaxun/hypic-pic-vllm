@@ -16,7 +16,6 @@ from dataclasses import dataclass
 
 from vllm.v1.pic.execution import PICExecutionPlan, PICExecutionRange
 from vllm.v1.pic.worker_plan import (
-    PICWorkerPlan,
     PICWorkerUnsupported,
     build_worker_plan,
 )
@@ -43,9 +42,7 @@ class PICSingleRequestPlan:
             raise ValueError("PIC single-request skip/recompute positions overlap")
         all_positions = set(self.skip_positions) | set(self.recompute_positions)
         if all_positions != set(range(prompt_len)):
-            raise ValueError(
-                "PIC single-request positions do not cover the prompt"
-            )
+            raise ValueError("PIC single-request positions do not cover the prompt")
 
 
 def build_single_request_plan(

@@ -4,38 +4,27 @@
 """Position-independent segment-cache primitives."""
 
 from vllm.v1.pic.cache import PICCachePlan, PICSegmentCache, PICSegmentEntry
-from vllm.v1.pic.handles import PICHandle, PICHandleKind, PICHandlePool
-from vllm.v1.pic.state import (
-    PICAffineTransition,
-    PICConvTransition,
-    PICGDNTransition,
-    PICLinearTransition,
-    PICStateLayout,
-    PICStateSpec,
-    PICTransitionOperator,
-    PICRequestStateBinding,
-)
-from vllm.v1.pic.gdn_transition import build_gdn_transition_operator
 from vllm.v1.pic.execution import (
     PICExecutionPlan,
     PICExecutionRange,
     PICTransition,
     compile_execution_plan,
 )
-from vllm.v1.pic.pool import (
-    PICPhysicalAllocation,
-    PICPhysicalPool,
-    PICSlotMapping,
-    PICTensorRegion,
+from vllm.v1.pic.external_kv import (
+    PICExternalKVImportError,
+    PICExternalKVImportRequest,
+    PICExternalKVImportResult,
+    PICExternalKVProvider,
+    PICExternalKVRegistry,
 )
-from vllm.v1.pic.snapshot import PICPhysicalSnapshot, PICSnapshotStore
-from vllm.v1.pic.worker_plan import (
-    PICWorkerCapabilities,
-    PICWorkerPlan,
-    PICWorkerUnsupported,
-    build_worker_plan,
+from vllm.v1.pic.gdn_transition import build_gdn_transition_operator
+from vllm.v1.pic.handles import PICHandle, PICHandleKind, PICHandlePool
+from vllm.v1.pic.kv_copyback import (
+    PICAttentionKVCacheCopyBack,
+    PICKVLayerTarget,
+    build_kv_slot_mapping,
 )
-from vllm.v1.pic.materialization import PICMaterialization
+from vllm.v1.pic.lifecycle import PICLeaseRegistry, PICLeaseToken
 from vllm.v1.pic.live_capture import (
     PICGDNTransitionCapture,
     PICLiveCaptureManager,
@@ -43,17 +32,14 @@ from vllm.v1.pic.live_capture import (
     capture_transition_operator_segment,
     restore_matched_mamba_segment,
 )
-from vllm.v1.pic.kv_copyback import (
-    PICKVLayerTarget,
-    PICAttentionKVCacheCopyBack,
-    build_kv_slot_mapping,
-)
+from vllm.v1.pic.materialization import PICMaterialization
+from vllm.v1.pic.metrics import PICMetrics
 from vllm.v1.pic.native_kv import (
-    PICLocalBlockSpan,
     PICKVPositionMode,
+    PICLocalBlockSpan,
+    PICNativeKVAllocation,
     PICNativeKVKind,
     PICNativeKVLease,
-    PICNativeKVAllocation,
     PICNativeKVReference,
     PICNativeKVRequestMapping,
     PICNativeKVSlotPlan,
@@ -64,18 +50,11 @@ from vllm.v1.pic.native_kv import (
     materialize_private_rope_key,
     rerotate_native_key,
 )
-from vllm.v1.pic.lifecycle import PICLeaseRegistry, PICLeaseToken
-from vllm.v1.pic.metrics import PICMetrics
-from vllm.v1.pic.external_kv import (
-    PICExternalKVImportError,
-    PICExternalKVImportRequest,
-    PICExternalKVImportResult,
-    PICExternalKVProvider,
-    PICExternalKVRegistry,
-)
-from vllm.v1.pic.single_request import (
-    PICSingleRequestPlan,
-    build_single_request_plan,
+from vllm.v1.pic.pool import (
+    PICPhysicalAllocation,
+    PICPhysicalPool,
+    PICSlotMapping,
+    PICTensorRegion,
 )
 from vllm.v1.pic.runtime import (
     PICRuntimeRange,
@@ -87,6 +66,27 @@ from vllm.v1.pic.segmenter import (
     segments_from_ranges,
     split_text_and_tokenize,
     split_token_ids,
+)
+from vllm.v1.pic.single_request import (
+    PICSingleRequestPlan,
+    build_single_request_plan,
+)
+from vllm.v1.pic.snapshot import PICPhysicalSnapshot, PICSnapshotStore
+from vllm.v1.pic.state import (
+    PICAffineTransition,
+    PICConvTransition,
+    PICGDNTransition,
+    PICLinearTransition,
+    PICRequestStateBinding,
+    PICStateLayout,
+    PICStateSpec,
+    PICTransitionOperator,
+)
+from vllm.v1.pic.worker_plan import (
+    PICWorkerCapabilities,
+    PICWorkerPlan,
+    PICWorkerUnsupported,
+    build_worker_plan,
 )
 
 __all__ = [

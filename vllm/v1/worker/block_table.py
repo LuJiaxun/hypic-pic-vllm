@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Sequence
+
 import numpy as np
 import torch
-from collections.abc import Sequence
 
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger

@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any, Literal
 
 import torch
+
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.inputs import (
@@ -341,8 +342,8 @@ class InputProcessor:
             assert pic_prompt_token_ids is not None
             prompt_token_ids = pic_prompt_token_ids
             if max_tokens_was_unset and sampling_params is not None:
-                sampling_params.max_tokens = (
-                    self.model_config.max_model_len - len(prompt_token_ids)
+                sampling_params.max_tokens = self.model_config.max_model_len - len(
+                    prompt_token_ids
                 )
 
         # Multimodal related.
@@ -434,9 +435,7 @@ class InputProcessor:
         ):
             return False, None, None, None, None
 
-        extra_args = (
-            sampling_params.extra_args if sampling_params is not None else None
-        )
+        extra_args = sampling_params.extra_args if sampling_params is not None else None
         extra_args = extra_args or {}
         requested_value = extra_args.get("pic_enabled")
         explicitly_requested = requested_value is not None

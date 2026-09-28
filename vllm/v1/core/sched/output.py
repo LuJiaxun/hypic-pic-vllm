@@ -16,10 +16,10 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
-    from vllm.v1.request import Request
     from vllm.v1.pic.cache import PICCachePlan
-    from vllm.v1.pic.segmenter import PICSegment
     from vllm.v1.pic.execution import PICExecutionPlan
+    from vllm.v1.pic.segmenter import PICSegment
+    from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object

@@ -399,14 +399,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         description="KVTransfer parameters used for disaggregated serving.",
     )
 
-    vllm_xargs: dict[
-        str, bool | str | int | float | list[str | int | float]
-    ] | None = Field(
-        default=None,
-        description=(
-            "Additional request parameters with (list of) string, boolean, "
-            "or numeric values, used by custom extensions."
-        ),
+    vllm_xargs: dict[str, bool | str | int | float | list[str | int | float]] | None = (
+        Field(
+            default=None,
+            description=(
+                "Additional request parameters with (list of) string, boolean, "
+                "or numeric values, used by custom extensions."
+            ),
+        )
     )
 
     repetition_detection: RepetitionDetectionParams | None = Field(

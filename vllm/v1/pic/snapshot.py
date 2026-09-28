@@ -10,8 +10,9 @@ adapter does not inspect vLLM's live KV cache or alter model execution.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 from vllm.v1.pic.cache import PICSegmentCache, PICSegmentEntry
 from vllm.v1.pic.handles import PICHandleKind
@@ -20,7 +21,6 @@ from vllm.v1.pic.pool import PICPhysicalPool
 from vllm.v1.pic.segmenter import PICSegment
 from vllm.v1.pic.state import (
     PICStateLayout,
-    PICStateSpec,
     PICTransitionOperator,
 )
 
@@ -77,10 +77,10 @@ class PICSnapshotStore:
         self,
         segment: PICSegment,
         *,
-        full_kv: Sequence["torch.Tensor"] = (),
-        recurrent_state: Sequence["torch.Tensor"] = (),
-        transition_state: Sequence["torch.Tensor"] = (),
-        conv_tail: Sequence["torch.Tensor"] = (),
+        full_kv: Sequence[torch.Tensor] = (),
+        recurrent_state: Sequence[torch.Tensor] = (),
+        transition_state: Sequence[torch.Tensor] = (),
+        conv_tail: Sequence[torch.Tensor] = (),
         native_kv_refs: Sequence[PICNativeKVReference] = (),
     ) -> PICPhysicalSnapshot:
         """Copy supplied tensors into independent physical allocations."""
@@ -166,8 +166,7 @@ class PICSnapshotStore:
         if len(expected_groups) != len(references):
             raise ValueError("PIC native KV capture has duplicate cache groups")
         if any(
-            reference.token_count != len(segment.token_ids)
-            for reference in references
+            reference.token_count != len(segment.token_ids) for reference in references
         ):
             raise ValueError("PIC native KV reference length does not match segment")
         return PICPhysicalSnapshot(
@@ -182,9 +181,9 @@ class PICSnapshotStore:
         segment: PICSegment,
         operator: PICTransitionOperator,
         *,
-        full_kv: Sequence["torch.Tensor"] = (),
-        recurrent_state: Sequence["torch.Tensor"] = (),
-        conv_tail: Sequence["torch.Tensor"] = (),
+        full_kv: Sequence[torch.Tensor] = (),
+        recurrent_state: Sequence[torch.Tensor] = (),
+        conv_tail: Sequence[torch.Tensor] = (),
         native_kv_refs: Sequence[PICNativeKVReference] = (),
     ) -> PICPhysicalSnapshot:
         """Persist a compact transition operator with a PIC segment.
@@ -212,7 +211,7 @@ class PICSnapshotStore:
         self,
         segment: PICSegment,
         layout: PICStateLayout,
-        state_tensors: Mapping[PICStateKey, "torch.Tensor"],
+        state_tensors: Mapping[PICStateKey, torch.Tensor],
     ) -> PICPhysicalSnapshot:
         """Capture state tensors in the authoritative layout order.
 
@@ -230,7 +229,7 @@ class PICSnapshotStore:
         self,
         snapshot: PICPhysicalSnapshot,
         layout: PICStateLayout,
-        state_tensors: Mapping[PICStateKey, "torch.Tensor"],
+        state_tensors: Mapping[PICStateKey, torch.Tensor],
     ) -> None:
         """Restore recurrent/conv tensors using the same layout validation."""
         recurrent, conv_tail = self._ordered_state_tensors(layout, state_tensors)
@@ -244,10 +243,10 @@ class PICSnapshotStore:
         self,
         snapshot: PICPhysicalSnapshot,
         *,
-        full_kv: Sequence["torch.Tensor"] = (),
-        recurrent_state: Sequence["torch.Tensor"] = (),
-        transition_state: Sequence["torch.Tensor"] = (),
-        conv_tail: Sequence["torch.Tensor"] = (),
+        full_kv: Sequence[torch.Tensor] = (),
+        recurrent_state: Sequence[torch.Tensor] = (),
+        transition_state: Sequence[torch.Tensor] = (),
+        conv_tail: Sequence[torch.Tensor] = (),
     ) -> None:
         """Restore a snapshot into caller-owned tensors."""
         self._restore_one(snapshot.full_kv_handles, full_kv, "full_kv")
@@ -280,7 +279,7 @@ class PICSnapshotStore:
 
     def _capture_one(
         self,
-        tensors: Sequence["torch.Tensor"],
+        tensors: Sequence[torch.Tensor],
         *,
         kind: PICHandleKind,
         token_start: int,
@@ -301,7 +300,7 @@ class PICSnapshotStore:
     def _restore_one(
         self,
         handle_ids: tuple[int, ...],
-        tensors: Sequence["torch.Tensor"],
+        tensors: Sequence[torch.Tensor],
         name: str,
     ) -> None:
         if not handle_ids and not tensors:
@@ -315,8 +314,8 @@ class PICSnapshotStore:
     @staticmethod
     def _ordered_state_tensors(
         layout: PICStateLayout,
-        state_tensors: Mapping[PICStateKey, "torch.Tensor"],
-    ) -> tuple[tuple["torch.Tensor", ...], tuple["torch.Tensor", ...]]:
+        state_tensors: Mapping[PICStateKey, torch.Tensor],
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         specs = tuple(spec for group in layout.groups for spec in group)
         expected_keys = {(spec.group_id, spec.state_index) for spec in specs}
         if set(state_tensors) != expected_keys:
@@ -326,8 +325,8 @@ class PICSnapshotStore:
                 f"actual={sorted(state_tensors)}"
             )
 
-        recurrent: list["torch.Tensor"] = []
-        conv_tail: list["torch.Tensor"] = []
+        recurrent: list[torch.Tensor] = []
+        conv_tail: list[torch.Tensor] = []
         for spec in specs:
             tensor = state_tensors[(spec.group_id, spec.state_index)]
             if tuple(tensor.shape) != spec.shape or tensor.dtype != spec.dtype:
@@ -343,7 +342,6 @@ class PICSnapshotStore:
                 conv_tail.append(tensor)
             else:
                 raise ValueError(
-                    "PICStateLayout contains unsupported snapshot kind "
-                    f"{spec.kind!r}"
+                    f"PICStateLayout contains unsupported snapshot kind {spec.kind!r}"
                 )
         return tuple(recurrent), tuple(conv_tail)

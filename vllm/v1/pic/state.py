@@ -10,8 +10,9 @@ centralized is important because Mamba, short-conv, and GDN use different
 numbers and meanings of state tensors.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -20,7 +21,7 @@ from vllm.v1.pic.handles import PICHandleKind
 if TYPE_CHECKING:
     import torch
 
-    from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 
 @dataclass(frozen=True)
@@ -272,9 +273,7 @@ class PICGDNTransition:
         if self.value.shape[:2] != self.log_decay.shape:
             raise ValueError("PIC GDN transition value/gate heads do not match")
         if self.value.shape[1] % self.key.shape[1] != 0:
-            raise ValueError(
-                "PIC GDN value heads must be divisible by key heads"
-            )
+            raise ValueError("PIC GDN value heads must be divisible by key heads")
         if not (
             self.key.device
             == self.value.device
@@ -297,9 +296,7 @@ class PICGDNTransition:
         chunked = (self.chunk_w, self.chunk_u, self.chunk_g)
         if any(item is not None for item in chunked):
             if not all(item is not None for item in chunked):
-                raise ValueError(
-                    "PIC GDN chunked reference must provide w, u and g"
-                )
+                raise ValueError("PIC GDN chunked reference must provide w, u and g")
             assert self.chunk_w is not None
             assert self.chunk_u is not None
             assert self.chunk_g is not None
@@ -500,9 +497,7 @@ class PICGDNTransition:
             ),
             chunk_size=self.chunk_size,
             backend=self.backend or following.backend,
-            use_fla_reference=(
-                self.use_fla_reference or following.use_fla_reference
-            ),
+            use_fla_reference=(self.use_fla_reference or following.use_fla_reference),
         )
 
     def slice(self, local_start: int, local_end: int) -> "PICGDNTransition":
@@ -526,9 +521,7 @@ class PICGDNTransition:
         if self.backend == "triton":
             from vllm.v1.pic.gdn_transition import _build_fla_chunk_reference
 
-            chunk_reference = _build_fla_chunk_reference(
-                key, value, log_decay, beta
-            )
+            chunk_reference = _build_fla_chunk_reference(key, value, log_decay, beta)
             if chunk_reference is None:
                 from vllm.v1.pic.worker_plan import PICWorkerUnsupported
 
@@ -593,15 +586,9 @@ class PICGDNTransition:
             beta=self.beta.detach().clone(),
             zero_state=self.zero_state.detach().clone(),
             backend=self.backend,
-            chunk_w=(
-                None if self.chunk_w is None else self.chunk_w.detach().clone()
-            ),
-            chunk_u=(
-                None if self.chunk_u is None else self.chunk_u.detach().clone()
-            ),
-            chunk_g=(
-                None if self.chunk_g is None else self.chunk_g.detach().clone()
-            ),
+            chunk_w=(None if self.chunk_w is None else self.chunk_w.detach().clone()),
+            chunk_u=(None if self.chunk_u is None else self.chunk_u.detach().clone()),
+            chunk_g=(None if self.chunk_g is None else self.chunk_g.detach().clone()),
             chunk_size=self.chunk_size,
             use_fla_reference=self.use_fla_reference,
         )
@@ -680,9 +667,7 @@ class PICConvTransition:
         )
 
 
-PICStateTransition = (
-    PICAffineTransition | PICLinearTransition | PICGDNTransition
-)
+PICStateTransition = PICAffineTransition | PICLinearTransition | PICGDNTransition
 
 
 @dataclass(frozen=True)
@@ -737,9 +722,7 @@ class PICTransitionOperator:
                 "PIC conv transition operators have different state counts"
             )
         composed: list[PICStateTransition] = []
-        for current, next_transition in zip(
-            self.transitions, following.transitions
-        ):
+        for current, next_transition in zip(self.transitions, following.transitions):
             if type(current) is not type(next_transition):
                 raise ValueError("PIC transition operators have different state kinds")
             composed.append(current.compose(next_transition))  # type: ignore[arg-type]
@@ -783,17 +766,14 @@ class PICTransitionOperator:
 
     def storage_tensors(self) -> tuple["torch.Tensor", ...]:
         """Flatten operator tensors for a physical snapshot allocation."""
-        tensors: list["torch.Tensor"] = []
+        tensors: list[torch.Tensor] = []
         for transition in self.transitions:
-            first = (
-                transition.decay
-                if isinstance(transition, PICAffineTransition)
-                else (
-                    transition.matrix
-                    if isinstance(transition, PICLinearTransition)
-                    else transition.key
-                )
-            )
+            if isinstance(transition, PICAffineTransition):
+                first = transition.decay
+            elif isinstance(transition, PICLinearTransition):
+                first = transition.matrix
+            else:
+                first = transition.key
             if isinstance(transition, PICGDNTransition):
                 tensors.extend(
                     (
@@ -806,8 +786,8 @@ class PICTransitionOperator:
                 )
             else:
                 tensors.extend((first, transition.zero_state))
-        for transition in self.conv_transitions:
-            tensors.extend(transition.storage_tensors())
+        for conv_transition in self.conv_transitions:
+            tensors.extend(conv_transition.storage_tensors())
         return tuple(tensors)
 
     def detached_clone(self) -> "PICTransitionOperator":
@@ -904,6 +884,7 @@ class PICStateLayout:
                 continue
 
             backend_name = spec.mamba_type.name
+            state_kinds: tuple[PICHandleKind, ...]
             if backend_name == "LINEAR":
                 state_kinds = (PICHandleKind.RECURRENT_STATE,)
             elif backend_name in {"MAMBA1", "MAMBA2", "GDN_ATTN"}:
