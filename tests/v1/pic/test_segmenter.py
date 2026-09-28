@@ -1155,7 +1155,13 @@ def test_live_capture_deduplicates_repeated_published_transition_snapshot() -> N
     pool = PICPhysicalPool(4096, device="cpu", alignment_bytes=1)
     manager = PICLiveCaptureManager(pool, retain_published=True)
     operator = PICTransitionOperator.from_step_transitions(
-        ((PICAffineTransition(decay=torch.tensor([2.0]), zero_state=torch.tensor([1.0])),),),
+        (
+            (
+                PICAffineTransition(
+                    decay=torch.tensor([2.0]), zero_state=torch.tensor([1.0])
+                ),
+            ),
+        ),
         token_start=0,
         token_end=2,
     )
@@ -1321,7 +1327,7 @@ def test_native_slot_plan_expands_allocator_block_for_attention_kernel() -> None
 
 
 def test_native_slot_plan_crosses_allocator_boundary_at_kernel_granularity() -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     reference = PICNativeKVReference(
         kv_cache_group_id=3,
         block_ids=(5, 2),
@@ -1348,7 +1354,7 @@ def test_native_slot_plan_crosses_allocator_boundary_at_kernel_granularity() -> 
 
 
 def test_native_slot_plan_private_copies_rope_shifted_aligned_range() -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     reference = PICNativeKVReference(
         kv_cache_group_id=0,
         block_ids=(5, 2),
@@ -1369,7 +1375,7 @@ def test_native_slot_plan_private_copies_rope_shifted_aligned_range() -> None:
 
 
 def test_canonical_public_slot_plan_never_aliases_position_dependent_kv() -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     reference = PICNativeKVReference(
         kv_cache_group_id=0,
         block_ids=(5, 2),
@@ -1386,7 +1392,7 @@ def test_canonical_public_slot_plan_never_aliases_position_dependent_kv() -> Non
 
 
 def test_native_slot_plan_rejects_unaligned_target_for_block_table() -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     reference = PICNativeKVReference(
         kv_cache_group_id=0,
         block_ids=(5, 2),
@@ -1447,7 +1453,7 @@ def test_native_kv_gather_supports_nhd_and_hnd_layouts() -> None:
 
 
 def test_native_kv_private_plan_is_accepted_for_arbitrary_target_phase() -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     reference = PICNativeKVReference(
         kv_cache_group_id=0,
         block_ids=(5, 2),
@@ -1747,7 +1753,8 @@ def test_single_request_runtime_allows_partial_hybrid_range_with_transition() ->
     assert any(item.action == "reuse" for item in runtime_plan.ranges)
 
 
-def test_single_request_runtime_allows_partial_conv_tail_reuse_with_transition() -> None:
+def test_single_request_runtime_allows_partial_conv_tail_reuse_with_transition(
+) -> None:
     segments = split_token_ids([1, 2, 3, 4, 5, 9, 6, 9, 7], [9])
     reference = PICNativeKVReference(
         kv_cache_group_id=0,
@@ -1791,7 +1798,8 @@ def test_single_request_runtime_allows_partial_conv_tail_reuse_with_transition()
     assert any(item.action == "reuse" for item in runtime_plan.ranges)
 
 
-def test_single_request_runtime_plan_uses_private_copy_for_unaligned_native_range() -> None:
+def test_single_request_runtime_plan_uses_private_copy_for_unaligned_native_range(
+) -> None:
     segments = split_token_ids([1, 2, 9, 3, 4, 5, 9, 6], [9])
     reference = PICNativeKVReference(
         kv_cache_group_id=0,

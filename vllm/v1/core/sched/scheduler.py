@@ -1809,7 +1809,10 @@ class Scheduler(SchedulerInterface):
                     item.recurrent_state_handle,
                     item.conv_tail_handle,
                     item.full_kv_handles,
-                    tuple(reference.kv_cache_group_id for reference in item.native_kv_refs),
+                    tuple(
+                        reference.kv_cache_group_id
+                        for reference in item.native_kv_refs
+                    ),
                 )
 
     def _evict_pic_segment(self, seg_hash: bytes) -> None:

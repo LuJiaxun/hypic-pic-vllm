@@ -45,7 +45,9 @@ def _tokenize(base_url: str, model: str, text: str) -> list[int]:
         },
     )
     tokens = response.get("tokens")
-    if not isinstance(tokens, list) or not all(isinstance(token, int) for token in tokens):
+    if not isinstance(tokens, list) or not all(
+        isinstance(token, int) for token in tokens
+    ):
         raise ValueError("/tokenize did not return an integer token list")
     return tokens
 
