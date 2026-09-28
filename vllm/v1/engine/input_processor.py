@@ -325,13 +325,17 @@ class InputProcessor:
             pooling_params = params.clone()
             max_tokens_was_unset = False
 
-        pic_enabled, pic_prompt_token_ids, pic_segment_ranges, pic_mode, pic_seam_sink = (
-            self._prepare_pic_request(
-                prompt_token_ids,
-                prompt_embeds,
-                decoder_inputs.get("prompt"),
-                sampling_params,
-            )
+        (
+            pic_enabled,
+            pic_prompt_token_ids,
+            pic_segment_ranges,
+            pic_mode,
+            pic_seam_sink,
+        ) = self._prepare_pic_request(
+            prompt_token_ids,
+            prompt_embeds,
+            decoder_inputs.get("prompt"),
+            sampling_params,
         )
         if pic_enabled:
             assert pic_prompt_token_ids is not None
@@ -471,7 +475,10 @@ class InputProcessor:
             if explicitly_requested:
                 raise ValueError(message)
             if pic_config.debug:
-                logger.warning("[PIC-DEBUG] input result pic_enabled=False reason=%s", message)
+                logger.warning(
+                    "[PIC-DEBUG] input result pic_enabled=False reason=%s",
+                    message,
+                )
             return False, None, None, None, None
 
         pic_prompt_token_ids, pic_segment_ranges = split_text_and_tokenize(

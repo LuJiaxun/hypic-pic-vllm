@@ -165,7 +165,10 @@ class PICSnapshotStore:
         expected_groups = {reference.kv_cache_group_id for reference in references}
         if len(expected_groups) != len(references):
             raise ValueError("PIC native KV capture has duplicate cache groups")
-        if any(reference.token_count != len(segment.token_ids) for reference in references):
+        if any(
+            reference.token_count != len(segment.token_ids)
+            for reference in references
+        ):
             raise ValueError("PIC native KV reference length does not match segment")
         return PICPhysicalSnapshot(
             seg_hash=segment.seg_hash,

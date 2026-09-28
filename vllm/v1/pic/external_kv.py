@@ -127,7 +127,12 @@ class PICExternalKVRegistry:
                 f"external PIC provider import failed: {provider_name}"
             ) from exc
         expected_blocks = (
-            (reference.canonical_start + reference.token_count + reference.block_size - 1)
+            (
+                reference.canonical_start
+                + reference.token_count
+                + reference.block_size
+                - 1
+            )
             // reference.block_size
         ) - (reference.canonical_start // reference.block_size)
         if result.block_size != reference.block_size:

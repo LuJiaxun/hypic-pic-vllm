@@ -75,7 +75,9 @@ class PICRequestStateBinding:
         if num_computed_tokens < 0:
             raise ValueError("PIC logical token position must be non-negative")
         self.logical_token_position = int(num_computed_tokens)
-        self.state_block_ids = tuple(tuple(int(block) for block in group) for group in block_ids)
+        self.state_block_ids = tuple(
+            tuple(int(block) for block in group) for group in block_ids
+        )
         self.segment_index = int(segment_index)
         if range_cursor is not None:
             self.range_cursor = int(range_cursor)
@@ -140,7 +142,10 @@ class PICAffineTransition:
                 f"expected={tuple(self.zero_state.shape)}, "
                 f"actual={tuple(state.shape)}"
             )
-        if state.dtype != self.zero_state.dtype or state.device != self.zero_state.device:
+        if (
+            state.dtype != self.zero_state.dtype
+            or state.device != self.zero_state.device
+        ):
             raise ValueError("PIC transition state dtype/device mismatch")
         try:
             return self.decay * state + self.zero_state
@@ -199,7 +204,10 @@ class PICLinearTransition:
                 f"expected={tuple(self.zero_state.shape)}, "
                 f"actual={tuple(state.shape)}"
             )
-        if state.dtype != self.zero_state.dtype or state.device != self.zero_state.device:
+        if (
+            state.dtype != self.zero_state.dtype
+            or state.device != self.zero_state.device
+        ):
             raise ValueError("PIC linear transition state dtype/device mismatch")
         try:
             return state.matmul(self.matrix) + self.zero_state
@@ -283,7 +291,8 @@ class PICGDNTransition:
         if tuple(self.zero_state.shape) != expected_state_shape:
             raise ValueError(
                 "PIC GDN transition zero state shape mismatch: "
-                f"expected={expected_state_shape}, actual={tuple(self.zero_state.shape)}"
+                f"expected={expected_state_shape}, "
+                f"actual={tuple(self.zero_state.shape)}"
             )
         chunked = (self.chunk_w, self.chunk_u, self.chunk_g)
         if any(item is not None for item in chunked):
@@ -724,7 +733,9 @@ class PICTransitionOperator:
         if len(self.transitions) != len(following.transitions):
             raise ValueError("PIC transition operators have different state counts")
         if len(self.conv_transitions) != len(following.conv_transitions):
-            raise ValueError("PIC conv transition operators have different state counts")
+            raise ValueError(
+                "PIC conv transition operators have different state counts"
+            )
         composed: list[PICStateTransition] = []
         for current, next_transition in zip(
             self.transitions, following.transitions

@@ -106,7 +106,7 @@ class PICGDNTransitionCapture:
 
     def _debug(self, message: str, *args: object) -> None:
         if self.debug:
-            logger.warning("[PIC-DEBUG] " + message, *args)
+            logger.warning("[PIC-DEBUG] %s", message, *args)
 
     def record_gdn_layer(
         self,
@@ -328,7 +328,7 @@ class PICLiveCaptureManager:
 
     def _debug(self, message: str, *args: object) -> None:
         if self.debug:
-            logger.warning("[PIC-DEBUG] " + message, *args)
+            logger.warning("[PIC-DEBUG] %s", message, *args)
 
     def acquire_segment(self, request_id: str, seg_hash: bytes) -> bool:
         """Hold a request lease while a published snapshot is being used."""
@@ -487,7 +487,8 @@ class PICLiveCaptureManager:
             or transition_operator is not None
         ):
             self._debug(
-                "capture_segment returned None request=%s segment=%d reason=empty_state",
+                "capture_segment returned None "
+                "request=%s segment=%d reason=empty_state",
                 request_id,
                 segment_index,
             )
@@ -503,7 +504,10 @@ class PICLiveCaptureManager:
             owner_key = self._published_segment_owners.get(segment.seg_hash)
             if owner_key is not None and owner_key != key:
                 published = self._snapshots.get(owner_key)
-                if published is not None and published.transition_state_handle is not None:
+                if (
+                    published is not None
+                    and published.transition_state_handle is not None
+                ):
                     materialization = self._materialization_from_snapshot(
                         request_id,
                         segment_index,
@@ -888,11 +892,11 @@ def apply_matched_mamba_transition(
                 local_start=local_start,
                 local_end=local_end,
             )
-        except KeyError:
+        except KeyError as err:
             if local_end < segment.length:
                 raise PICWorkerUnsupported(
                     "PIC partial reuse has no conv transition for the live state"
-                )
+                ) from err
             manager.restore_conv_tail(entry.conv_tail_handle, conv_tail)
         else:
             if len(updated_conv) != len(conv_tail):
@@ -986,7 +990,9 @@ def _collect_native_kv_references(
 
     references: list[PICNativeKVReference] = []
     public_blocks = {
-        (int(segment_index), int(group_id)): tuple(int(block_id) for block_id in block_ids)
+        (int(segment_index), int(group_id)): tuple(
+            int(block_id) for block_id in block_ids
+        )
         for segment_index, group_id, block_ids in getattr(
             request_state, "pic_public_block_ids", ()
         )

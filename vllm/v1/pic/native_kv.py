@@ -200,7 +200,9 @@ class PICNativeKVReference:
         if self.kv_cache_group_id < 0:
             raise ValueError("PIC native KV group ID must be non-negative")
         if self.block_size <= 0 or self.token_count <= 0:
-            raise ValueError("PIC native KV block size and token count must be positive")
+            raise ValueError(
+                "PIC native KV block size and token count must be positive"
+            )
         if self.canonical_start < 0:
             raise ValueError("PIC native KV canonical start must be non-negative")
         source_token_start = (
@@ -415,7 +417,10 @@ class PICNativeKVAllocation:
         if not public and not private:
             raise ValueError("PIC allocation must contain public or private blocks")
         if public:
-            if self.target_start % self.block_size != 0 or self.target_end % self.block_size != 0:
+            if (
+                self.target_start % self.block_size != 0
+                or self.target_end % self.block_size != 0
+            ):
                 raise ValueError(
                     "PIC public allocation must cover complete native blocks"
                 )
@@ -764,7 +769,10 @@ def rerotate_native_key(
         raise ValueError("PIC native KV key must have shape [tokens, heads, dim]")
     source_positions = source_positions.to(device=key.device, dtype=torch.long)
     target_positions = target_positions.to(device=key.device, dtype=torch.long)
-    if source_positions.numel() != key.shape[0] or target_positions.numel() != key.shape[0]:
+    if (
+        source_positions.numel() != key.shape[0]
+        or target_positions.numel() != key.shape[0]
+    ):
         raise ValueError("PIC RoPE position count does not match the KV key")
 
     # Canonical public materialization may be followed by a request-private
@@ -782,7 +790,10 @@ def rerotate_native_key(
     cache = rotary_emb.cos_sin_cache.to(device=key.device, dtype=key.dtype)
     if source_positions.numel():
         max_position = cache.shape[0]
-        if int(source_positions.max()) >= max_position or int(target_positions.max()) >= max_position:
+        if (
+            int(source_positions.max()) >= max_position
+            or int(target_positions.max()) >= max_position
+        ):
             raise ValueError("PIC RoPE position exceeds the rotary cache")
     source_cos, source_sin = cache.index_select(0, source_positions).chunk(2, dim=-1)
     target_cos, target_sin = cache.index_select(0, target_positions).chunk(2, dim=-1)
@@ -840,7 +851,9 @@ class PICRoPERerotationPlan:
 def materialize_private_rope_key(
     public_key: "torch.Tensor",
     plan: PICRoPERerotationPlan,
-    rerotate: Callable[["torch.Tensor", "torch.Tensor", "torch.Tensor"], "torch.Tensor"],
+    rerotate: Callable[
+        ["torch.Tensor", "torch.Tensor", "torch.Tensor"], "torch.Tensor"
+    ],
 ) -> "torch.Tensor":
     """Apply a caller-provided RoPE transform without mutating public K.
 

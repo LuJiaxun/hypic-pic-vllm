@@ -124,4 +124,6 @@ def build_worker_plan(
 
 def merge_positions(plans: Iterable[PICWorkerPlan]) -> tuple[int, ...]:
     """Return sorted unique positions for batch-side diagnostics."""
-    return tuple(sorted({position for plan in plans for position in plan.skip_positions}))
+    return tuple(
+        sorted({position for plan in plans for position in plan.skip_positions})
+    )
