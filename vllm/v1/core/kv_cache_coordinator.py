@@ -218,6 +218,48 @@ class KVCacheCoordinator(ABC):
         for manager in self.single_type_managers:
             manager.free(request_id)
 
+    def validate_pic_native_blocks(
+        self,
+        request_id: str,
+        *,
+        kv_cache_group_id: int,
+        target_start: int,
+        token_count: int,
+        block_ids: Sequence[int],
+        block_size: int,
+    ) -> None:
+        manager = self.single_type_managers[kv_cache_group_id]
+        if isinstance(manager, CrossAttentionManager):
+            raise ValueError("PIC native KV cannot target a cross-attention group")
+        manager.validate_pic_native_blocks(
+            request_id,
+            target_start=target_start,
+            token_count=token_count,
+            block_ids=block_ids,
+            block_size=block_size,
+        )
+
+    def attach_pic_native_blocks(
+        self,
+        request_id: str,
+        *,
+        kv_cache_group_id: int,
+        target_start: int,
+        token_count: int,
+        block_ids: Sequence[int],
+        block_size: int,
+    ) -> None:
+        manager = self.single_type_managers[kv_cache_group_id]
+        if isinstance(manager, CrossAttentionManager):
+            raise ValueError("PIC native KV cannot target a cross-attention group")
+        manager.attach_pic_native_blocks(
+            request_id,
+            target_start=target_start,
+            token_count=token_count,
+            block_ids=block_ids,
+            block_size=block_size,
+        )
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
         """
         Get the number of common prefix blocks for all requests with allocated

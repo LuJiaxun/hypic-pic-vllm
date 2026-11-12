@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -49,10 +50,32 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    CrossAttentionSpec,
+    EncoderOnlyAttentionSpec,
+    KVCacheConfig,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.pic.async_import import PICAsyncImportSpec
+from vllm.v1.pic.cache import PICSegmentCache
+from vllm.v1.pic.env import pic_debug_enabled
+from vllm.v1.pic.execution import compile_execution_plan
+from vllm.v1.pic.materialization import PICMaterialization
+from vllm.v1.pic.mooncake_kv import (
+    PICMooncakeReferenceIndex,
+    connect_mooncake_native_kv_store,
+)
+from vllm.v1.pic.native_kv import (
+    PICNativeKVLease,
+    get_covering_local_block_span,
+    get_full_local_block_span,
+    has_complete_native_kv_reference,
+    is_pic_exact_position_aliasable,
+)
+from vllm.v1.pic.profile_level import pic_profile_enabled
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -180,6 +203,48 @@ class Scheduler(SchedulerInterface):
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
 
+        # HYPIC/PIC async import (stage 1b).  A request that must import its
+        # external segments is parked in WAITING_FOR_REMOTE_KVS instead of
+        # blocking the step it was scheduled with; the worker reports
+        # completion through ModelRunnerOutput.pic_finished_imports.
+        self.pic_async_imports_enabled = bool(
+            vllm_config.pic_config.async_import
+        )
+        if vllm_config.pic_config.debug or self.pic_async_imports_enabled:
+            # Surfaces a misconfigured switch immediately: a run that expects
+            # parking but shows enabled=False is a config problem, not a bug in
+            # the parking path.
+            logger.warning(
+                "[PIC-DEBUG] async_import enabled=%s",
+                self.pic_async_imports_enabled,
+            )
+        self._pic_pending_imports: dict[str, Any] = {}
+        self._pic_finished_recving: set[str] = set()
+        # PIC imports that failed and need a full-recompute fallback.  Kept
+        # separate from the connector's failed_recving_kv_req_ids so the PIC path
+        # does not depend on a KV connector being configured.
+        self._pic_failed_recving: set[str] = set()
+        # Requests whose external import already completed.  Their cache plan keeps
+        # the external references (they are the record of where the KV came from),
+        # so parking has to consult this set instead of the plan alone; otherwise
+        # the request parks again on the very next step and loops forever.
+        self._pic_import_completed: set[str] = set()
+        self._pic_park_started: dict[str, float] = {}
+        # Canonical block set per (segment hash, KV group) for segments whose KV
+        # comes from the store.  The Mooncake provider keeps one destination span
+        # per resource key, so every request importing that segment must be given
+        # the same blocks; these outlive the request that allocated them.
+        self._pic_public_shared_blocks: dict[tuple[Any, int], tuple[Any, ...]] = {}
+        # Holder counts for those shared sets.  BlockPool owns ``Block.ref_cnt``
+        # (get_new_blocks raises it once, free_blocks lowers it once), so sharing a
+        # set across requests is counted here instead of inflating the pool's own
+        # counter.  One count is the cache's; each request adds and drops its own.
+        self._pic_public_shared_holders: dict[tuple[Any, int], int] = {}
+        self._pic_public_shared_held: dict[str, list[tuple[Any, int]]] = {}
+        # Promotion attempts per parked request, used only to bound the debug
+        # trace when an empty-step loop re-checks the same request.
+        self._pic_promote_attempts: dict[str, int] = {}
+
         # Encoder-related.
         # Calculate encoder cache size if applicable
         supports_mm_inputs = mm_registry.supports_multimodal_inputs(
@@ -235,6 +300,29 @@ class Scheduler(SchedulerInterface):
             hash_block_size=hash_block_size,
             metrics_collector=self.kv_metrics_collector,
         )
+        pic_config = vllm_config.pic_config
+        self.pic_cache: PICSegmentCache | None = (
+            PICSegmentCache(
+                enabled=True,
+                max_cache_bytes=pic_config.max_cache_bytes,
+            )
+            if pic_config.enabled
+            else None
+        )
+        # Native KV references are intentionally lease-free in the
+        # scheduler/worker message.  Keep the actual BlockPool leases here so
+        # a published segment cannot be evicted while a later request uses its
+        # physical slots.
+        self._pic_native_leases: dict[tuple[bytes, int], PICNativeKVLease] = {}
+        # Public canonical KV is allocated independently from a request's
+        # ordinary blocks.  The allocation owner is transferred to
+        # ``_pic_native_leases`` only after the worker has materialized it.
+        self._pic_public_allocations: dict[tuple[str, bytes, int], tuple[Any, ...]] = {}
+        # ``get_new_blocks`` is called directly for PIC public KV, so those
+        # blocks do not pass through SingleTypeKVCacheManager's normal
+        # new-block zeroing queue.  Keep a scheduler-side queue and merge it
+        # into SchedulerOutput before the worker can read a recycled block.
+        self._pic_public_block_ids_to_zero: list[int] = []
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -247,6 +335,39 @@ class Scheduler(SchedulerInterface):
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
+        self.pic_mooncake_reference_index: PICMooncakeReferenceIndex | None = None
+        if pic_config.mooncake:
+            try:
+                object_store = connect_mooncake_native_kv_store()
+                group_block_sizes: dict[int, int] = {}
+                group_dtypes: dict[int, str] = {}
+                for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
+                    if not isinstance(group.kv_cache_spec, AttentionSpec) or isinstance(
+                        group.kv_cache_spec,
+                        (CrossAttentionSpec, EncoderOnlyAttentionSpec),
+                    ):
+                        continue
+                    group_block_sizes[group_id] = int(group.kv_cache_spec.block_size)
+                    group_dtypes[group_id] = str(group.kv_cache_spec.dtype)
+                if group_block_sizes:
+                    self.pic_mooncake_reference_index = PICMooncakeReferenceIndex(
+                        object_store,
+                        group_block_sizes=group_block_sizes,
+                        group_dtypes=group_dtypes,
+                        require_hybrid_state=self.has_mamba_layers,
+                    )
+                    logger.info(
+                        "PIC Mooncake external manifest discovery enabled for "
+                        "%d native KV groups%s",
+                        len(group_block_sizes),
+                        " (hybrid state-aware)" if self.has_mamba_layers else "",
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "PIC Mooncake scheduler discovery unavailable; "
+                    "external references will fall back: %s",
+                    exc,
+                )
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
@@ -275,6 +396,30 @@ class Scheduler(SchedulerInterface):
             self._re_block_ids: dict[str, list[int]] = {}
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+    def _discover_pic_mooncake_segment(self, segment: Any) -> Any:
+        """Discover a full-attention external entry without exposing remote IDs."""
+        index = self.pic_mooncake_reference_index
+        if index is None:
+            return None
+        # Gate on the profiling switch, not on ``--pic-debug``: the phase and
+        # block records use the profiling switch, and mixing the two gates made
+        # this line silent in runs that profiled without debug logging.
+        profile = pic_profile_enabled()
+        start = time.perf_counter() if profile else 0.0
+        entry = index.lookup(segment, tuple(index.group_block_sizes))
+        if profile:
+            # A repeated segment hits the local cache before this runs; a
+            # first-seen one pays the remote manifest loads here, so the timing
+            # separates "new segment lookup" from the rest of scheduling.
+            logger.warning(
+                "[PIC-PROFILE] pic-lookup segment=%s groups=%d found=%s ms=%.3f",
+                segment.seg_hash.hex()[:12],
+                len(index.group_block_sizes),
+                entry is not None,
+                (time.perf_counter() - start) * 1000.0,
+            )
+        return entry
 
     def _mamba_block_aligned_split(
         self,
@@ -346,6 +491,11 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        pic_batch_mode: bool | None = None
+        pic_exclusive_batch = self.vllm_config.pic_config.exclusive_batch
+        # Mixed-batch execution is gone; the name stays so the exclusive-batch conditions below keep
+        # their shape, and it is what those conditions already saw in this deployment.
+        pic_batch_execution = False
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
@@ -365,6 +515,17 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if pic_exclusive_batch and not pic_batch_execution:
+                claims_step = self._pic_claims_exclusive_step(request)
+                if (pic_batch_mode is True and num_scheduled_tokens) or (
+                    pic_batch_mode is False and claims_step
+                ):
+                    # A ready PIC prefill owns the whole step: the worker rebuilds the
+                    # batch for one row, so anything joining it - another reusable
+                    # prefill included - would disable the fast path for all of them.
+                    req_index += 1
+                    continue
 
             if (
                 request.num_output_placeholders > 0
@@ -492,6 +653,12 @@ class Scheduler(SchedulerInterface):
 
             # Schedule the request.
             scheduled_running_reqs.append(request)
+            if (
+                pic_exclusive_batch
+                and not pic_batch_execution
+                and pic_batch_mode is None
+            ):
+                pic_batch_mode = self._pic_claims_exclusive_step(request)
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
@@ -554,6 +721,21 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+
+                if pic_exclusive_batch and not pic_batch_execution:
+                    claims_step = self._pic_claims_exclusive_step(request)
+                    if (
+                        (pic_batch_mode is True and num_scheduled_tokens)
+                        or (pic_batch_mode is False and claims_step)
+                    ) and not self._pic_awaits_park(request):
+                        # Same rule as the running loop: a ready PIC prefill runs alone,
+                        # and it waits for a step of its own rather than sharing one. A
+                        # request whose import has not been submitted yet is let through
+                        # regardless: parking spends no token budget, and holding it back
+                        # would only delay the transfer this pipeline depends on.
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -759,6 +941,18 @@ class Scheduler(SchedulerInterface):
                             preempted=request.num_preemptions > 0,
                         )
 
+                if self.pic_async_imports_enabled and self._park_pic_external_import(
+                    request,
+                    self.kv_cache_manager.get_blocks(request_id).get_block_ids(),
+                ):
+                    # The blocks for this request are allocated and stay owned by
+                    # it while the import runs; the worker reports completion and
+                    # _try_promote_blocked_waiting_request moves it back to
+                    # WAITING for the next step.
+                    request = request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 request = request_queue.pop_request()
                 if load_kv_async:
                     # If loading async, allocate memory and put request
@@ -781,6 +975,7 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens = num_computed_tokens
                     continue
 
+                self._pic_log_plan("schedule", request)
                 self.running.append(request)
                 if self.log_stats:
                     request.record_event(
@@ -795,6 +990,12 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
+                if (
+                    pic_exclusive_batch
+                    and not pic_batch_execution
+                    and pic_batch_mode is None
+                ):
+                    pic_batch_mode = self._pic_claims_exclusive_step(request)
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
@@ -846,6 +1047,23 @@ class Scheduler(SchedulerInterface):
                 )
 
         # Construct the scheduler output.
+        if self.vllm_config.pic_config.debug and scheduled_new_reqs:
+            for req in scheduled_new_reqs:
+                plan = req.pic_cache_plan
+                logger.warning(
+                    "[PIC-PLAN] build request=%s plan=%s id=%s matches=%d extra=%d "
+                    "ranges=%d public_blocks=%d status=%s",
+                    req.request_id,
+                    type(plan).__name__ if plan is not None else None,
+                    ("%#x" % id(plan)) if plan is not None else None,
+                    len(getattr(plan, "matches", ()) or ()),
+                    len(getattr(plan, "external_matches", ()) or ()),
+                    len(
+                        getattr(req.pic_execution_plan, "ranges", ()) or ()
+                    ),
+                    len(req.pic_public_block_ids or ()),
+                    req.status.name,
+                )
         if self.use_v2_model_runner:
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
             scheduled_resumed_reqs = []
@@ -878,11 +1096,21 @@ class Scheduler(SchedulerInterface):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
-        new_block_ids_to_zero = (
-            (self.kv_cache_manager.take_new_block_ids() or None)
-            if self.needs_kv_cache_zeroing
-            else None
-        )
+        new_block_ids_to_zero = None
+        if self.needs_kv_cache_zeroing:
+            new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids() or []
+
+        # PIC public blocks are read directly by native-slot reuse and must be
+        # zeroed even when ordinary vLLM KV allocation does not require
+        # zeroing.  Their queue is therefore independent of
+        # ``needs_kv_cache_zeroing``.
+        if self._pic_public_block_ids_to_zero:
+            if new_block_ids_to_zero is None:
+                new_block_ids_to_zero = []
+            new_block_ids_to_zero.extend(self._pic_public_block_ids_to_zero)
+            self._pic_public_block_ids_to_zero.clear()
+        if not new_block_ids_to_zero:
+            new_block_ids_to_zero = None
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -901,6 +1129,14 @@ class Scheduler(SchedulerInterface):
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
+        if self._pic_pending_imports:
+            # One emission per request: the worker starts the import on this
+            # step, then reports completion through
+            # ModelRunnerOutput.pic_finished_imports.
+            scheduler_output.pic_async_imports = tuple(
+                self._pic_pending_imports.values()
+            )
+            self._pic_pending_imports.clear()
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
@@ -1294,6 +1530,8 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
 
+        self._update_pic_materializations(model_runner_output.pic_materializations)
+
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
             perf_stats = self.perf_metrics.get_step_perf_stats_per_gpu(scheduler_output)
@@ -1550,6 +1788,10 @@ class Scheduler(SchedulerInterface):
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
 
+        # HYPIC/PIC: the worker reports async import completion on the model
+        # runner output, independent of whether a KV connector is configured.
+        self._update_pic_async_imports(model_runner_output)
+
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
 
@@ -1601,6 +1843,182 @@ class Scheduler(SchedulerInterface):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
+    def _update_pic_materializations(
+        self, materializations: list[PICMaterialization]
+    ) -> None:
+        """Publish worker-owned PIC handles into the scheduler-side index."""
+        if self.vllm_config.pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] scheduler materializations received count=%d cache=%s",
+                len(materializations),
+                self.pic_cache is not None,
+            )
+        if not materializations or self.pic_cache is None:
+            return
+        for item in materializations:
+            if item.evicted:
+                self._evict_pic_segment(item.seg_hash)
+                continue
+            request = self.requests.get(item.request_id)
+            if request is None or request.pic_segments is None:
+                # A worker can return a materialization after the scheduler
+                # has already retired the request.  In that case the
+                # request-owned public reservation has no normal _free_blocks
+                # call left to release it.  Do not leave those native blocks
+                # pinned until the allocator wraps around.
+                self._free_pic_public_allocations(item.request_id)
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler materialization SKIP request=%s "
+                        "reason=unknown_or_non_pic",
+                        item.request_id,
+                    )
+                logger.warning(
+                    "Ignoring PIC materialization for unknown/non-PIC request %s",
+                    item.request_id,
+                )
+                continue
+            if item.segment_index < 0 or item.segment_index >= len(
+                request.pic_segments
+            ):
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler materialization SKIP request=%s "
+                        "segment=%d reason=invalid_segment_index",
+                        item.request_id,
+                        item.segment_index,
+                    )
+                logger.warning(
+                    "Ignoring PIC materialization with invalid segment index %s for %s",
+                    item.segment_index,
+                    item.request_id,
+                )
+                continue
+            segment = request.pic_segments[item.segment_index]
+            if segment.seg_hash != item.seg_hash:
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler materialization SKIP request=%s "
+                        "segment=%d reason=stale_hash expected=%s got=%s",
+                        item.request_id,
+                        item.segment_index,
+                        segment.seg_hash[:12],
+                        item.seg_hash[:12],
+                    )
+                logger.warning(
+                    "Ignoring stale PIC materialization for request %s segment %s",
+                    item.request_id,
+                    item.segment_index,
+                )
+                continue
+            native_kv_refs = item.native_kv_refs
+            lease_failed = False
+            for reference in item.native_kv_refs:
+                lease_key = (item.seg_hash, reference.kv_cache_group_id)
+                # An external reference names a Mooncake object.  Its local
+                # native blocks do not exist until the target worker imports
+                # the object, so the scheduler must not try to attach the
+                # provider's object key to its own BlockPool.
+                if reference.is_external:
+                    old_lease = self._pic_native_leases.pop(lease_key, None)
+                    if old_lease is not None:
+                        old_lease.release()
+                    continue
+                old_lease = self._pic_native_leases.pop(lease_key, None)
+                if old_lease is not None:
+                    old_lease.release()
+                try:
+                    allocation_key = (
+                        item.request_id,
+                        item.seg_hash,
+                        reference.kv_cache_group_id,
+                    )
+                    owned_blocks = self._pic_public_allocations.pop(
+                        allocation_key, None
+                    )
+                    if owned_blocks is not None:
+                        owned_ids = tuple(int(block.block_id) for block in owned_blocks)
+                        if owned_ids != reference.block_ids:
+                            self.kv_cache_manager.block_pool.free_blocks(owned_blocks)
+                            raise ValueError(
+                                "PIC public allocation does not match worker reference"
+                            )
+                        lease = PICNativeKVLease.from_owned_block_pool(
+                            self.kv_cache_manager.block_pool,
+                            reference.block_ids,
+                        )
+                    else:
+                        # Compatibility path for metadata produced without a
+                        # scheduler reservation; it remains conservative and
+                        # pins the referenced native blocks.
+                        lease = PICNativeKVLease.from_block_pool(
+                            self.kv_cache_manager.block_pool, reference.block_ids
+                        )
+                    self._pic_native_leases[lease_key] = lease
+                except Exception:
+                    lease_failed = True
+                    logger.warning(
+                        "PIC native KV lease failed for segment %s group %s; "
+                        "native-slot execution will fall back",
+                        item.seg_hash[:12],
+                        reference.kv_cache_group_id,
+                        exc_info=True,
+                    )
+
+            if lease_failed:
+                for reference in item.native_kv_refs:
+                    lease_key = (item.seg_hash, reference.kv_cache_group_id)
+                    failed_lease = self._pic_native_leases.get(lease_key)
+                    if failed_lease is not None:
+                        self._pic_native_leases.pop(lease_key)
+                        failed_lease.release()
+                native_kv_refs = ()
+                self.pic_cache.clear_native_kv(segment)
+
+            self.pic_cache.insert(
+                segment,
+                full_kv_handles=item.full_kv_handles,
+                recurrent_state_handle=item.recurrent_state_handle,
+                transition_state_handle=item.transition_state_handle,
+                conv_tail_handle=item.conv_tail_handle,
+                native_kv_refs=native_kv_refs,
+                external_transition_key=item.external_transition_key,
+            )
+            if self.vllm_config.pic_config.debug:
+                logger.warning(
+                    "[PIC-DEBUG] scheduler materialization PUBLISHED request=%s "
+                    "segment=%d hash=%s recurrent=%s conv_tail=%s full_kv=%s "
+                    "native_kv_groups=%s",
+                    item.request_id,
+                    item.segment_index,
+                    item.seg_hash[:12],
+                    item.recurrent_state_handle,
+                    item.conv_tail_handle,
+                    item.full_kv_handles,
+                    tuple(
+                        reference.kv_cache_group_id for reference in item.native_kv_refs
+                    ),
+                )
+
+    def _evict_pic_segment(self, seg_hash: bytes) -> None:
+        """Drop worker-invalidated PIC metadata and all scheduler leases."""
+        if self.pic_cache is not None:
+            self.pic_cache.evict_hash(seg_hash)
+        for lease_key, lease in tuple(self._pic_native_leases.items()):
+            if lease_key[0] == seg_hash:
+                self._pic_native_leases.pop(lease_key, None)
+                lease.release()
+        for allocation_key, blocks in tuple(self._pic_public_allocations.items()):
+            if allocation_key[1] == seg_hash:
+                self._pic_public_allocations.pop(allocation_key, None)
+                self.kv_cache_manager.block_pool.free_blocks(blocks)
+        self._release_pic_shared_cache_hold(seg_hash)
+        if self.vllm_config.pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] scheduler evicted segment hash=%s",
+                seg_hash[:12],
+            )
 
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
@@ -1767,14 +2185,349 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            if (
+                request.pic_enabled
+                and request.pic_segments is not None
+                and self.pic_cache is not None
+            ):
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler lookup request=%s segments=%d",
+                        request.request_id,
+                        len(request.pic_segments),
+                    )
+                request.pic_cache_plan = self.pic_cache.build_plan(
+                    request.pic_segments,
+                    mode=request.pic_mode or self.vllm_config.pic_config.mode,
+                    seam_sink=(
+                        request.pic_seam_sink
+                        if request.pic_seam_sink is not None
+                        else self.vllm_config.pic_config.seam_sink
+                    ),
+                    min_segment_tokens=(
+                        self.vllm_config.pic_config.min_segment_tokens
+                    ),
+                    external_lookup=self._discover_pic_mooncake_segment,
+                )
+                request.pic_execution_plan = compile_execution_plan(
+                    request.pic_segments, request.pic_cache_plan
+                )
+                self._ensure_pic_public_blocks(request)
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] scheduler lookup %s request=%s reused=%s "
+                        "recompute=%s matches=%s external_matches=%s "
+                        "actions=%s plan_id=%#x",
+                        "HIT" if request.pic_cache_plan.reused_segments else "MISS",
+                        request.request_id,
+                        request.pic_cache_plan.reused_segments,
+                        request.pic_cache_plan.recompute_segments,
+                        [i for i, _ in request.pic_cache_plan.matches],
+                        [i for i, _ in request.pic_cache_plan.external_matches],
+                        [range_.action for range_ in request.pic_execution_plan.ranges]
+                        if request.pic_execution_plan is not None
+                        else None,
+                        id(request.pic_execution_plan)
+                        if request.pic_execution_plan is not None
+                        else 0,
+                    )
             if request.resumable:
                 request.streaming_queue = deque()
-            self._enqueue_waiting_request(request)
+            if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+
+    def _pic_debug(self, message: str, *args: Any) -> None:
+        """PIC diagnostics, emitted only when PIC debug is enabled.
+
+        The scheduler side must not call the worker runner's helper of the same
+        name: AsyncScheduler shares this class's methods, so the method has to
+        live here for every scheduler variant.
+        """
+        if self.vllm_config.pic_config.debug:
+            logger.warning("[PIC-DEBUG] " + message, *args)
+
+    def _pic_parked_wait_report(self, request_id: str, *, failed: bool) -> None:
+        """Report how long a request waited between parking and resolving."""
+        started = self._pic_park_started.pop(request_id, None)
+        if started is None or not self._pic_trace_enabled():
+            return
+        logger.warning(
+            "[PIC-TRACE] park-wait request=%s ms=%.3f failed=%s",
+            request_id,
+            (time.perf_counter() - started) * 1000.0,
+            failed,
+        )
+
+    @staticmethod
+    def _pic_trace_enabled() -> bool:
+        """True when the low-volume lifecycle trace is on.
+
+        Kept separate from ``_pic_debug`` because it is cheap enough to leave on
+        during a normal latency run, while the debug lines are per-step.
+        """
+        return pic_debug_enabled()
+
+    def _park_pic_external_import(self, request: Request, block_ids: Any) -> bool:
+        """Park a PIC request whose segments must be imported from the store.
+
+        The import happens inside the worker's ``execute_model.update_states``
+        and costs tens of milliseconds.  Parking the request before it is
+        dispatched lets the other requests of the same step prefill instead of
+        waiting behind that import; the worker reports completion through
+        ``ModelRunnerOutput.pic_finished_imports`` and
+        ``_try_promote_blocked_waiting_request`` moves the request back to
+        WAITING.
+
+        Only the request is parked, not individual segments: one request
+        publishes exactly one external segment per KV group, so a partial park
+        would buy nothing and complicate the token accounting.
+        """
+        plan = request.pic_cache_plan
+        if plan is None:
+            return False
+        if request.request_id in self._pic_import_completed:
+            # The import already ran for this request and the worker adopted the
+            # result.  The plan still lists the external references, so without
+            # this guard the request parks again on the next step and loops.
+            return False
+        # A normal PIC deployment resolves the external entry through
+        # external_lookup and then re-looks-it-up, so the segment lands in
+        # ``matches`` and ``external_matches`` stays empty.  Park on what the
+        # worker will actually import: any matched entry holding external
+        # native references, whichever list it came from.
+        external: list[int] = []
+        for segment_index, entry in tuple(plan.matches) + tuple(plan.external_matches):
+            if segment_index in external:
+                continue
+            if any(
+                reference.is_external or reference.external_key is not None
+                for reference in entry.native_kv_refs
+            ):
+                external.append(int(segment_index))
+        if not external:
+            return False
+        # Always park.  Parking used to be refused for the last runnable request
+        # on the theory that an all-parked queue makes the engine take empty steps
+        # that never poll, so the import would never complete.  Nothing in the
+        # path supports that:
+        #
+        #   * ``schedule`` attaches ``pic_async_imports`` to every
+        #     ``SchedulerOutput``, whatever it scheduled;
+        #   * ``EngineCore.step`` calls ``execute_model`` unconditionally, even
+        #     with zero scheduled tokens;
+        #   * the worker starts and polls imports at the very top of
+        #     ``execute_model``, before it reads the token count.
+        #
+        # So a parked import advances on empty steps, and a lone request costs the
+        # same either way - the import takes its time whether it runs inline or
+        # parked.  Keeping one code path also removes the half-inline half-parked
+        # mix that made the pipeline depend on arrival timing.  The step-based
+        # import timeout still covers a wedged import.
+        # The worker cannot read the request's row while it is parked, so ship the
+        # payload it would have received on a normal step: destination resolution
+        # needs the cache plan, the segments and the allocated block ids only.
+        # Park-to-promote is server time that no execute_model record covers: the
+        # request waits while the engine takes empty steps. Timing it is the only
+        # way to attribute the gap between the client-observed latency and
+        # execute_model.total.
+        self._pic_park_started[request.request_id] = time.perf_counter()
+        self._pic_pending_imports[request.request_id] = PICAsyncImportSpec(
+            request_id=request.request_id,
+            segment_indices=tuple(external),
+            request_data=NewRequestData.from_request(request, block_ids),
+        )
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        self._pic_log_plan("park", request)
+        if self.vllm_config.pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] async import PARK request=%s segments=%s",
+                request.request_id,
+                external,
+            )
+        return True
+
+    def _pic_log_plan(self, stage: str, request: Request) -> None:
+        """Trace the cache plan across the scheduler's own handover points."""
+        if not self.vllm_config.pic_config.debug:
+            return
+        plan = getattr(request, "pic_cache_plan", None)
+        logger.warning(
+            "[PIC-PLAN] %s request=%s plan=%s id=%s matches=%d extra=%d ranges=%d status=%s",
+            stage,
+            request.request_id,
+            type(plan).__name__ if plan is not None else None,
+            ("%#x" % id(plan)) if plan is not None else None,
+            len(getattr(plan, "matches", ()) or ()),
+            len(getattr(plan, "external_matches", ()) or ()),
+            len(getattr(getattr(request, "pic_execution_plan", None), "ranges", ()) or ()),
+            request.status.name,
+        )
+
+    def _ensure_pic_public_blocks(self, request: Request) -> None:
+        """Reserve independent native blocks for first-seen PIC segments.
+
+        These blocks are the canonical/public copy described by SGLang's PIC
+        allocator.  They are never installed in the request's private block
+        table.  The worker writes canonical-position KV into them, then the
+        scheduler adopts their initial allocation reference when publishing
+        the cache entry.
+        """
+        request.pic_public_block_ids = ()
+        if (
+            not request.pic_enabled
+            or request.pic_segments is None
+            or request.pic_cache_plan is None
+            or self.pic_cache is None
+            or request.mm_features
+            or request.prompt_embeds is not None
+        ):
+            return
+
+        matched_entries = dict(request.pic_cache_plan.matches)
+        matched_entries.update(request.pic_cache_plan.external_matches)
+        records: list[tuple[int, int, tuple[int, ...]]] = []
+        allocated: list[tuple[tuple[str, bytes, int], tuple[Any, ...]]] = []
+        shared_hits = 0
+        fresh_sets = 0
+        try:
+            for segment_index, segment in enumerate(request.pic_segments):
+                if not getattr(segment, "cacheable", True):
+                    continue
+                entry = matched_entries.get(segment_index)
+                has_external_refs = entry is not None and any(
+                    reference.is_external or reference.external_key is not None
+                    for reference in entry.native_kv_refs
+                )
+                # The common prefix segment already has request-owned native
+                # KV blocks.  The worker will publish those blocks directly
+                # and the scheduler will later promote them to a canonical
+                # lease.  Do not allocate a second PIC public copy here.
+                # Interior/shifted segments remain on the conservative public
+                # allocation path until their position mapping is exact.
+                #
+                # The exception is an entry whose KV still lives in the store:
+                # the Mooncake provider keys destinations by resource, so every
+                # request importing the same segment must import into ONE block
+                # set.  Request-owned blocks differ per request, so those
+                # segments need the shared public copy.
+                if is_pic_exact_position_aliasable(segment.start) and not has_external_refs:
+                    continue
+                for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                    spec = group.kv_cache_spec
+                    if not isinstance(spec, AttentionSpec) or isinstance(
+                        spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
+                    ):
+                        continue
+                    # Covering span: a segment that does not end on a page boundary still
+                    # publishes the page it ends inside, so the window may reach its last token.
+                    span = get_covering_local_block_span(
+                        segment.end - segment.start, int(spec.block_size)
+                    )
+                    if span.block_count <= 0:
+                        continue
+                    # A lookup hit may contain only live state (for example an
+                    # entry warmed by the single-segment prefill path).  It is
+                    # not usable by the 9-A native-slot runtime until its
+                    # complete canonical KV span has been materialized.  The
+                    # A single-segment warmup is reserved here even though its
+                    # only segment is not looked up by the current request. It
+                    # can be an interior hit in a later request. For a
+                    # multi-segment request, the final continuation segment was
+                    # filtered above, matching SGLang PIC semantics.
+                    if entry is not None and has_complete_native_kv_reference(
+                        entry.native_kv_refs,
+                        kv_cache_group_id=group_id,
+                        block_count=span.block_count,
+                        token_count=span.reusable_token_count,
+                    ):
+                        continue
+                    # External KV is imported into ONE block set per stored
+                    # segment: the provider keys destinations by resource and
+                    # refuses a second, different span.  Allocate one shared set
+                    # per (segment, group) and hand every request the same ids.
+                    # seg_hash is raw bytes; coercing it to int raised inside the
+                    # allocation try-block and silently disabled every destination.
+                    segment_key = (segment.seg_hash, group_id)
+                    shared = self._pic_public_shared_blocks.get(segment_key)
+                    if shared is not None and len(shared) >= span.block_count:
+                        granted = shared[: span.block_count]
+                        shared_hits += 1
+                        self._pic_public_shared_holders[segment_key] = (
+                            self._pic_public_shared_holders.get(segment_key, 1) + 1
+                        )
+                        self._pic_public_shared_held.setdefault(
+                            request.request_id, []
+                        ).append(segment_key)
+                        records.append(
+                            (
+                                segment_index,
+                                group_id,
+                                tuple(int(block.block_id) for block in granted),
+                            )
+                        )
+                        continue
+                    key = (request.request_id, segment.seg_hash, group_id)
+                    blocks = tuple(
+                        self.kv_cache_manager.block_pool.get_new_blocks(
+                            span.block_count
+                        )
+                    )
+                    fresh_sets += 1
+                    self._pic_public_block_ids_to_zero.extend(
+                        int(block.block_id) for block in blocks
+                    )
+                    if has_external_refs:
+                        # Shared by every request importing this segment, so it
+                        # must outlive the request that allocated it: registering
+                        # it under the request would free it at request end and
+                        # leave other requests pointing at recycled blocks.
+                        # Two holders from the start: this request and the cache.
+                        self._pic_public_shared_blocks[segment_key] = blocks
+                        self._pic_public_shared_holders[segment_key] = 2
+                        self._pic_public_shared_held.setdefault(
+                            request.request_id, []
+                        ).append(segment_key)
+                    else:
+                        self._pic_public_allocations[key] = blocks
+                        allocated.append((key, blocks))
+                    records.append(
+                        (
+                            segment_index,
+                            group_id,
+                            tuple(int(block.block_id) for block in blocks),
+                        )
+                    )
+        except Exception:
+            for key, blocks in allocated:
+                self._pic_public_allocations.pop(key, None)
+                self.kv_cache_manager.block_pool.free_blocks(blocks)
+            if self.vllm_config.pic_config.debug:
+                logger.warning(
+                    "[PIC-DEBUG] public native allocation failed request=%s; "
+                    "native KV publication disabled",
+                    request.request_id,
+                    exc_info=True,
+                )
+            return
+        request.pic_public_block_ids = tuple(records)
+        if records and self.vllm_config.pic_config.debug:
+            # Fresh versus shared sets is the number that separates "a new
+            # segment costs block allocation and zeroing" from "it does not":
+            # a repeated segment is all hits, a first-seen one is all fresh.
+            logger.warning(
+                "[PIC-DEBUG] reserved public native KV request=%s "
+                "fresh_sets=%d shared_hits=%d zero_blocks=%d records=%s",
+                request.request_id,
+                fresh_sets,
+                shared_hits,
+                len(self._pic_public_block_ids_to_zero),
+                records,
+            )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -1824,6 +2577,20 @@ class Scheduler(SchedulerInterface):
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
 
+        if valid_requests and self._pic_trace_enabled():
+            # Latency rose steadily across a twenty-request run in both the PIC and
+            # the native configuration, which no warm-up curve explains.  Free
+            # blocks per finished request tells "the pool is being consumed" apart
+            # from "the requests themselves got slower".
+            logger.warning(
+                "[PIC-TRACE] finish free_blocks=%d running=%d waiting=%d "
+                "pic_public_sets=%d",
+                self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                len(self.running),
+                len(self.waiting),
+                len(self._pic_public_shared_blocks),
+            )
+
         # Second pass: set status and free requests
         for request in valid_requests:
             delay_free_blocks = False
@@ -1838,6 +2605,39 @@ class Scheduler(SchedulerInterface):
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
         return [(r.request_id, r.client_index) for r in valid_requests]
+
+    def _pic_claims_exclusive_step(self, request: Request) -> bool:
+        """Whether this request needs a step of its own for the PIC fast path.
+
+        The single-request runner rebuilds the batch around one row, so a ready PIC
+        prefill that shares its step with anything else loses the fast path - and with it
+        the whole reuse, falling back to a full prefill. Exclusivity therefore keys on
+        readiness, not on the server-wide flag: once PIC is enabled every request has
+        ``pic_enabled`` set, so keying on it separated nothing and mixed batches were
+        scheduled anyway.
+        """
+        plan = request.pic_cache_plan
+        return bool(
+            request.pic_enabled
+            and request.num_computed_tokens == 0
+            and plan is not None
+            and plan.reused_segments
+        )
+
+    def _pic_awaits_park(self, request: Request) -> bool:
+        """Whether this request still has an external import to submit.
+
+        Parking costs no token budget: the request is taken out of the step right after
+        its blocks are allocated, so it never reaches the model. Deferring such a request
+        would only postpone the start of its transfer while the GPU stays busy anyway -
+        the opposite of the pipeline this is meant to protect.
+        """
+        plan = request.pic_cache_plan
+        return bool(
+            self.pic_async_imports_enabled
+            and plan is not None
+            and plan.external_matches
+        )
 
     def _free_request(
         self, request: Request, delay_free_blocks: bool = False
@@ -1859,8 +2659,60 @@ class Scheduler(SchedulerInterface):
 
     def _free_blocks(self, request: Request):
         assert request.is_finished()
+        # A request may finish before a worker reaches the capture boundary.
+        # Release every request-owned public allocation that was not adopted by
+        # a published PIC cache lease.  Keying this cleanup by request ID is
+        # deliberate: it also covers a late/invalid materialization and keeps
+        # the allocator from monotonically consuming public blocks.
+        self._free_pic_public_allocations(request.request_id)
+        self._release_pic_shared_blocks(request.request_id)
+        self._pic_import_completed.discard(request.request_id)
+        self._pic_promote_attempts.pop(request.request_id, None)
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
+
+    def _free_pic_public_allocations(self, request_id: str) -> None:
+        """Release unadopted public PIC blocks owned by one request."""
+        for allocation_key, blocks in tuple(self._pic_public_allocations.items()):
+            if allocation_key[0] != request_id:
+                continue
+            self._pic_public_allocations.pop(allocation_key, None)
+            self.kv_cache_manager.block_pool.free_blocks(blocks)
+
+    def _release_pic_shared_cache_hold(self, seg_hash: bytes) -> None:
+        """Drop the cache's hold on a shared block set after eviction.
+
+        Shared sets are counted like cached KV blocks: the cache keeps one holder,
+        so a set survives requests coming and going and is returned to the pool
+        once the segment is evicted and no request holds it.
+        """
+        for segment_key in tuple(self._pic_public_shared_blocks):
+            if segment_key[0] != seg_hash:
+                continue
+            self._drop_pic_shared_holder(segment_key)
+
+    def _drop_pic_shared_holder(self, segment_key: tuple[Any, int]) -> None:
+        holders = self._pic_public_shared_holders.get(segment_key, 0) - 1
+        if holders > 0:
+            self._pic_public_shared_holders[segment_key] = holders
+            return
+        self._pic_public_shared_holders.pop(segment_key, None)
+        blocks = self._pic_public_shared_blocks.pop(segment_key, None)
+        if not blocks:
+            return
+        # Single decrement for the pool's own reference, taken at allocation.
+        self.kv_cache_manager.block_pool.free_blocks(blocks)
+        if self.vllm_config.pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] released shared public blocks segment=%s blocks=%d",
+                segment_key,
+                len(blocks),
+            )
+
+    def _release_pic_shared_blocks(self, request_id: str) -> None:
+        """Drop one request's holds on shared canonical block sets."""
+        for segment_key in self._pic_public_shared_held.pop(request_id, ()):
+            self._drop_pic_shared_holder(segment_key)
 
     @property
     def pause_state(self) -> PauseState:
@@ -1930,6 +2782,11 @@ class Scheduler(SchedulerInterface):
             self.prev_step_scheduled_req_ids.clear()
 
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
+        if reset_successful and self.pic_cache is not None:
+            self.pic_cache.clear()
+            for lease in self._pic_native_leases.values():
+                lease.release()
+            self._pic_native_leases.clear()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
                 "Failed to reset KV cache even when all the running requests are "
@@ -2105,6 +2962,74 @@ class Scheduler(SchedulerInterface):
         Try to promote a blocked waiting request back to schedulable states.
         """
         if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            if request.request_id in self._pic_failed_recving:
+                # PIC async import failed: drop the partial external import and
+                # fall back to a full recompute.  Do not route this through
+                # _update_waiting_for_remote_kv: that path is connector-specific
+                # and would keep partially valid blocks and counters.
+                self._pic_failed_recving.discard(request.request_id)
+                self._pic_finished_recving.discard(request.request_id)
+                self._pic_parked_wait_report(request.request_id, failed=True)
+                self._pic_pending_imports.pop(request.request_id, None)
+                self._free_pic_public_allocations(request.request_id)
+                self.kv_cache_manager.free(request)
+                request.num_computed_tokens = 0
+                request.pic_cache_plan = None
+                request.status = (
+                    RequestStatus.PREEMPTED
+                    if request.num_preemptions
+                    else RequestStatus.WAITING
+                )
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] async import FAILED PROMOTE request=%s "
+                        "fallback=full_recompute",
+                        request.request_id,
+                    )
+                return True
+            if self.vllm_config.pic_config.debug and (
+                request.request_id not in self._pic_finished_recving
+            ):
+                # Bounded trace: tells "the worker never reported" apart from
+                # "the scheduler dropped the report" without flooding the log when
+                # an empty-step loop re-checks this request thousands of times.
+                attempts = self._pic_promote_attempts.get(request.request_id, 0) + 1
+                self._pic_promote_attempts[request.request_id] = attempts
+                if attempts == 1 or attempts % 500 == 0:
+                    logger.warning(
+                        "[PIC-DEBUG] async import WAIT request=%s attempts=%d",
+                        request.request_id,
+                        attempts,
+                    )
+            if request.request_id in self._pic_finished_recving:
+                # PIC async import: the worker finished the transfer, so the
+                # request can be scheduled again on the next step.  Token
+                # accounting is untouched: PIC keeps deciding skip/recompute
+                # through its own plan, unlike a prefix hit.
+                self._pic_finished_recving.discard(request.request_id)
+                self._pic_pending_imports.pop(request.request_id, None)
+                # Remember that this request's import is done: the plan keeps its
+                # external references, so parking must consult this set or the
+                # request parks again immediately after being promoted.
+                self._pic_import_completed.add(request.request_id)
+                started = self._pic_park_started.pop(request.request_id, None)
+                if started is not None and self._pic_trace_enabled():
+                    logger.warning(
+                        "[PIC-TRACE] park-wait request=%s ms=%.3f",
+                        request.request_id,
+                        (time.perf_counter() - started) * 1000.0,
+                    )
+                request.status = (
+                    RequestStatus.PREEMPTED
+                    if request.num_preemptions
+                    else RequestStatus.WAITING
+                )
+                if self.vllm_config.pic_config.debug:
+                    logger.warning(
+                        "[PIC-DEBUG] async import PROMOTE request=%s",
+                        request.request_id,
+                    )
+                return True
             # finished_recving_kv_req_ids is populated during
             # update_from_output(), based on worker-side connector signals
             # in KVConnectorOutput.finished_recving
@@ -2133,6 +3058,38 @@ class Scheduler(SchedulerInterface):
             f"{request.status.name} for request {request.request_id}"
         )
 
+    def _update_pic_async_imports(self, model_runner_output: Any) -> None:
+        """Record which parked requests finished or failed their import.
+
+        Success promotes the request on the next step.  A failure is recorded in
+        ``failed_recving_kv_req_ids`` so the promotion path frees the blocks and
+        lets the request recompute instead of waiting forever.
+        """
+        finished = getattr(model_runner_output, "pic_finished_imports", ())
+        for req_id in finished:
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            self._pic_finished_recving.add(req_id)
+            if self.vllm_config.pic_config.debug:
+                logger.warning("[PIC-DEBUG] async import READY request=%s", req_id)
+
+        failed = getattr(model_runner_output, "pic_failed_imports", ())
+        for req_id in failed:
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            # Record the failure in the PIC set, not the connector's: PIC must not
+            # depend on a connector being configured, and the promotion path
+            # frees the blocks and schedules a full recompute for this request.
+            self._pic_failed_recving.add(req_id)
+            if self.vllm_config.pic_config.debug:
+                logger.warning("[PIC-DEBUG] async import FAILED request=%s", req_id)
+
     def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
         """
         KV Connector: update the scheduler state based on the output.
@@ -2146,6 +3103,17 @@ class Scheduler(SchedulerInterface):
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+
+        pic_finished = getattr(kv_connector_output, "pic_finished_imports", ())
+        for req_id in pic_finished:
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+            if request.status != RequestStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            self._pic_finished_recving.add(req_id)
+            if self.vllm_config.pic_config.debug:
+                logger.warning("[PIC-DEBUG] async import READY request=%s", req_id)
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
