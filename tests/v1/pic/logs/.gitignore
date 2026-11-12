@@ -1,0 +1,4 @@
+# logs
+*.log
+mooncake_config.json
+probe_*.json
