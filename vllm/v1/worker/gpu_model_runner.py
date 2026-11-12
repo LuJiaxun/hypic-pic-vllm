@@ -4,10 +4,11 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
-from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -134,6 +135,7 @@ from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
+    get_kv_cache_layout,
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
@@ -166,6 +168,73 @@ from vllm.v1.outputs import (
     SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
+from vllm.v1.pic.profile_level import pic_profile_enabled
+from vllm.v1.pic.attention import (
+    PICAttentionBackendUnsupported,
+    build_pic_packed_attention_round,
+)
+from vllm.v1.pic.external_kv import (
+    PICExternalKVImportBatch,
+    PICExternalKVImportError,
+    PICExternalKVProvider,
+    PICExternalKVRegistry,
+)
+from vllm.v1.pic.cache import pic_external_segment_indices
+from vllm.v1.pic.kv_slots import (
+    PICKVLayerTarget,
+    build_kv_slot_mapping,
+)
+from vllm.v1.pic.lifecycle import PICLeaseRegistry, PICLeaseToken
+from vllm.v1.pic.live_capture import (
+    PICGDNTransitionCapture,
+    PICLiveCaptureManager,
+    apply_matched_mamba_transition,
+    capture_completed_mamba_segment,
+    capture_transition_operator_segment,
+    ordered_gdn_layer_names,
+    restore_matched_mamba_segment,
+)
+from vllm.v1.pic.metrics import PICMetrics
+from vllm.v1.pic.mooncake_kv import (
+    MooncakeNativeKVObjectStore,
+    connect_mooncake_native_kv_store,
+)
+from vllm.v1.pic.mooncake_provider import MooncakePICExternalKVProvider
+from vllm.v1.pic.native_kv import (
+    PICNativeKVAllocation,
+    PICNativeKVReference,
+    PICNativeKVRequestMapping,
+    gather_native_kv_slots,
+    get_allocator_block_count,
+    get_covering_local_block_span,
+    get_full_local_block_span,
+    is_pic_exact_position_aliasable,
+    rerotate_native_key,
+)
+from vllm.v1.pic.pool import PICPhysicalPool
+from vllm.v1.pic.runtime import (
+    PICRuntimeRange,
+    PICSingleRequestRuntimePlan,
+    build_single_request_runtime_plan,
+)
+from vllm.v1.pic.segmenter import PICSegment
+from vllm.v1.pic.single_request import build_single_request_plan
+from vllm.v1.pic.state import PICLinearTransition, PICRequestStateBinding
+from types import SimpleNamespace
+
+from vllm.v1.pic.async_import import PICAsyncImportManager, PICAsyncImportSpec
+from vllm.v1.pic.request_transfer import (
+    PICRequestTransfer,
+    PICTransferError,
+    split_transition_result,
+)
+from vllm.v1.pic.worker_plan import (
+    PICWorkerCapabilities,
+    PICWorkerPlan,
+    PICWorkerUnsupported,
+    build_worker_plan,
+)
+from vllm.v1.pic.execution import compile_execution_plan
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
@@ -208,6 +277,8 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
+from vllm.v1.pic.env import pic_debug_enabled
+from vllm.v1.pic.env import pic_profile_deep_enabled
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm.v1.worker.workspace import lock_workspace
 
@@ -226,6 +297,230 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+# A parked import that has not reported within this many seconds is treated as
+# failed, so the request falls back to a full recompute instead of hanging.  The
+# bound is wall-clock, not steps: an empty scheduler loop runs tens of thousands
+# of steps per second, so a step budget meant "about a second" while a contended
+# import can legitimately need several.
+_PIC_PARK_IMPORT_TIMEOUT_SECONDS = 30.0
+
+
+def _pic_now_seconds() -> float:
+    return time.perf_counter()
+
+
+def _pic_import_profile_enabled() -> bool:
+    return pic_profile_enabled()
+
+
+def _pic_forward_profile_enabled() -> bool:
+    return pic_profile_enabled()
+
+
+def _pic_detail_profile_enabled() -> bool:
+    return pic_profile_enabled()
+
+
+def _pic_trace_enabled() -> bool:
+    """Whether to emit one decision line per PIC request.
+
+    Kept separate from the profiling switch on purpose: profiling synchronises the
+    device at several points, which distorts exactly the import and
+    materialization times this trace is meant to explain.  The trace only reads
+    ``perf_counter`` values that are already collected, so it can stay enabled
+    during a normal latency run.
+    """
+    return pic_debug_enabled()
+
+
+def _pic_log_cuda_memory(
+    stage: str,
+    request_id: str,
+    device: Any,
+    *,
+    synchronize: bool = False,
+) -> None:
+    """Log live CUDA allocator counters at PIC request lifecycle boundaries."""
+    if not pic_profile_enabled():
+        return
+    try:
+        target = torch.device(device)
+        if target.type != "cuda" or not torch.cuda.is_available():
+            return
+        # Allocator counters only. The free/total figures need ``cudaMemGetInfo``, a driver call
+        # that measured fifty-five milliseconds in a trace - thirteen of those per request, inside
+        # the request, purely because diagnostics were on. What the counters below answer here is
+        # whether a stage allocates and whether it releases; the driver figure answers a different
+        # question, and is not worth distorting every measurement to get.
+        logger.warning(
+            "[PIC-MEMORY] request=%s stage=%s device=%s allocated_bytes=%d "
+            "reserved_bytes=%d peak_allocated_bytes=%d",
+            request_id,
+            stage,
+            target,
+            int(torch.cuda.memory_allocated(target)),
+            int(torch.cuda.memory_reserved(target)),
+            int(torch.cuda.max_memory_allocated(target)),
+        )
+    except (RuntimeError, TypeError, ValueError):
+        # Diagnostics must never change request behavior.
+        logger.debug("PIC CUDA memory snapshot failed at %s", stage, exc_info=True)
+
+
+def _pic_exception_chain(exc: BaseException) -> str:
+    """Format chained PIC import errors without hiding the transport cause."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(parts) < 8:
+        seen.add(id(current))
+        parts.append(f"{type(current).__name__}: {current}")
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)
+
+
+def _pic_log_request_memory_owners(
+    stage: str,
+    request_state: CachedRequestState,
+    pool: PICPhysicalPool | None,
+) -> None:
+    """Log request-owned PIC references alongside allocator snapshots."""
+    if not pic_profile_enabled():
+        return
+    try:
+        request_transfer = request_state.pic_request_transfer
+        imported_native_refs = sum(
+            len(references)
+            for references in request_state.pic_imported_native_refs.values()
+        )
+        transition_bytes = 0
+        for operator in request_state.pic_transition_operators.values():
+            transition_bytes += sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in operator.storage_tensors()
+            )
+        pool_capacity = pool.capacity_bytes if pool is not None else 0
+        pool_free = pool.free_bytes if pool is not None else 0
+        logger.warning(
+            "[PIC-MEMORY-OWNERS] request=%s stage=%s native_leases=%d "
+            "inflight_leases=%d imported_native_refs=%d transition_handles=%d "
+            "transition_operators=%d transition_operator_bytes=%d "
+            "transfer_native_ops=%d transfer_state_ops=%d pic_pool_used_bytes=%d "
+            "pic_pool_capacity_bytes=%d",
+            request_state.req_id,
+            stage,
+            len(request_state.pic_native_kv_leases),
+            len(request_state.pic_inflight_leases),
+            imported_native_refs,
+            len(request_state.pic_transition_handles),
+            len(request_state.pic_transition_operators),
+            transition_bytes,
+            len(request_transfer.native) if request_transfer is not None else 0,
+            len(request_transfer.state) if request_transfer is not None else 0,
+            pool_capacity - pool_free,
+            pool_capacity,
+        )
+    except Exception:
+        # Best-effort instrumentation must not affect request cleanup.
+        logger.debug("PIC memory-owner snapshot failed", exc_info=True)
+
+
+def _pic_timeline_sync_enabled() -> bool:
+    """Whether a phase boundary waits for the device before taking its timestamp.
+
+    Synchronising makes the timeline truthful - a phase that only launches GPU work
+    would otherwise look free - but it also charges every phase the tail of the previous
+    step's device work. ``update_states`` measured 26.6 ms that way, most of which was the
+    previous forward, and the phases then summed to more than their parent.
+    A profile run leaves the timeline unsynchronised, so each record is
+    CPU time on the calling thread - which is what a Python-side optimisation can move.
+    """
+    return pic_profile_enabled()
+
+
+# Last phase end per (request, mode), used to report the gap between
+# instrumented phases so uninstrumented work cannot hide in a parent total.
+_PIC_PHASE_LAST_END: dict[tuple[str, str], int] = {}
+
+
+def _pic_profile_sync(enabled: bool, device: Any) -> None:
+    """Synchronize only for deep profiling.
+
+    Timing a queued phase with the wall clock attributes its work to whichever phase waits next: a
+    six-millisecond rotation was once reported as two hundred and ninety because the next phase
+    drained the queue and was charged for it. Deep profiling synchronises so each phase is honest,
+    at the cost of making the request slower than it is; the default profile leaves the queue alone,
+    so its numbers describe latency rather than attribution.
+    """
+    if not enabled or not pic_profile_deep_enabled():
+        return
+    if getattr(device, "type", None) != "cuda" or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize(device)
+
+
+def _pic_profile_phase_start(enabled: bool, device: Any = None) -> int:
+    """Start a request-phase timer when detailed profiling is enabled."""
+    if not enabled:
+        return 0
+    if _pic_timeline_sync_enabled() and device is not None:
+        _pic_profile_sync(True, device)
+    return time.perf_counter_ns()
+
+
+def _pic_profile_phase_end(
+    enabled: bool,
+    start_ns: int,
+    *,
+    request_ids: str,
+    mode: str,
+    stage: str,
+    device: Any = None,
+) -> None:
+    """Emit one parseable start/end/duration record for a request phase.
+
+    Besides the phase itself, the time between the previous phase's end and this
+    phase's start is emitted as ``<stage>.gap``.  Without it, work done between
+    two instrumented phases hides inside the parent total and is indistinguishable
+    from the phase that follows it.
+    """
+    if not enabled or start_ns == 0:
+        return
+    if _pic_timeline_sync_enabled() and device is not None:
+        _pic_profile_sync(True, device)
+    end_ns = time.perf_counter_ns()
+    key = (request_ids or "-", mode)
+    previous_end = _PIC_PHASE_LAST_END.get(key, 0)
+    _PIC_PHASE_LAST_END[key] = end_ns
+    if previous_end and start_ns > previous_end:
+        logger.warning(
+            "[PIC-PROFILE] timeline request=%s mode=%s stage=%s.gap "
+            "start_ns=%d end_ns=%d duration_ms=%.3f",
+            request_ids or "-",
+            mode,
+            stage,
+            previous_end,
+            start_ns,
+            (start_ns - previous_end) / 1_000_000.0,
+        )
+    logger.warning(
+        "[PIC-PROFILE] timeline request=%s mode=%s stage=%s "
+        "start_ns=%d end_ns=%d duration_ms=%.3f",
+        request_ids or "-",
+        mode,
+        stage,
+        start_ns,
+        end_ns,
+        (end_ns - start_ns) / 1_000_000.0,
+    )
+
+
+def _pic_profile_request_ids(scheduler_output: Any) -> str:
+    scheduled = getattr(scheduler_output, "num_scheduled_tokens", None)
+    if isinstance(scheduled, Mapping):
+        return ",".join(str(request_id) for request_id in scheduled)
+    return "-"
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -431,6 +726,17 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        # Stage 6-A only wires the descriptor into worker state.  A concrete
+        # backend must explicitly advertise range support before any reused
+        # range can be consumed.
+        self.pic_worker_capabilities = PICWorkerCapabilities()
+        # One worker-local ownership ledger is shared by live state snapshots,
+        # native KV views, and in-flight execution. The scheduler keeps the
+        # actual BlockPool lease in its own process; this ledger protects the
+        # worker-side view until the matching request/round is finished.
+        self.pic_lease_registry = PICLeaseRegistry()
+        self.pic_metrics = PICMetrics()
+        self.pic_external_kv = PICExternalKVRegistry()
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -439,6 +745,77 @@ class GPUModelRunner(
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
+
+        self.pic_live_capture: PICLiveCaptureManager | None = None
+        self.pic_mooncake_object_store: MooncakeNativeKVObjectStore | None = None
+        # Per (external key, KV group) queue of destination block ids.  Several
+        # requests may import the same stored segment at once (same prompt, own
+        # blocks), so a single slot per key would let one request's destinations be
+        # consumed by another's import or overwritten before it runs.
+        self._pic_mooncake_destinations: dict[
+            tuple[str, int], deque[tuple[int, ...]]
+        ] = {}
+        pic_config = self.vllm_config.pic_config
+        if pic_config.enabled and (
+            pic_config.capture_live or pic_config.restore_live
+        ):
+            if pic_config.max_cache_bytes is None:
+                logger.warning(
+                    "PIC live capture requested without --pic-max-cache-bytes; "
+                    "capture remains disabled"
+                )
+            else:
+                self.pic_live_capture = PICLiveCaptureManager(
+                    PICPhysicalPool(
+                        pic_config.max_cache_bytes,
+                        device=self.device,
+                    ),
+                    retain_published=pic_config.restore_live,
+                    debug=pic_config.debug,
+                    lease_registry=self.pic_lease_registry,
+                    metrics=self.pic_metrics,
+                )
+
+        if pic_config.debug:
+            logger.warning(
+                "[PIC-DEBUG] gpu_model_runner init capture_live=%s "
+                "restore_live=%s zero_copy=%s manager=%s",
+                pic_config.capture_live,
+                pic_config.restore_live,
+                pic_config.zero_copy,
+                self.pic_live_capture is not None,
+            )
+        if pic_config.zero_copy:
+            logger.info(
+                "PIC zero-copy requested; native KV slot capability will be "
+                "decided after KV cache initialization"
+            )
+        if pic_config.single_request:
+            logger.info(
+                "PIC single-request skip/recompute requested; Stage 9-A "
+                "capability will be decided after KV cache initialization"
+            )
+        if pic_config.mooncake:
+            try:
+                # The worker has no scheduler-side BlockPool or remote KV
+                # destination resolver. Registering this provider keeps the
+                # capability explicit while making unsupported imports fail
+                # closed instead of inventing native block IDs.
+                self.register_pic_external_kv_provider(
+                    MooncakePICExternalKVProvider(
+                        lease_registry=self.pic_lease_registry,
+                    )
+                )
+                logger.info(
+                    "PIC Mooncake provider registered in fail-closed mode; "
+                    "native block destination is required for import"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "PIC Mooncake provider initialization failed; "
+                    "external imports will fall back: %s",
+                    exc,
+                )
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
@@ -1125,8 +1502,52 @@ class GPUModelRunner(
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
+            request_state = self.requests.get(req_id)
+            pool = (
+                self.pic_live_capture.pool
+                if self.pic_live_capture is not None
+                else None
+            )
+            if request_state is not None:
+                _pic_log_request_memory_owners(
+                    "cleanup_begin", request_state, pool
+                )
+            _pic_log_cuda_memory(
+                "request_finished_cleanup_begin", req_id, self.device
+            )
+            if request_state is not None:
+                self._release_pic_request_leases(request_state)
+                _pic_log_request_memory_owners(
+                    "after_pic_lease_release", request_state, pool
+                )
+                _pic_log_cuda_memory(
+                    "request_cleanup_after_pic_lease_release", req_id, self.device
+                )
+                self._release_pic_imported_native_refs(request_state)
+                _pic_log_request_memory_owners(
+                    "after_imported_native_refs_release", request_state, pool
+                )
+                _pic_log_cuda_memory(
+                    "request_cleanup_after_imported_native_refs_release",
+                    req_id,
+                    self.device,
+                )
+            if self.pic_live_capture is not None:
+                self.pic_live_capture.release_request(req_id)
+            if request_state is not None:
+                _pic_log_request_memory_owners(
+                    "after_live_capture_release", request_state, pool
+                )
+                _pic_log_cuda_memory(
+                    "request_cleanup_after_live_capture_release",
+                    req_id,
+                    self.device,
+                )
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            _pic_log_cuda_memory(
+                "request_finished_cleanup_state_removed", req_id, self.device
+            )
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1138,11 +1559,51 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+            # Drop the loop-local request reference before the optional synced
+            # snapshot so it does not keep request-owned PIC tensors alive.
+            request_state = None
+            _pic_log_cuda_memory(
+                "request_finished_cleanup_complete",
+                req_id,
+                self.device,
+                synchronize=True,
+            )
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
+        #
+        # The zeroing is deferred to the next step that actually schedules tokens.
+        # A step with no tokens is the engine polling for a parked import; the
+        # blocks it announces belong to a request that cannot run yet, and issuing
+        # a kernel there blocks on the CUDA context that the import thread is
+        # using for its own copies. Measured: 1 ms of kernel followed by ~180 ms of
+        # host wait, on every empty step, for every first-seen segment.
         if scheduler_output.new_block_ids_to_zero:
-            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+            pending_zero = getattr(self, "_pic_deferred_zero_ids", None)
+            if pending_zero is None:
+                pending_zero = []
+                self._pic_deferred_zero_ids = pending_zero
+            pending_zero.extend(scheduler_output.new_block_ids_to_zero)
+        deferred = getattr(self, "_pic_deferred_zero_ids", None)
+        if deferred and int(
+            getattr(scheduler_output, "total_num_scheduled_tokens", 0)
+        ) > 0:
+            zero_ids = list(dict.fromkeys(deferred))
+            deferred.clear()
+            zero_start = time.perf_counter()
+            self._zero_block_ids(zero_ids)
+            if _pic_import_profile_enabled():
+                # A first-seen PIC segment allocates public blocks; a repeated one
+                # does not.  The request id is what lets a slow zeroing be tied to
+                # the step that paid it instead of guessed at.
+                scheduled = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+                first_request = next(iter(scheduled), "-") if scheduled else "-"
+                logger.warning(
+                    "[PIC-PROFILE] pic-zero request=%s blocks=%d ms=%.3f",
+                    first_request,
+                    len(zero_ids),
+                    (time.perf_counter() - zero_start) * 1000.0,
+                )
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -1201,6 +1662,10 @@ class GPUModelRunner(
             else:
                 generator = None
 
+            pic_worker_plan, pic_worker_fallback = self._build_pic_worker_plan(
+                new_req_data
+            )
+
             if self.is_pooling_model:
                 assert pooling_params is not None
                 task = pooling_params.task
@@ -1223,7 +1688,32 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                pic_enabled=new_req_data.pic_enabled,
+                pic_segments=new_req_data.pic_segments,
+                pic_cache_plan=new_req_data.pic_cache_plan,
+                pic_execution_plan=new_req_data.pic_execution_plan,
+                pic_public_block_ids=new_req_data.pic_public_block_ids,
+                pic_worker_plan=pic_worker_plan,
+                pic_worker_fallback=pic_worker_fallback,
+                pic_state_binding=PICRequestStateBinding(req_id),
             )
+            if pic_debug_enabled():
+                # What the scheduler had and what the worker received, side by side: a plan that
+                # arrives with no matches looks exactly like one that never matched.
+                _plan = new_req_data.pic_cache_plan
+                logger.warning(
+                    "[PIC-PLAN] received request=%s plan=%s id=%s matches=%d extra=%d "
+                    "ranges=%s public_blocks=%d",
+                    req_id,
+                    type(_plan).__name__ if _plan is not None else None,
+                    ("%#x" % id(_plan)) if _plan is not None else None,
+                    len(getattr(_plan, "matches", ()) or ()),
+                    len(getattr(_plan, "external_matches", ()) or ()),
+                    len(getattr(new_req_data.pic_execution_plan, "ranges", ()) or ()),
+                    len(new_req_data.pic_public_block_ids),
+                )
+            with record_function_or_nullcontext("pic:plan_apply"):
+                self._set_pic_runtime_plan(req_state)
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
@@ -1368,6 +1858,8 @@ class GPUModelRunner(
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+
+            self._sync_pic_state_binding(req_state)
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -1541,6 +2033,3203 @@ class GPUModelRunner(
                     num_reqs,
                 )
 
+    def _build_pic_worker_plan(
+        self, new_req_data: NewRequestData
+    ) -> tuple[PICWorkerPlan | None, bool]:
+        """Resolve a Stage 5 plan at the worker boundary.
+
+        This method is intentionally a gate only.  The returned descriptor is
+        stored with the request, but no model or attention code consumes it in
+        Stage 6-A.  Until a backend advertises range support, a PIC hit keeps
+        using the ordinary vLLM forward path.
+        """
+        if not new_req_data.pic_enabled or new_req_data.pic_execution_plan is None:
+            return None, False
+        worker_plan, did_fallback = self._build_pic_worker_plan_for(
+            new_req_data.pic_execution_plan,
+            length_from_prompt_token_ids_or_embeds(
+                new_req_data.prompt_token_ids, new_req_data.prompt_embeds
+            ),
+            request_id=new_req_data.req_id,
+        )
+        return worker_plan, did_fallback
+
+    def _build_pic_worker_plan_for(
+        self,
+        execution_plan: Any,
+        prompt_len: int,
+        *,
+        request_id: str = "-",
+    ) -> tuple[PICWorkerPlan | None, bool]:
+        """Build the worker descriptor for one execution plan.
+
+        Split out so the plan can be rebuilt later with the same rules: the first attempt
+        runs before the pending import installs its native references, so an entry can
+        still lack handles at that moment and the plan is refused. Rebuilding after the
+        adopt costs about a millisecond and avoids a full recompute of the prompt.
+        """
+        # The scheduler compiles this plan and hands the same object over, so comparing
+        # the actions and the object id on both sides says whether the worker received a
+        # plan whose reuse ranges were already gone.
+        self._pic_debug(
+            "worker plan input request=%s actions=%s reused=%d plan_id=%#x",
+            request_id,
+            [range_.action for range_ in execution_plan.ranges],
+            len(execution_plan.reused_ranges),
+            id(execution_plan),
+        )
+        worker_plan = build_worker_plan(
+            execution_plan,
+            prompt_len=prompt_len,
+            range_execution_supported=(
+                self.pic_worker_capabilities.range_execution_supported
+            ),
+            allow_fallback=self.vllm_config.pic_config.allow_fallback,
+        )
+        did_fallback = worker_plan is None and bool(execution_plan.reused_ranges)
+        if did_fallback:
+            # This used to be logger.debug, which vLLM never prints at its default
+            # level: a plan rejected for missing physical handles looked identical to one
+            # that was never built, and every reuse counter stayed at zero with no line
+            # saying why. The reason is spelled out here.
+            self._pic_debug(
+                "pic worker plan rejected request=%s reasons=%s reused=%s "
+                "handles_required=%s range_exec=%s",
+                request_id,
+                ",".join(
+                    [
+                        name
+                        for name, failed in (
+                            (
+                                "no_physical_handles",
+                                execution_plan.requires_physical_handles,
+                            ),
+                            (
+                                "range_execution_unsupported",
+                                not self.pic_worker_capabilities.range_execution_supported,
+                            ),
+                        )
+                        if failed
+                    ]
+                )
+                or "unknown",
+                len(execution_plan.reused_ranges),
+                execution_plan.requires_physical_handles,
+                self.pic_worker_capabilities.range_execution_supported,
+            )
+        return worker_plan, did_fallback
+
+    def _build_pic_runtime_plan(
+        self, request_state: CachedRequestState
+    ) -> PICSingleRequestRuntimePlan | None:
+        """Build the native-slot view only for an explicitly enabled backend.
+
+        The capability remains false in the stock runner.  A backend that
+        implements the range forward contract can opt in by advertising both
+        native-slot and single-request execution support.
+        """
+        self._pic_debug(
+            "runtime plan enter request=%s enabled=%s worker_plan=%s",
+            request_state.req_id,
+            request_state.pic_enabled,
+            request_state.pic_worker_plan is not None,
+        )
+        if (
+            not request_state.pic_enabled
+            or request_state.pic_worker_plan is None
+            or not self.pic_worker_capabilities.single_request_execution_supported
+            or not self.pic_worker_capabilities.native_kv_bridge_supported
+            or request_state.pic_cache_plan is None
+        ):
+            self._pic_debug(
+                "runtime plan skipped request=%s enabled=%s worker_plan=%s "
+                "single=%s batch=%s bridge=%s plan=%s",
+                request_state.req_id,
+                request_state.pic_enabled,
+                request_state.pic_worker_plan is not None,
+                self.pic_worker_capabilities.single_request_execution_supported,
+                self.pic_worker_capabilities.native_kv_bridge_supported,
+                request_state.pic_cache_plan is not None,
+            )
+            return None
+        if request_state.mm_features or request_state.prompt_embeds is not None:
+            self._pic_debug(
+                "single-request runtime skipped "
+                "request=%s reason=request_has_mm_inputs",
+                request_state.req_id,
+            )
+            return None
+        references = tuple(
+            reference
+            for _, entry in request_state.pic_cache_plan.matches
+            for reference in entry.native_kv_refs
+        )
+        # A request parked for its external import already resolved those
+        # references on an earlier step; install them and skip the import block.
+        adopted = self._pic_adopt_park_import(request_state)
+        if not adopted and request_state.pic_imported_native_refs:
+            # The import ran on a previous step of this same request (the state
+            # outlives the step), so reuse the resolved references instead of
+            # importing a second time.
+            adopted = True
+        if adopted:
+            references = tuple(
+                reference
+                for segment_index, entry in request_state.pic_cache_plan.matches
+                for reference in request_state.pic_imported_native_refs.get(
+                    segment_index, entry.native_kv_refs
+                )
+            )
+        if any(reference.is_external for reference in references):
+            if not self.vllm_config.pic_config.mooncake:
+                self.pic_metrics.record_fallback("external_native_kv_disabled")
+                self._pic_debug(
+                    "external native KV disabled request=%s",
+                    request_state.req_id,
+                )
+                return None
+            pending_native_imports: dict[int, PICExternalKVImportBatch] = {}
+            request_transfer = PICRequestTransfer(request_key=request_state.req_id)
+            request_state.pic_request_transfer = request_transfer
+            _pic_log_cuda_memory(
+                "runtime_plan_external_import_begin", request_state.req_id, self.device
+            )
+            try:
+                self._prepare_pic_mooncake_destinations(request_state)
+                _pic_log_cuda_memory(
+                    "runtime_plan_destinations_ready",
+                    request_state.req_id,
+                    self.device,
+                )
+                external_segment_indices = {
+                    segment_index
+                    for segment_index, entry in request_state.pic_cache_plan.matches
+                    if any(reference.is_external for reference in entry.native_kv_refs)
+                }
+                resolved_entries = list(request_state.pic_cache_plan.matches)
+                for segment_index, entry in request_state.pic_cache_plan.matches:
+                    if segment_index in external_segment_indices:
+                        batch = self.pic_external_kv.begin_import_references(
+                            entry.native_kv_refs
+                        )
+                        pending_native_imports[segment_index] = batch
+                        request_transfer.add_native(segment_index, batch)
+                        _pic_log_cuda_memory(
+                            f"native_import_submitted_segment_{segment_index}",
+                            request_state.req_id,
+                            self.device,
+                        )
+                if self.kv_cache_config.has_mamba_layers:
+                    if self.pic_live_capture is None:
+                        raise PICExternalKVImportError(
+                            "hybrid PIC transition manager is unavailable"
+                        )
+                    if self.pic_mooncake_object_store is None:
+                        raise PICExternalKVImportError(
+                            "Mooncake hybrid transition store is unavailable"
+                        )
+                    for segment_index, entry in resolved_entries:
+                        if segment_index not in external_segment_indices:
+                            continue
+                        transition_key = entry.external_transition_key
+                        if transition_key is None:
+                            raise PICExternalKVImportError(
+                                "external hybrid entry is missing transition state"
+                            )
+                        transition_handle = request_state.pic_transition_handles.get(
+                            segment_index
+                        )
+                        if not self.pic_live_capture.has_transition(
+                            transition_handle
+                        ):
+                            segment = request_state.pic_segments[segment_index]
+                            def load_transition_async(
+                                transition_key: str = transition_key,
+                            ) -> tuple[Any, Any]:
+                                result = self.pic_mooncake_object_store.load_transition_operator(
+                                    transition_key,
+                                    device=self.device,
+                                )
+                                # Store receive may enqueue .to(device) work on
+                                # the receiver thread's CUDA stream. Publish the
+                                # state handle only after that stream is
+                                # complete.
+                                if getattr(self.device, "type", None) == "cuda":
+                                    import torch
+
+                                    torch.cuda.synchronize(self.device)
+                                return result
+
+                            request_transfer.submit_state(
+                                segment_index,
+                                load_transition_async,
+                            )
+                            try:
+                                manifest, operator = request_transfer.wait_state(
+                                    segment_index
+                                )
+                            except Exception as exc:
+                                raise PICExternalKVImportError(
+                                    "external hybrid transition import failed"
+                                ) from exc
+                            if not self._pic_transition_covers_segment(
+                                manifest, segment
+                            ):
+                                raise PICExternalKVImportError(
+                                    "external hybrid transition length mismatch"
+                                )
+                            transition_handle = (
+                                self.pic_live_capture.import_transition_operator(
+                                    request_id=request_state.req_id,
+                                    external_key=transition_key,
+                                    operator=operator,
+                                )
+                            )
+                            request_state.pic_transition_handles[
+                                segment_index
+                            ] = transition_handle
+                            _pic_log_cuda_memory(
+                                f"transition_loaded_segment_{segment_index}",
+                                request_state.req_id,
+                                self.device,
+                            )
+                        request_state.pic_mooncake_transition_keys[
+                            segment_index
+                        ] = transition_key
+                for segment_index in external_segment_indices:
+                    batch = pending_native_imports.pop(segment_index, None)
+                    if batch is not None:
+                        request_state.pic_imported_native_refs[segment_index] = (
+                            request_transfer.wait_native(segment_index)
+                        )
+                        _pic_log_cuda_memory(
+                            f"native_import_ready_segment_{segment_index}",
+                            request_state.req_id,
+                            self.device,
+                        )
+                references = tuple(
+                    reference
+                    for segment_index, entry in resolved_entries
+                    for reference in request_state.pic_imported_native_refs.get(
+                        segment_index, entry.native_kv_refs
+                    )
+                )
+                self.pic_metrics.record_external_import()
+                _pic_log_cuda_memory(
+                    "runtime_plan_external_import_ready",
+                    request_state.req_id,
+                    self.device,
+                )
+            except (PICExternalKVImportError, PICTransferError, ValueError) as exc:
+                for batch in pending_native_imports.values():
+                    batch.discard()
+                request_transfer.discard()
+                self._release_pic_imported_native_refs(request_state)
+                request_state.pic_transition_handles.clear()
+                self.pic_metrics.record_external_import(failed=True)
+                self.pic_metrics.record_fallback("external_native_kv_import_failed")
+                self._pic_debug(
+                    "external native KV import fallback request=%s reason=%s "
+                    "exception_chain=%s",
+                    request_state.req_id,
+                    str(exc),
+                    _pic_exception_chain(exc),
+                )
+                if _pic_trace_enabled():
+                    logger.warning(
+                        "[PIC-TRACE] import-failed request=%s error=%s:%s "
+                        "chain=%s",
+                        request_state.req_id,
+                        type(exc).__name__,
+                        str(exc),
+                        _pic_exception_chain(exc),
+                    )
+                return None
+            finally:
+                request_state.pic_request_transfer = None
+        seam_tokens_by_segment = {
+            transition.segment_index: transition.seam_end - transition.seam_start
+            for transition in (
+                request_state.pic_execution_plan.transitions
+                if request_state.pic_execution_plan is not None
+                else ()
+            )
+        }
+        # The refusal reasons live inside these two calls and used to be swallowed: the
+        # caller only saw None and every cause looked the same. Naming the reason here is what
+        # turns "the plan is empty" into an answer.
+        try:
+            single_plan = build_single_request_plan(
+                request_state.pic_execution_plan,
+                prompt_len=request_state.num_prompt_tokens,
+                speculative_decoding=self.speculative_config is not None,
+                zero_copy_attention_supported=True,
+                native_kv_bridge_supported=True,
+                allow_fallback=self.vllm_config.pic_config.allow_fallback,
+                # The worker descriptor was resolved when the request entered the batch;
+                # rebuilding it here would regenerate the per-token position lists.
+                worker_plan=request_state.pic_worker_plan,
+            )
+        except PICWorkerUnsupported as exc:
+            self._pic_debug(
+                "single-request plan refused request=%s reason=%s",
+                request_state.req_id,
+                exc,
+            )
+            return None
+        if single_plan is None:
+            self._pic_debug(
+                "single-request plan empty request=%s seam=%s actions=%s",
+                request_state.req_id,
+                seam_tokens_by_segment,
+                [item.action for item in (
+                    request_state.pic_execution_plan.ranges
+                    if request_state.pic_execution_plan is not None
+                    else ()
+                )],
+            )
+            return None
+        try:
+            return build_single_request_runtime_plan(
+                single_plan,
+                native_kv_refs_by_group=references,
+                native_kv_refs_by_segment=request_state.pic_imported_native_refs,
+                device=self.device,
+                prompt_len=request_state.num_prompt_tokens,
+                allow_fallback=self.vllm_config.pic_config.allow_fallback,
+                kernel_block_sizes=self._kernel_block_sizes,
+                seam_tokens_by_segment=seam_tokens_by_segment,
+            )
+        except PICWorkerUnsupported as exc:
+            self._pic_debug(
+                "runtime plan refused request=%s reason=%s seam=%s block_sizes=%s",
+                request_state.req_id,
+                exc,
+                seam_tokens_by_segment,
+                self._kernel_block_sizes,
+            )
+            return None
+
+    def register_pic_external_kv_provider(
+        self, provider: PICExternalKVProvider
+    ) -> None:
+        """Register a worker-local Mooncake/native-KV adapter."""
+        self.pic_external_kv.register(provider)
+
+    def _initialize_pic_mooncake(self) -> None:
+        """Connect the worker to the vLLM 0.22.1 Mooncake store API."""
+        if not self.vllm_config.pic_config.mooncake:
+            return
+        try:
+            self.pic_mooncake_object_store = connect_mooncake_native_kv_store()
+            self.pic_external_kv.unregister("mooncake")
+            self.register_pic_external_kv_provider(
+                MooncakePICExternalKVProvider(
+                    lease_registry=self.pic_lease_registry,
+                    block_resolver=self._resolve_pic_mooncake_destination,
+                    transfer=self.pic_mooncake_object_store.make_transfer_callback(
+                        self._restore_pic_mooncake_native_blocks
+                    ),
+                    receive=self.pic_mooncake_object_store.make_receive_callback(),
+                    materialize=self._materialize_pic_mooncake_native_blocks,
+                )
+            )
+            logger.info(
+                "PIC Mooncake native KV store connected using the "
+                "vLLM 0.22.1/Mooncake 0.3.10.post2 setup contract"
+            )
+        except Exception as exc:
+            self.pic_mooncake_object_store = None
+            logger.warning(
+                "PIC Mooncake store initialization failed; external KV "
+                "references will fall back: %s",
+                exc,
+            )
+
+    def _prepare_pic_mooncake_destinations(
+        self, request_state: CachedRequestState
+    ) -> set[str]:
+        """Queue destination blocks for every external reference.
+
+        Returns the external keys that got a destination, so the caller only
+        submits references whose destination was actually queued: the provider
+        pops one entry per imported reference.
+        """
+        prepared: set[str] = set()
+        if request_state.pic_cache_plan is None:
+            return prepared
+        started = time.perf_counter()
+        entries = tuple(request_state.pic_cache_plan.matches) + tuple(
+            request_state.pic_cache_plan.external_matches
+        )
+        for segment_index, entry in entries:
+            for reference in entry.native_kv_refs:
+                if not reference.is_external or reference.external_key is None:
+                    continue
+                # Covering span: the reference describes the window up to the segment's last
+                # token, so rounding it down to a block boundary asks the destination for one block
+                # fewer than the manifest declares - a hundred and fifty-one against a hundred and
+                # fifty-two - and the provider refuses the import.
+                span = get_covering_local_block_span(
+                    reference.token_count, reference.block_size
+                )
+                allocator_ids = self._pic_public_blocks(
+                    request_state,
+                    segment_index,
+                    reference.kv_cache_group_id,
+                )
+                block_table = self.input_batch.block_table[
+                    reference.kv_cache_group_id
+                ]
+                if not allocator_ids:
+                    # External KV must land in the shared canonical blocks: the
+                    # provider keys destinations by resource, so two requests
+                    # importing the same segment have to use one block set.
+                    # Request-owned blocks differ per request and trip the
+                    # provider's "block span changed" guard, so do not fall back
+                    # to them here.  Skip instead of failing: a destination that
+                    # was not reserved means this reference has nothing to import
+                    # into yet, and the request must not be parked on it.
+                    self._pic_debug(
+                        "Mooncake import skipped: no public destination "
+                        "request=%s segment=%d group=%d",
+                        request_state.req_id,
+                        segment_index,
+                        reference.kv_cache_group_id,
+                    )
+                    continue
+                kernel_ids = block_table.map_to_kernel_blocks(
+                    np.asarray(allocator_ids, dtype=np.int64),
+                    block_table.blocks_per_kv_block,
+                    block_table._kernel_block_arange,
+                )
+                # Allocator blocks are expanded into smaller kernel blocks.
+                # A final allocator block may cover more tokens than the
+                # exact manifest span, so trim only after expanding it.
+                kernel_ids = kernel_ids[: span.block_count]
+                if len(kernel_ids) < span.block_count:
+                    raise PICExternalKVImportError(
+                        "Mooncake import has too few kernel destination blocks"
+                    )
+                self._pic_mooncake_destinations.setdefault(
+                    (reference.external_key, reference.kv_cache_group_id), deque()
+                ).append(tuple(int(block_id) for block_id in kernel_ids))
+                prepared.add(reference.external_key)
+        if _pic_import_profile_enabled() and prepared:
+            logger.warning(
+                "[PIC-PROFILE] pic-destinations request=%s refs=%d ms=%.3f",
+                request_state.req_id,
+                len(prepared),
+                (time.perf_counter() - started) * 1000.0,
+            )
+        return prepared
+
+    # -- parked-request async import (W1 stage 1c) -------------------------
+    def _pic_async_manager(self) -> PICAsyncImportManager:
+        manager = getattr(self, "_pic_async_imports", None)
+        if manager is None:
+            manager = PICAsyncImportManager()
+            self._pic_async_imports = manager
+            self._pic_import_reports: tuple[list[str], list[str]] = ([], [])
+        return manager
+
+    def _pic_park_state(self, spec: PICAsyncImportSpec) -> Any:
+        """Stand-in request state for a parked request.
+
+        Destination resolution reads only the cache plan, the segments, the public
+        block ids and the block ids, so a stand-in is enough; the request has no
+        batch row while it is parked.
+        """
+        data = spec.request_data
+        if data is None:
+            raise PICExternalKVImportError(
+                "asynchronous import spec is missing the request payload"
+            )
+        state = SimpleNamespace(
+            req_id=spec.request_id,
+            pic_enabled=True,
+            pic_cache_plan=data.pic_cache_plan,
+            pic_segments=data.pic_segments,
+            pic_public_block_ids=data.pic_public_block_ids,
+            block_ids=data.block_ids,
+            pic_imported_native_refs={},
+            pic_transition_handles={},
+            num_prompt_tokens=len(data.prompt_token_ids or ()),
+        )
+        return state
+
+    def _pic_park_submit(self, spec: PICAsyncImportSpec) -> None:
+        """Start the imports for one parked request; never waits."""
+        manager = self._pic_async_manager()
+        state = self._pic_park_state(spec)
+        plan = state.pic_cache_plan
+        entries = tuple(plan.matches) + tuple(plan.external_matches)
+        per_segment: list[tuple[int, list[Any]]] = []
+        for segment_index, entry in entries:
+            if int(segment_index) not in spec.segment_indices:
+                continue
+            selected = [
+                reference
+                for reference in entry.native_kv_refs
+                if reference.is_external
+            ]
+            if selected:
+                per_segment.append((int(segment_index), selected))
+        if not per_segment:
+            # Nothing external left to import: report the request as finished so it
+            # is promoted on the next step and takes the normal inline path, which
+            # will simply find no external references.
+            manager.start(spec, {})
+            manager.complete(spec.request_id)
+            self._pic_debug(
+                "async step=%d SUBMIT request=%s skipped=no_external_refs",
+                self._pic_async_step,
+                spec.request_id,
+            )
+            return
+        prepared = self._prepare_pic_mooncake_destinations(state)
+        # Every submitted reference must have a queued destination: the provider
+        # pops one entry per imported reference, so skipping a preparation while
+        # still submitting the reference would fail the whole batch.
+        references: list[Any] = []
+        spans: list[tuple[int, int]] = []
+        for segment_index, selected in per_segment:
+            kept = [
+                reference
+                for reference in selected
+                if reference.external_key in prepared
+            ]
+            if not kept:
+                continue
+            references.extend(kept)
+            spans.append((segment_index, len(kept)))
+        if not references:
+            manager.start(spec, {})
+            manager.complete(spec.request_id)
+            self._pic_debug(
+                "async step=%d SUBMIT request=%s skipped=no_destination",
+                self._pic_async_step,
+                spec.request_id,
+            )
+            return
+        batch = self.pic_external_kv.begin_import_references(tuple(references))
+        transfer = PICRequestTransfer(request_key=spec.request_id)
+        transitions: dict[int, str] = {}
+        if self.kv_cache_config.has_mamba_layers and self.pic_mooncake_object_store:
+            for segment_index, entry in entries:
+                if segment_index not in spec.segment_indices:
+                    continue
+                transition_key = entry.external_transition_key
+                if transition_key is None:
+                    batch.discard()
+                    manager.fail(spec.request_id, "missing transition state")
+                    return
+                transitions[segment_index] = transition_key
+
+                def load_transition_async(transition_key: str = transition_key) -> Any:
+                    return self.pic_mooncake_object_store.load_transition_operator(
+                        transition_key, device=self.device
+                    )
+
+                transfer.submit_state(segment_index, load_transition_async)
+        manager.start(
+            spec,
+            {
+                "batch": batch,
+                "transfer": transfer,
+                "transitions": transitions,
+                "segments": tuple(spec.segment_indices),
+                "spans": tuple(spans),
+                "submitted_step": self._pic_async_step,
+                "submitted_at": _pic_now_seconds(),
+            },
+        )
+        self._pic_debug(
+            "async step=%d SUBMIT request=%s segments=%s",
+            self._pic_async_step,
+            spec.request_id,
+            list(spec.segment_indices),
+        )
+
+    def _pic_with_import_reports(self, output: Any) -> Any:
+        """Carry parked-import verdicts through an empty step output.
+
+        When every request is parked the engine still steps, but ``execute_model``
+        returns the shared empty output before the normal ``ModelRunnerOutput`` is
+        built.  The poll verdict is produced in that same step, so without this
+        wrapper the scheduler never sees the completion and the request waits
+        forever.
+        """
+        reports = getattr(self, "_pic_import_reports", None)
+        if reports is None or not (reports[0] or reports[1]):
+            return output
+        finished = tuple(reports[0])
+        failed = tuple(reports[1])
+        reports[0].clear()
+        reports[1].clear()
+        self._pic_debug(
+            "async step=%d DELIVER ready=%s failed=%s",
+            getattr(self, "_pic_async_step", 0),
+            list(finished),
+            list(failed),
+        )
+        carried = copy(output)
+        carried.pic_finished_imports = finished
+        carried.pic_failed_imports = failed
+        return carried
+
+    def _pic_park_poll(self) -> None:
+        """Inspect pending imports without blocking; record ready and failed ids."""
+        manager = self._pic_async_manager()
+        finished, failed = self._pic_import_reports
+        for request_id in tuple(manager.in_flight()):
+            payload = manager.payload(request_id)
+            ready, bad = payload["batch"].poll()
+            state_ready, state_bad = payload["transfer"].poll_state()
+            waited = (
+                _pic_now_seconds() - float(payload.get("submitted_at", 0.0))
+            )
+            if (
+                not bad
+                and not state_bad
+                and waited > _PIC_PARK_IMPORT_TIMEOUT_SECONDS
+            ):
+                # A transfer that never reports must not park the request forever:
+                # fail it so the scheduler falls back to a full recompute.  The
+                # budget is wall-clock so it means the same thing however fast the
+                # engine happens to be stepping.
+                payload["batch"].discard()
+                payload["transfer"].discard()
+                manager.fail(request_id, "parked import timed out")
+                failed.append(request_id)
+                self._pic_debug(
+                    "async step=%d TIMEOUT request=%s waited=%.3fs",
+                    self._pic_async_step,
+                    request_id,
+                    waited,
+                )
+                continue
+            if self._pic_async_step % 500 == 0:
+                # Bounded trace: tells "poll never runs" apart from "poll runs but
+                # the transfer never reports", without flooding an empty-step loop.
+                self._pic_debug(
+                    "async step=%d POLL request=%s ready=%s failed=%s "
+                    "state_ready=%s state_failed=%s",
+                    self._pic_async_step,
+                    request_id,
+                    ready,
+                    bad,
+                    state_ready,
+                    state_bad,
+                )
+            if bad or state_bad:
+                # Surface the provider's exception: without it a failed polled
+                # import is indistinguishable from a timeout, and the traceback
+                # would only appear inside a fallback path.
+                error = payload["batch"].error()
+                payload["batch"].discard()
+                payload["transfer"].discard()
+                manager.fail(request_id, str(error) or "import failed")
+                failed.append(request_id)
+                self._pic_debug(
+                    "async step=%d FAILED request=%s error=%s: %s",
+                    self._pic_async_step,
+                    request_id,
+                    type(error).__name__ if error is not None else "None",
+                    error,
+                )
+                continue
+            if not (ready and state_ready):
+                continue
+            refs = payload["batch"].wait()
+            operators: dict[int, Any] = {}
+            manifests: dict[int, Any] = {}
+            for index, handle in payload["transfer"].state.items():
+                # load_transition_operator hands back (manifest, operator); storing
+                # the raw value here made import_transition_operator receive a
+                # tuple and fail on operator.detached_clone.
+                manifest, operator = split_transition_result(handle.wait())
+                operators[index] = operator
+                manifests[index] = manifest
+            manager.complete(
+                request_id,
+                {
+                    "refs": refs,
+                    "operators": operators,
+                    "manifests": manifests,
+                    "transitions": payload["transitions"],
+                    # (segment_index, reference count) pairs: adoption slices the
+                    # resolved references with them, so this must survive the
+                    # hand-off, not only the submit payload.
+                    "spans": payload["spans"],
+                },
+            )
+            finished.append(request_id)
+            started = payload.get("submitted_at")
+            if started is not None:
+                # Import wall time, measured where the transfer actually runs.  The
+                # scheduler sees park-to-promote, which also contains the empty-step
+                # polling; the difference is what the engine adds on top.
+                logger.warning(
+                    "[PIC-TRACE] import-ready request=%s ms=%.3f",
+                    request_id,
+                    (_pic_now_seconds() - float(started)) * 1000.0,
+                )
+            self._pic_debug(
+                "async step=%d READY request=%s",
+                self._pic_async_step,
+                request_id,
+            )
+
+    def _pic_async_import_step(self, scheduler_output: Any) -> None:
+        """Poll previous imports, then start the ones this step announced."""
+        manager = self._pic_async_manager()
+        self._pic_async_step = getattr(self, "_pic_async_step", 0) + 1
+        self._pic_park_poll()
+        for spec in getattr(scheduler_output, "pic_async_imports", ()):
+            if spec.request_id in manager.in_flight():
+                continue
+            try:
+                self._pic_park_submit(spec)
+            except Exception as exc:  # noqa: BLE001 - reported as fallback
+                self.pic_metrics.record_external_import(failed=True)
+                self.pic_metrics.record_fallback("async_native_kv_import_failed")
+                self._pic_import_reports[1].append(spec.request_id)
+                # Drop whatever the failed submit may have left behind, so the
+                # request is neither polled forever nor re-submitted in a loop.
+                manager.abort(spec.request_id)
+                self._pic_debug(
+                    "async import submit failed request=%s error=%s",
+                    spec.request_id,
+                    exc,
+                )
+
+    def _pic_adopt_park_import(self, request_state: Any) -> bool:
+        """Install an already-imported state for a request that was parked."""
+        if not getattr(request_state, "pic_enabled", False):
+            # Ordinary requests never park, so there is nothing to adopt.  Skipping
+            # silently keeps the debug log free of their false "no_result" entries.
+            return False
+        manager = getattr(self, "_pic_async_imports", None)
+        if manager is None:
+            self._pic_debug(
+                "async adopt skipped request=%s reason=no_manager",
+                request_state.req_id,
+            )
+            return False
+        result = manager.peek_result(request_state.req_id)
+        if result is None:
+            if request_state.pic_imported_native_refs:
+                # Already adopted through the other entry point; nothing to do and
+                # nothing to report.
+                return True
+            self._pic_debug(
+                "async adopt skipped request=%s reason=no_result",
+                request_state.req_id,
+            )
+            return False
+        references = tuple(result.get("refs") or ())
+        if not references:
+            self._pic_debug(
+                "async adopt skipped request=%s reason=empty_refs",
+                request_state.req_id,
+            )
+            return False
+        # The batch preserves the order the references were submitted in, and
+        # ``spans`` records how many belong to each segment.
+        by_segment: dict[int, list[Any]] = {}
+        cursor = 0
+        for segment_index, count in result.get("spans", ()):
+            chunk = references[cursor : cursor + count]
+            cursor += count
+            if chunk:
+                by_segment[int(segment_index)] = list(chunk)
+        if not by_segment:
+            self._pic_debug(
+                "async adopt skipped request=%s reason=empty_spans",
+                request_state.req_id,
+            )
+            return False
+        # Only now consume the state: a validation failure above must not throw
+        # the import away.
+        manager.pop_result(request_state.req_id)
+        for segment_index, items in by_segment.items():
+            request_state.pic_imported_native_refs[segment_index] = tuple(items)
+        if self.pic_live_capture is not None:
+            manifests = result.get("manifests") or {}
+            for segment_index, operator in result["operators"].items():
+                transition_key = result["transitions"].get(segment_index)
+                if transition_key is None:
+                    continue
+                manifest = manifests.get(segment_index)
+                segments = request_state.pic_segments or ()
+                if (
+                    manifest is not None
+                    and segment_index < len(segments)
+                    and not self._pic_transition_covers_segment(
+                        manifest, segments[segment_index]
+                    )
+                ):
+                    # Same guard as the synchronous path: a length mismatch means
+                    # the transition does not describe this segment, so do not
+                    # install it and let the ordinary import path fail closed.
+                    self._pic_debug(
+                        "async adopt transition mismatch request=%s segment=%d "
+                        "manifest=%d segment_len=%d",
+                        request_state.req_id,
+                        segment_index,
+                        manifest.token_count,
+                        segments[segment_index].length,
+                    )
+                    continue
+                request_state.pic_transition_handles[segment_index] = (
+                    self.pic_live_capture.import_transition_operator(
+                        request_id=request_state.req_id,
+                        external_key=transition_key,
+                        operator=operator,
+                    )
+                )
+        self.pic_metrics.record_external_import()
+        self._pic_debug(
+            "async step=%d ADOPT request=%s imported=0 segments=%s",
+            getattr(self, "_pic_async_step", 0),
+            request_state.req_id,
+            sorted(by_segment),
+        )
+        return True
+
+    def _resolve_pic_mooncake_destination(
+        self, request: Any
+    ) -> tuple[int, ...]:
+        key = (request.external_key, request.kv_cache_group_id)
+        queued = self._pic_mooncake_destinations.get(key)
+        if not queued:
+            raise PICExternalKVImportError(
+                "Mooncake import destination is not prepared for this request"
+            )
+        # FIFO per key: several requests may import the same stored segment into
+        # their own blocks, and each submit is paired with exactly one entry.
+        block_ids = queued.popleft()
+        if not queued:
+            self._pic_mooncake_destinations.pop(key, None)
+        return block_ids
+
+    def _restore_pic_mooncake_native_blocks(
+        self,
+        request: Any,
+        obj: Any,
+        block_ids: tuple[int, ...],
+        _engine: Any,
+    ) -> None:
+        if self.pic_mooncake_object_store is None:
+            raise PICExternalKVImportError("Mooncake object store is unavailable")
+        group = self.kv_cache_config.kv_cache_groups[request.kv_cache_group_id]
+        kv_caches = {
+            layer_name: getattr(
+                self.compilation_config.static_forward_context[layer_name],
+                "kv_cache",
+            )
+            for layer_name in group.layer_names
+        }
+        with torch.cuda.device(self.device):
+            self.pic_mooncake_object_store.restore_native_blocks(
+                obj,
+                kv_caches=kv_caches,
+                block_ids=block_ids,
+            )
+        self._pic_debug(
+            "Mooncake native KV imported request=%s group=%d blocks=%d",
+            request.external_key,
+            request.kv_cache_group_id,
+            len(block_ids),
+        )
+
+    def _materialize_pic_mooncake_native_blocks(
+        self,
+        request: Any,
+        received: Any,
+        block_ids: tuple[int, ...],
+        _engine: Any,
+    ) -> None:
+        """Materialize a P5 receive result on the request/attention path."""
+        if self.pic_mooncake_object_store is None:
+            raise PICExternalKVImportError("Mooncake object store is unavailable")
+        group = self.kv_cache_config.kv_cache_groups[request.kv_cache_group_id]
+        kv_caches = {
+            layer_name: getattr(
+                self.compilation_config.static_forward_context[layer_name],
+                "kv_cache",
+            )
+            for layer_name in group.layer_names
+        }
+        with torch.cuda.device(self.device):
+            self.pic_mooncake_object_store.materialize_native_blocks(
+                received,
+                kv_caches=kv_caches,
+                block_ids=block_ids,
+            )
+        self._pic_debug(
+            "Mooncake native KV materialized request=%s group=%d blocks=%d",
+            request.external_key,
+            request.kv_cache_group_id,
+            len(block_ids),
+        )
+
+    def _set_pic_runtime_plan(self, request_state: CachedRequestState) -> None:
+        """Persist the request-local native mapping beside its runtime plan.
+
+        SGLang keeps its ``req_to_token`` row for the lifetime of the request.
+        vLLM still rebuilds the active ``BlockTable`` row as requests are
+        scheduled, but the PIC logical-to-native mapping and private
+        materialization state must survive those rounds.
+        """
+        manager = getattr(self, "_pic_async_imports", None)
+        self._pic_debug(
+            "runtime plan entry request=%s enabled=%s plan=%s parked_result=%s",
+            request_state.req_id,
+            request_state.pic_enabled,
+            request_state.pic_cache_plan is not None,
+            bool(manager is not None and manager.peek_result(request_state.req_id)),
+        )
+        detail_profile = _pic_detail_profile_enabled()
+        total_start = time.perf_counter() if detail_profile else 0.0
+        cache_plan = request_state.pic_cache_plan
+        if request_state.pic_enabled:
+            self.pic_metrics.record_lookup(
+                hit=bool(cache_plan is not None and cache_plan.matches),
+                matched_segments=(
+                    len(cache_plan.matches) if cache_plan is not None else 0
+                ),
+            )
+        release_start = time.perf_counter() if detail_profile else 0.0
+        self._release_pic_request_leases(request_state)
+        release_ms = (
+            (time.perf_counter() - release_start) * 1000.0
+            if detail_profile
+            else 0.0
+        )
+        import_start = time.perf_counter() if detail_profile else 0.0
+        self._release_pic_imported_native_refs(request_state)
+        import_release_ms = (
+            (time.perf_counter() - import_start) * 1000.0
+            if detail_profile
+            else 0.0
+        )
+        request_state.pic_mooncake_transition_keys.clear()
+        request_state.pic_transition_handles.clear()
+        # Adopt only after BOTH clearing steps above: adopting earlier installed the
+        # native references and the transition handles and then had them wiped, which
+        # made the request import a second time and left the hybrid runtime without a
+        # transition handle to apply.
+        self._pic_adopt_park_import(request_state)
+        # The worker plan is built when the request first enters the batch, which happens
+        # before this adopt installs the native references. An entry with external refs
+        # therefore has no physical handles at that moment and the plan is refused, so the
+        # request silently recomputes its whole prompt. Rebuilding here, right after the
+        # adopt, costs about a millisecond per request and only for requests that were
+        # refused; the alternative is a full prefill.
+        if (
+            request_state.pic_worker_plan is None
+            and request_state.pic_cache_plan is not None
+            and request_state.pic_segments
+        ):
+            recompiled = compile_execution_plan(
+                request_state.pic_segments, request_state.pic_cache_plan
+            )
+            rebuilt, rebuilt_fallback = self._build_pic_worker_plan_for(
+                recompiled,
+                request_state.num_prompt_tokens,
+                request_id=request_state.req_id,
+            )
+            if rebuilt is not None:
+                request_state.pic_worker_plan = rebuilt
+                request_state.pic_execution_plan = recompiled
+                self._pic_debug(
+                    "worker plan rebuilt after adopt request=%s ranges=%d fallback=%s",
+                    request_state.req_id,
+                    len(rebuilt.ranges),
+                    rebuilt_fallback,
+                )
+        build_start = time.perf_counter() if detail_profile else 0.0
+        try:
+            runtime_plan = self._build_pic_runtime_plan(request_state)
+        except Exception as exc:  # noqa: BLE001 - diagnostics for an unexplained fallback
+            # Every documented exit logs its reason; an exception that escapes them is exactly
+            # the case that used to look like a silent refusal.
+            self._pic_debug(
+                "runtime plan raised request=%s type=%s reason=%s chain=%s",
+                request_state.req_id,
+                type(exc).__name__,
+                exc,
+                _pic_exception_chain(exc),
+            )
+            runtime_plan = None
+        if runtime_plan is None and request_state.pic_worker_plan is not None:
+            # The worker plan exists but no runtime view came out of it: that is a refusal inside
+            # the range compiler, not a missing capability, and it is where a reuse silently
+            # becomes a full prefill.
+            self._pic_debug(
+                "runtime plan refused request=%s workers_ranges=%d cache_matches=%d "
+                "imported_segments=%d",
+                request_state.req_id,
+                len(getattr(request_state.pic_worker_plan, "ranges", ()) or ()),
+                len(getattr(request_state.pic_cache_plan, "matches", ()) or ()),
+                len(getattr(request_state, "pic_imported_native_refs", {}) or {}),
+            )
+        build_ms = (
+            (time.perf_counter() - build_start) * 1000.0
+            if detail_profile
+            else 0.0
+        )
+        binding_start = time.perf_counter() if detail_profile else 0.0
+        request_state.pic_runtime_plan = runtime_plan
+        # Both switches, because the lines around this one are gated on the config flag: using a
+        # different gate here made an ordinary fallback look like a crash for several rounds.
+        if self.vllm_config.pic_config.debug or _pic_trace_enabled():
+            reuse_ranges = [
+                item
+                for item in (getattr(runtime_plan, "ranges", ()) or ())
+                if getattr(item, "action", "") == "reuse"
+            ]
+            references = [
+                reference
+                for _, entry in (
+                    getattr(request_state.pic_cache_plan, "matches", ()) or ()
+                )
+                for reference in getattr(entry, "native_kv_refs", ())
+            ]
+            logger.warning(
+                "[PIC-TRACE] plan request=%s segments=%d plan_none=%s "
+                "reuse_ranges=%d reuse_tokens=%d compute_tokens=%d seam=%s "
+                "cacheable=%s lookup=%s refs=%d refs_external=%d providers=%s "
+                "segment_spans=%s prompt=%d",
+                request_state.req_id,
+                len(getattr(request_state, "pic_segments", ()) or ()),
+                runtime_plan is None,
+                len(reuse_ranges),
+                sum(int(item.token_count) for item in reuse_ranges),
+                sum(
+                    int(item.token_count)
+                    for item in (getattr(runtime_plan, "ranges", ()) or ())
+                    if getattr(item, "action", "") != "reuse"
+                ),
+                getattr(runtime_plan, "seam_tokens", None)
+                if runtime_plan is not None
+                else None,
+                [
+                    bool(getattr(segment, "cacheable", True))
+                    for segment in (getattr(request_state, "pic_segments", ()) or ())
+                ],
+                "hit"
+                if getattr(request_state, "pic_cache_plan", None) is not None
+                and getattr(request_state.pic_cache_plan, "reused_segments", ())
+                else "miss",
+                len(references),
+                sum(1 for reference in references if reference.is_external),
+                sorted(
+                    {
+                        str(getattr(reference, "external_provider", None))
+                        for reference in references
+                    }
+                ),
+                [
+                    (int(segment.start), int(segment.end))
+                    for segment in (getattr(request_state, "pic_segments", ()) or ())
+                ],
+                int(request_state.num_prompt_tokens),
+            )
+        request_state.pic_native_kv_mapping = (
+            PICNativeKVRequestMapping(runtime_plan.native_slot_plans)
+            if runtime_plan is not None
+            else None
+        )
+        if request_state.pic_state_binding is None:
+            request_state.pic_state_binding = PICRequestStateBinding(
+                request_state.req_id
+            )
+        request_state.pic_state_binding.bind_mapping(runtime_plan is not None)
+        self._sync_pic_state_binding(request_state)
+        request_state.pic_private_kv_materialized.clear()
+        request_state.pic_native_kv_allocations.clear()
+        request_state.pic_mooncake_external_keys.clear()
+        request_state.pic_mooncake_external_block_sizes.clear()
+        binding_ms = (
+            (time.perf_counter() - binding_start) * 1000.0
+            if detail_profile
+            else 0.0
+        )
+        if runtime_plan is not None:
+            self.pic_metrics.record_plan(runtime_plan)
+            if request_state.pic_execution_plan is not None:
+                self.pic_metrics.record_seam(
+                    sum(
+                        transition.seam_end - transition.seam_start
+                        for transition in request_state.pic_execution_plan.transitions
+                    )
+                )
+        if detail_profile:
+            logger.warning(
+                "[PIC-PROFILE] runtime-plan request=%s mode=normal "
+                "matched=%d release_ms=%.3f imported_release_ms=%.3f "
+                "build_ms=%.3f binding_ms=%.3f total_ms=%.3f",
+                request_state.req_id,
+                len(cache_plan.matches) if cache_plan is not None else 0,
+                release_ms,
+                import_release_ms,
+                build_ms,
+                binding_ms,
+                (time.perf_counter() - total_start) * 1000.0,
+            )
+
+    def _pic_entry_skip_reasons(
+        self,
+        scheduler_output: Any,
+        req_ids: Sequence[str],
+        num_reqs: int,
+    ) -> str:
+        """Name the entry conditions the PIC fast path did not meet.
+
+        The path requires one request in the batch, no copy-back, a runtime plan, no
+        tokens computed yet, and the whole prompt scheduled in this step. Reporting which
+        one failed turns "reuse never happened" into a specific diagnosis: at higher
+        concurrency the prompt no longer fits in one batch budget, so the request is
+        chunked and the fast path is skipped while the scheduler still planned reuse.
+        """
+        reasons: list[str] = []
+        if num_reqs != 1:
+            reasons.append(f"batch={num_reqs}")
+        first = req_ids[0] if req_ids else None
+        state = self.requests.get(first) if first else None
+        if state is None:
+            reasons.append("no_request_state")
+        else:
+            if not state.pic_runtime_plan:
+                reasons.append("no_runtime_plan")
+            if state.num_computed_tokens != 0:
+                reasons.append(f"computed={state.num_computed_tokens}")
+            scheduled = scheduler_output.num_scheduled_tokens.get(first, 0)
+            if scheduled != state.num_prompt_tokens:
+                reasons.append(f"scheduled={scheduled}/{state.num_prompt_tokens}")
+        return ",".join(reasons) if reasons else "unknown"
+
+    def _disable_pic_runtime(
+        self, request_state: CachedRequestState, reason: str = "request_fallback"
+    ) -> None:
+        """Drop the persistent native view and request lease on fallback."""
+        self.pic_metrics.record_fallback(reason)
+        self._release_pic_request_leases(request_state)
+        self._release_pic_imported_native_refs(request_state)
+        if self.pic_live_capture is not None:
+            self.pic_live_capture.release_request(request_state.req_id)
+        request_state.pic_runtime_plan = None
+        request_state.pic_native_kv_mapping = None
+        if request_state.pic_state_binding is not None:
+            request_state.pic_state_binding.invalidate("pic_runtime_disabled")
+        request_state.pic_private_kv_materialized.clear()
+        request_state.pic_native_kv_allocations.clear()
+        request_state.pic_mooncake_external_keys.clear()
+        request_state.pic_mooncake_external_block_sizes.clear()
+        request_state.pic_mooncake_transition_keys.clear()
+        request_state.pic_transition_handles.clear()
+
+    def _sync_pic_state_binding(self, request_state: CachedRequestState) -> None:
+        """Bind scheduler progress to the request, never to an input row."""
+        binding = request_state.pic_state_binding
+        if binding is None:
+            return
+        runtime_plan = request_state.pic_runtime_plan
+        position = int(request_state.num_computed_tokens)
+        segment_index = -1
+        range_cursor = 0
+        transition_cursor = 0
+        if runtime_plan is not None:
+            for index, item in enumerate(runtime_plan.ranges):
+                if item.end <= position:
+                    range_cursor = index + 1
+                    if item.action == "reuse":
+                        transition_cursor += 1
+                elif item.start <= position < item.end:
+                    segment_index = item.segment_index
+                    break
+        binding.sync(
+            num_computed_tokens=position,
+            block_ids=request_state.block_ids,
+            segment_index=segment_index,
+            range_cursor=range_cursor,
+            transition_cursor=transition_cursor,
+        )
+
+    def _validate_pic_decode_bindings(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Keep decode on the request-owned native mapping when it is safe."""
+        for req_id in self.input_batch.req_ids:
+            request_state = self.requests.get(req_id)
+            if (
+                request_state is None
+                or request_state.pic_runtime_plan is None
+                or request_state.pic_state_binding is None
+                or request_state.num_computed_tokens <= 0
+            ):
+                continue
+            scheduled_tokens = int(scheduler_output.num_scheduled_tokens.get(req_id, 0))
+            binding = request_state.pic_state_binding
+            if not binding.mark_decode_step(
+                num_computed_tokens=request_state.num_computed_tokens,
+                scheduled_tokens=scheduled_tokens,
+                mapping_present=request_state.pic_native_kv_mapping is not None,
+            ):
+                reason = binding.fallback_reason or "unknown"
+                self._disable_pic_runtime(request_state, f"decode:{reason}")
+                request_state.pic_worker_fallback = True
+                self.pic_metrics.record_decode_mapping(reused=False)
+                self._pic_debug(
+                    "PIC decode mapping fallback request=%s reason=%s",
+                    req_id,
+                    reason,
+                )
+            else:
+                self.pic_metrics.record_decode_mapping(reused=True)
+                self._pic_debug(
+                    "PIC decode mapping reused request=%s position=%d steps=%d "
+                    "scheduled=%d prompt=%d",
+                    req_id,
+                    request_state.num_computed_tokens,
+                    binding.decode_steps,
+                    scheduled_tokens,
+                    request_state.num_prompt_tokens,
+                )
+
+    @staticmethod
+    def _pic_allocation_resource_key(
+        allocation: PICNativeKVAllocation,
+    ) -> tuple[Any, ...]:
+        return (
+            "native_kv",
+            allocation.kv_cache_group_id,
+            allocation.target_start,
+            allocation.target_end,
+            allocation.public_block_ids,
+            allocation.private_block_ids,
+        )
+
+    def _retain_pic_allocation(
+        self,
+        request_state: CachedRequestState,
+        allocation: PICNativeKVAllocation,
+    ) -> None:
+        """Hold one active-request reference for a native KV view."""
+        resource_key = self._pic_allocation_resource_key(allocation)
+        if resource_key not in request_state.pic_native_kv_leases:
+            request_state.pic_native_kv_leases[resource_key] = (
+                self.pic_lease_registry.acquire(
+                    resource_key,
+                    owner=f"request:{request_state.req_id}",
+                    kind="active_request",
+                )
+            )
+
+    def _release_pic_request_leases(self, request_state: CachedRequestState) -> None:
+        """Release request and in-flight references exactly once."""
+        for resource_key, token in tuple(request_state.pic_native_kv_leases.items()):
+            self.pic_lease_registry.release(token)
+            # Every request allocation key embeds the scheduler-assigned
+            # native block span. Once this request reference is gone, no later
+            # request can acquire this record as the same allocation, so
+            # retire it for both public-only and private allocations.
+            self.pic_lease_registry.retire(resource_key)
+        request_state.pic_native_kv_leases.clear()
+        for token in tuple(request_state.pic_inflight_leases.values()):
+            self.pic_lease_registry.release(token)
+        request_state.pic_inflight_leases.clear()
+
+    def _release_pic_imported_native_refs(
+        self, request_state: CachedRequestState
+    ) -> None:
+        """Release worker-local external KV imports without touching cache entries."""
+        for references in tuple(request_state.pic_imported_native_refs.values()):
+            for reference in references:
+                reference.release()
+        request_state.pic_imported_native_refs.clear()
+
+    @contextmanager
+    def _pic_inflight_leases(self, request_ids: Iterable[str]) -> Iterator[None]:
+        """Protect request-local PIC state for the duration of model execution."""
+        acquired: list[tuple[CachedRequestState, PICLeaseToken]] = []
+        try:
+            for req_id in request_ids:
+                request_state = self.requests.get(req_id)
+                if request_state is None:
+                    raise PICWorkerUnsupported(
+                        f"PIC in-flight lease request is missing: {req_id}"
+                    )
+                token = self.pic_lease_registry.acquire(
+                    ("request", req_id),
+                    owner=f"inflight:{req_id}",
+                    kind="inflight",
+                )
+                request_state.pic_inflight_leases[token.token_id] = token
+                acquired.append((request_state, token))
+            yield
+        finally:
+            for request_state, token in acquired:
+                request_state.pic_inflight_leases.pop(token.token_id, None)
+                self.pic_lease_registry.release(token)
+                self.pic_lease_registry.retire(token.resource_key)
+
+    def _attach_pic_native_slots(self) -> None:
+        """Attach reused native blocks to the worker-local request row.
+
+        This is the vLLM equivalent of SGLang's ``req_to_token_pool.write``.
+        It only patches a request-local block-table row; ordinary requests do
+        not enter this method.  The scheduler-side PIC cache owns the native
+        block lease, so a failed attach is safe to fall back from.
+        """
+        detail_profile = _pic_detail_profile_enabled()
+        total_start = time.perf_counter() if detail_profile else 0.0
+        attached_requests = 0
+        for req_id in self.input_batch.req_ids:
+            request_state = self.requests.get(req_id)
+            if request_state is None or request_state.pic_runtime_plan is None:
+                continue
+            row_idx = self.input_batch.req_id_to_index[req_id]
+            try:
+                request_start = time.perf_counter() if detail_profile else 0.0
+                materialize_start = (
+                    time.perf_counter() if detail_profile else 0.0
+                )
+                self._materialize_pic_private_kv(request_state, row_idx)
+                materialize_ms = (
+                    (time.perf_counter() - materialize_start) * 1000.0
+                    if detail_profile
+                    else 0.0
+                )
+                mapping = request_state.pic_native_kv_mapping
+                if mapping is None:
+                    continue
+                # Doc blocks and their slots do not move while the request is alive, so a decode step
+                # that finds the same mapping has nothing to attach. Re-attaching cost a block-table
+                # patch per plan per step - twenty-two milliseconds on every decode step of a request
+                # whose blocks had not changed since prefill.
+                signature = (
+                    row_idx,
+                    tuple(
+                        (
+                            plan.kv_cache_group_id,
+                            plan.logical_block_ids,
+                            plan.physical_block_ids,
+                        )
+                        for plan in mapping.slot_plans
+                        if not plan.requires_private_materialization
+                    ),
+                )
+                if request_state.pic_native_slots_signature == signature:
+                    continue
+                attach_start = time.perf_counter() if detail_profile else 0.0
+                attached_slots = 0
+                for slot_plan in mapping.slot_plans:
+                    if slot_plan.requires_private_materialization:
+                        continue
+                    allocation = PICNativeKVAllocation.from_slot_plan(slot_plan)
+                    request_state.pic_native_kv_allocations[
+                        (
+                            allocation.kv_cache_group_id,
+                            allocation.target_start,
+                            allocation.target_end,
+                        )
+                    ] = allocation
+                    self._retain_pic_allocation(request_state, allocation)
+                    self.input_batch.block_table.attach_pic_native_blocks(
+                        slot_plan.kv_cache_group_id,
+                        slot_plan.logical_block_ids,
+                        slot_plan.physical_block_ids,
+                        row_idx,
+                    )
+                    attached_slots += 1
+                request_state.pic_native_slots_signature = signature
+                attached_requests += 1
+                if detail_profile:
+                    logger.warning(
+                        "[PIC-PROFILE] native-slot-attach request=%s "
+                        "slots=%d materialize_ms=%.3f attach_map_ms=%.3f "
+                        "request_ms=%.3f",
+                        req_id,
+                        attached_slots,
+                        materialize_ms,
+                        (time.perf_counter() - attach_start) * 1000.0,
+                        (time.perf_counter() - request_start) * 1000.0,
+                    )
+            except Exception:
+                self._disable_pic_runtime(request_state, "native_slot_attach_failed")
+                request_state.pic_worker_fallback = True
+                logger.warning(
+                    "PIC native slot attach failed for request %s; falling back "
+                    "to ordinary block-table execution",
+                    req_id,
+                    exc_info=True,
+                )
+        if detail_profile:
+            logger.warning(
+                "[PIC-PROFILE] native-slot-attach requests=%d attached=%d "
+                "total_ms=%.3f",
+                len(self.input_batch.req_ids),
+                attached_requests,
+                (time.perf_counter() - total_start) * 1000.0,
+            )
+
+    def _pic_public_blocks(
+        self,
+        request_state: "CachedRequestState",
+        segment_index: int,
+        group_id: int,
+    ) -> tuple[int, ...]:
+        for index, group, block_ids in request_state.pic_public_block_ids:
+            if index == segment_index and group == group_id:
+                return tuple(int(block_id) for block_id in block_ids)
+        return ()
+
+    def _materialize_pic_public_kv(
+        self,
+        request_state: "CachedRequestState",
+        row_idx: int,
+        segment_index: int,
+        segment: "PICSegment",
+    ) -> None:
+        """Publish a first-seen segment into canonical native KV.
+
+        Exact-position prefix segments alias the request's already populated
+        native blocks and receive a scheduler-side canonical lease.  Shifted
+        or interior segments keep the conservative independent public copy:
+        keys are rerotated to the segment-local origin and values are copied.
+        """
+        profile = _pic_import_profile_enabled()
+        total_start = time.perf_counter() if profile else 0.0
+        rerotation_ms = 0.0
+        copy_ms = 0.0
+        layer_count = 0
+        layout = get_kv_cache_layout()
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, AttentionSpec) or isinstance(
+                spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
+            ):
+                continue
+            public_ids = self._pic_public_blocks(request_state, segment_index, group_id)
+            # The published span reaches the segment's last token, so the reused window can too;
+            # the page it ends inside is copied whole and read only up to that token.
+            span = get_covering_local_block_span(
+                segment.end - segment.start, int(spec.block_size)
+            )
+            if span.block_count <= 0:
+                continue
+            if pic_debug_enabled() and len(public_ids) < span.block_count:
+                # A window that reaches further than its blocks would read past the allocation, and
+                # the symptom is wrong output rather than an error. Naming both numbers here turns
+                # that into a message at the only moment they can be compared.
+                raise PICWorkerUnsupported(
+                    "PIC public KV covers %d block(s) but the segment window needs %d "
+                    "to reach token %d (segment=%d block_size=%d)"
+                    % (
+                        len(public_ids),
+                        span.block_count,
+                        span.reusable_token_count,
+                        segment.end - segment.start,
+                        int(spec.block_size),
+                    )
+                )
+            block_table = self.input_batch.block_table[group_id]
+            if block_table.pcp_world_size != 1 or block_table.dcp_world_size != 1:
+                raise PICWorkerUnsupported(
+                    "PIC public KV materialization requires single-rank KV"
+                )
+            source_block_count = int(block_table.num_blocks_per_row[row_idx])
+            source_block_ids = tuple(
+                int(block_id)
+                for block_id in block_table.get_numpy_array()[
+                    row_idx, :source_block_count
+                ]
+            )
+            if len(source_block_ids) < span.block_count:
+                raise PICWorkerUnsupported(
+                    "PIC native KV source request has too few complete blocks"
+                )
+
+            # For a prefix at absolute position zero, the request blocks are
+            # already in the canonical coordinate system. Record the request's
+            # allocator IDs for PIC ownership metadata and publish the existing
+            # kernel-page IDs directly; do not allocate a second public copy.
+            # This is the only alias path: interior
+            # or shifted segments still require the old canonical copy and
+            # subsequent private RoPE materialization.
+            if not public_ids and is_pic_exact_position_aliasable(segment.start):
+                kernel_span = get_full_local_block_span(
+                    segment.end - segment.start, block_table.block_size
+                )
+                if len(source_block_ids) < kernel_span.block_count:
+                    raise PICWorkerUnsupported(
+                        "PIC exact-position alias has too few kernel blocks"
+                    )
+                # BlockTable rows already contain kernel block IDs. Keep them
+                # for the published manifest without expanding them a second
+                # time.
+                source_kernel_ids = tuple(
+                    int(block_id)
+                    for block_id in source_block_ids[: kernel_span.block_count]
+                )
+                if group_id >= len(request_state.block_ids):
+                    raise PICWorkerUnsupported(
+                        "PIC exact-position alias has no allocator block row"
+                    )
+                allocator_ids = tuple(
+                    int(block_id)
+                    for block_id in request_state.block_ids[group_id][
+                        : span.block_count
+                    ]
+                )
+                if len(allocator_ids) != span.block_count:
+                    raise PICWorkerUnsupported(
+                        "PIC exact-position alias has too few allocator blocks"
+                    )
+                records = [
+                    record
+                    for record in request_state.pic_public_block_ids
+                    if not (record[0] == segment_index and record[1] == group_id)
+                ]
+                # pic_public_block_ids uses scheduler allocator granularity;
+                # the TE manifest below uses kernel-page granularity.
+                records.append((segment_index, group_id, allocator_ids))
+                request_state.pic_public_block_ids = tuple(records)
+                self._pic_debug(
+                    "native KV canonical alias request=%s segment=%d group=%d "
+                    "range=[0,%d) allocator_blocks=%s kernel_blocks=%s",
+                    request_state.req_id,
+                    segment_index,
+                    group_id,
+                    span.reusable_token_count,
+                    allocator_ids,
+                    source_kernel_ids,
+                )
+                self.pic_metrics.record_materialization(kind="alias")
+                if self.pic_mooncake_object_store is not None:
+                    external_key = (
+                        f"segment/{segment.seg_hash.hex()}/group-{group_id}"
+                    )
+                    group_kv_caches = {
+                        layer_name: getattr(
+                            self.compilation_config.static_forward_context[layer_name],
+                            "kv_cache",
+                        )
+                        for layer_name in group.layer_names
+                    }
+                    object_store = self.pic_mooncake_object_store
+                    object_store.publish_native_blocks(
+                        external_key=external_key,
+                        kv_cache_group_id=group_id,
+                        block_size=int(self._kernel_block_sizes[group_id]),
+                        token_count=span.reusable_token_count,
+                        canonical_start=0,
+                        layout=layout,
+                        kv_caches=group_kv_caches,
+                        block_ids=source_kernel_ids,
+                    )
+                    request_state.pic_mooncake_external_keys[
+                        (segment_index, group_id)
+                    ] = external_key
+                    request_state.pic_mooncake_external_block_sizes[
+                        (segment_index, group_id)
+                    ] = int(self._kernel_block_sizes[group_id])
+                    self._pic_debug(
+                        "Mooncake native KV alias published request=%s segment=%d "
+                        "group=%d key=%s blocks=%d",
+                        request_state.req_id,
+                        segment_index,
+                        group_id,
+                        external_key,
+                        len(source_kernel_ids),
+                    )
+                continue
+
+            if not public_ids:
+                continue
+            if len(public_ids) < span.block_count:
+                raise PICWorkerUnsupported(
+                    "PIC public allocation does not match segment-local span"
+                )
+            source_start = segment.start + span.reusable_start
+            source_end = segment.start + span.reusable_end
+            source_slots = build_kv_slot_mapping(
+                source_block_ids,
+                block_size=block_table.block_size,
+                token_start=source_start,
+                token_end=source_end,
+                device=self.device,
+            )
+            public_kernel_ids = block_table.map_to_kernel_blocks(
+                np.asarray(public_ids, dtype=np.int64),
+                block_table.blocks_per_kv_block,
+                block_table._kernel_block_arange,
+            )
+            public_slots = build_kv_slot_mapping(
+                tuple(int(block_id) for block_id in public_kernel_ids),
+                block_size=block_table.block_size,
+                token_start=0,
+                token_end=span.reusable_token_count,
+                device=self.device,
+            )
+            # The window is described by integers; building device position vectors only to have
+            # the rotation read two numbers back out of them was pure synchronisation.
+            for layer_name in group.layer_names:
+                layer = self.compilation_config.static_forward_context.get(layer_name)
+                if layer is None or not hasattr(layer, "impl"):
+                    raise PICWorkerUnsupported(
+                        f"PIC public KV cannot find attention layer {layer_name}"
+                    )
+                kv_cache = getattr(layer, "kv_cache", None)
+                copy_impl = getattr(layer.impl, "do_kv_cache_update", None)
+                if kv_cache is None or copy_impl is None:
+                    raise PICWorkerUnsupported(
+                        f"PIC public KV has no KV update path for {layer_name}"
+                    )
+                key, value = gather_native_kv_slots(
+                    kv_cache,
+                    source_slots,
+                    block_size=block_table.block_size,
+                    layout=layout,
+                )
+                rotary_emb = self._pic_rotary_embedding(layer_name, layer)
+                if rotary_emb is None:
+                    raise PICWorkerUnsupported(
+                        f"PIC public KV cannot resolve RoPE for {layer_name}"
+                    )
+                _pic_profile_sync(profile, self.device)
+                rerotation_start = time.perf_counter() if profile else 0.0
+                key = rerotate_native_key(
+                    key,
+                    rotary_emb=rotary_emb,
+                    source_start=int(source_start),
+                    target_start=0,
+                    token_count=int(span.reusable_token_count),
+                )
+                _pic_profile_sync(profile, self.device)
+                if profile:
+                    rerotation_ms += (
+                        time.perf_counter() - rerotation_start
+                    ) * 1000.0
+                _pic_profile_sync(profile, self.device)
+                copy_start = time.perf_counter() if profile else 0.0
+                copy_impl(layer, key, value, kv_cache, public_slots)
+                _pic_profile_sync(profile, self.device)
+                if profile:
+                    copy_ms += (time.perf_counter() - copy_start) * 1000.0
+                layer_count += 1
+            if pic_debug_enabled():
+                # Two counts that have to agree, side by side: the span's, the allocator's and the
+                # kernel block size the allocation is measured in. A mismatch here stops reuse, so
+                # the numbers behind it are worth a line.
+                self._pic_debug(
+                    "public allocation request=%s segment=%d group=%d tokens=%d "
+                    "span_blocks=%d public_ids=%d kernel_ids=%d block_size=%d "
+                    "kernel_block_size=%d",
+                    request_state.req_id,
+                    segment_index,
+                    group_id,
+                    int(span.reusable_token_count),
+                    int(span.block_count),
+                    len(public_ids),
+                    len(public_kernel_ids),
+                    int(block_table.block_size),
+                    int(self._kernel_block_sizes[group_id]),
+                )
+            allocation = PICNativeKVAllocation(
+                kv_cache_group_id=group_id,
+                target_start=0,
+                target_end=span.reusable_token_count,
+                block_size=block_table.block_size,
+                public_block_ids=tuple(int(block_id) for block_id in public_kernel_ids),
+            )
+            request_state.pic_native_kv_allocations[
+                (group_id, 0, span.reusable_token_count)
+            ] = allocation
+            self._retain_pic_allocation(request_state, allocation)
+            self._pic_debug(
+                "public KV materialized request=%s segment=%d group=%d "
+                "canonical=[0,%d) source=[%d,%d) blocks=%s",
+                request_state.req_id,
+                segment_index,
+                group_id,
+                span.reusable_token_count,
+                source_start,
+                source_end,
+                public_ids,
+            )
+            self.pic_metrics.record_materialization(kind="public")
+            if self.pic_mooncake_object_store is not None:
+                external_key = (
+                    f"segment/{segment.seg_hash.hex()}/group-{group_id}"
+                )
+                group_kv_caches = {
+                    layer_name: getattr(
+                        self.compilation_config.static_forward_context[layer_name],
+                        "kv_cache",
+                    )
+                    for layer_name in group.layer_names
+                }
+                object_store = self.pic_mooncake_object_store
+                object_store.publish_native_blocks(
+                    external_key=external_key,
+                    kv_cache_group_id=group_id,
+                    block_size=int(self._kernel_block_sizes[group_id]),
+                    token_count=span.reusable_token_count,
+                    canonical_start=0,
+                    layout=layout,
+                    kv_caches=group_kv_caches,
+                    block_ids=tuple(
+                        int(block_id) for block_id in public_kernel_ids
+                    ),
+                )
+                request_state.pic_mooncake_external_keys[
+                    (segment_index, group_id)
+                ] = external_key
+                request_state.pic_mooncake_external_block_sizes[
+                    (segment_index, group_id)
+                ] = int(self._kernel_block_sizes[group_id])
+                self._pic_debug(
+                    "Mooncake native KV published request=%s segment=%d "
+                    "group=%d key=%s blocks=%d",
+                    request_state.req_id,
+                    segment_index,
+                    group_id,
+                    external_key,
+                    len(public_kernel_ids),
+                )
+        if profile:
+            logger.warning(
+                "[PIC-PROFILE] native-materialization request=%s segment=%d "
+                "kind=public layers=%d rerotation_ms=%.3f copy_ms=%.3f "
+                "materialization_ms=%.3f",
+                request_state.req_id,
+                segment_index,
+                layer_count,
+                rerotation_ms,
+                copy_ms,
+                (time.perf_counter() - total_start) * 1000.0,
+            )
+
+    @staticmethod
+    def _pic_transition_covers_segment(manifest: Any, segment: "PICSegment") -> bool:
+        """Whether a published transition describes part of this segment.
+
+        The published span ends on an allocator block boundary and may start
+        after a seam, so it is normally shorter than the segment; requiring
+        equality with the segment length wrongly rejected every published entry.
+        """
+        if manifest is None:
+            return False
+        token_count = int(getattr(manifest, "token_count", 0) or 0)
+        span_start = int(getattr(manifest, "span_start", 0) or 0)
+        if token_count <= 0 or span_start < 0:
+            return False
+        return span_start + token_count <= segment.length
+
+    def _pic_transition_span_start(
+        self,
+        request_state: "CachedRequestState",
+        segment_index: int,
+        segment: "PICSegment",
+    ) -> int:
+        """First token the published transition covers, in segment-local terms.
+
+        Hypic caches only the reusable suffix of an interior segment: its first F
+        tokens form the seam window that is recomputed on reuse, because that head
+        attends to a left context which differs from cache time.  The leading
+        segment anchors at position zero, and the trailing query is recomputed
+        end-to-end, so neither excludes a seam from its published span.  This must
+        stay in step with the seam rule in ``vllm/v1/pic/cache.py``.
+        """
+        if segment_index <= 0 or not getattr(segment, "cacheable", True):
+            return 0
+        seam = int(self.vllm_config.pic_config.seam_sink)
+        return min(max(seam, 0), max(segment.length - 1, 0))
+
+    def _pic_transition_alignment(self) -> int:
+        """Block size the published KV span is rounded down to.
+
+        KV is published per *attention* allocator block, which a hybrid model pads
+        so an attention page covers a mamba page.  Mamba cache groups report their
+        own block size — typically the whole sequence — so including them would
+        round every segment down to zero and publish nothing.
+        """
+        sizes = []
+        config = getattr(self, "kv_cache_config", None)
+        for group in getattr(config, "kv_cache_groups", ()) or ():
+            spec = getattr(group, "kv_cache_spec", None)
+            if not isinstance(spec, AttentionSpec) or isinstance(
+                spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
+            ):
+                continue
+            block_size = int(getattr(spec, "block_size", 0) or 0)
+            if block_size > 0:
+                sizes.append(block_size)
+        if not sizes:
+            kernel = getattr(self, "_kernel_block_sizes", None) or (1,)
+            return min(int(size) for size in kernel) or 1
+        return max(sizes)
+
+    def _pic_compact_operator(self, operator: Any) -> Any | None:
+        """Return ``operator`` with every transition replaced by its matrix, or None.
+
+        Each token-level transition re-derives its chunk grid for the window it now covers before
+        being compacted: the stored metadata was computed on the segment's own grid, and a trimmed
+        window starts a chunk where the segment had a chunk boundary - keeping the old metadata
+        would describe a different transition. A layer that cannot be compacted returns None and the
+        operator stays as captured, so a reader falls back to the recurrence rather than to
+        something half-converted.
+        """
+        from vllm.v1.pic.state import (
+            PICGDNTransition,
+            PICLinearTransition,
+            PICTransitionOperator,
+        )
+
+        if self._pic_operator_is_linear(operator):
+            return operator
+        matrices = []
+        for transition in operator.transitions:
+            if isinstance(transition, PICLinearTransition):
+                matrices.append(transition)
+                continue
+            if not isinstance(transition, PICGDNTransition):
+                return None
+            matrix = transition.retimed().compact()
+            if matrix is None:
+                return None
+            matrices.append(matrix)
+        return PICTransitionOperator(
+            transitions=tuple(matrices),
+            conv_transitions=tuple(operator.conv_transitions),
+            token_start=int(operator.token_start),
+            token_end=int(operator.token_end),
+        )
+
+    @staticmethod
+    def _pic_operator_is_linear(operator: Any) -> bool:
+        """Whether the operator is stored as a matrix rather than as a token sequence.
+
+        A matrix describes one span and cannot be trimmed: cutting tokens off its window would give
+        the transition of a different span. It is therefore used exactly as published, and the
+        per-token slice path must never be reached for it.
+        """
+        transitions = getattr(operator, "transitions", None) or ()
+        return any(isinstance(item, PICLinearTransition) for item in transitions)
+
+    def _pic_transition_span_operator(
+        self,
+        request_state: "CachedRequestState",
+        segment_index: int,
+        segment: PICSegment,
+        operator: Any,
+    ) -> Any | None:
+        """Return the operator to apply for this segment's reusable span, or None.
+
+        A per-token operator is trimmed to the span the request will actually reuse: it starts after
+        the seam and ends on an allocator block boundary. A matrix is not trimmed at all - it was
+        built for one span, and cutting tokens off it would describe a different transition - so it
+        is used exactly as published.
+        """
+        # The matrix case comes first and returns: every rule below is about trimming, and there is
+        # nothing to trim here.
+        if self._pic_operator_is_linear(operator):
+            return operator
+
+        seam = self._pic_transition_span_start(request_state, segment_index, segment)
+        alignment = self._pic_transition_alignment()
+        # The matrix must cover what the window reaches; leaving it at the aligned end would reuse
+        # tail tokens with no transition standing behind them.
+        span_end = segment.length
+        if span_end - seam <= 0:
+            return None
+        if operator.token_start > seam or operator.token_end < span_end:
+            raise PICWorkerUnsupported(
+                "captured transition does not cover the reusable span: "
+                f"operator=[{operator.token_start},{operator.token_end}) "
+                f"expected=[{seam},{span_end})"
+            )
+        if (operator.token_start, operator.token_end) == (seam, span_end):
+            return operator
+        try:
+            base = int(operator.token_start)
+            return operator.slice(seam - base, span_end - base)
+        except PICWorkerUnsupported as exc:
+            # Anything that cannot be trimmed keeps the request on the ordinary path rather than
+            # failing it. The reason is logged so a refusal is never silent.
+            self._pic_debug(
+                "transition not trimmable request=%s kind=%s span=[%s,%s) reason=%s",
+                request_state.req_id,
+                type(operator).__name__,
+                seam,
+                span_end,
+                exc,
+            )
+            return None
+
+    def _publish_pic_transition_operator(
+        self,
+        request_state: "CachedRequestState",
+        segment_index: int,
+        segment: PICSegment,
+        operator: Any,
+    ) -> None:
+        """Publish the position-independent hybrid state for one segment."""
+        if self.pic_mooncake_object_store is None:
+            return
+        # The reused range starts after a seam at the head of the reused content and covers the rest
+        # of the segment whole, because a per-token operator cannot be sliced afterwards: the
+        # published range has to be the reused range.
+        seam = self._pic_transition_span_start(
+            request_state, segment_index, segment
+        )
+        # The published span is the window a reader will reuse, and that window stops one token short
+        # of the segment: the last token is recomputed because the request's logits come from it. A
+        # transition that covered one token more than the window could not be served - a matrix cannot
+        # be trimmed, so the reader asked for a slice of it and the slice was refused.
+        span_end = segment.length - 1
+        if self._pic_operator_is_linear(operator):
+            # Already a matrix: it is published for exactly the span it was built for.
+            seam = int(operator.token_start)
+            span_end = int(operator.token_end)
+        expected_tokens = span_end - seam
+        if expected_tokens <= 0:
+            if _pic_trace_enabled():
+                logger.warning(
+                    "[PIC-TRACE] publish-skipped request=%s segment=%d "
+                    "length=%d seam=%d span_end=%d",
+                    request_state.req_id,
+                    segment_index,
+                    segment.length,
+                    seam,
+                    span_end,
+                )
+            return
+        if operator.token_start > seam or operator.token_end < span_end:
+            raise PICWorkerUnsupported(
+                "captured transition does not cover the published span: "
+                f"operator=[{operator.token_start},{operator.token_end}) "
+                f"expected=[{seam},{span_end})"
+            )
+        trimmed = operator
+        # A matrix is never trimmed: it was built for one window and cutting tokens off it would
+        # describe a different transition. A closure is trimmed to the window the reader will use,
+        # which is what lets the matrix built from it match that window exactly.
+        if not self._pic_operator_is_linear(operator) and (
+            operator.token_start, operator.token_end
+        ) != (seam, span_end):
+            # `slice` takes coordinates relative to the operator's own window, while seam and
+            # span_end are segment coordinates. Passing them through unchanged only works while the
+            # operator starts at zero; when it does not, the requested length runs past the operator
+            # and the slice is refused.
+            base = int(operator.token_start)
+            trimmed = operator.slice(seam - base, span_end - base)
+        # The operator is segment-local, so a slice already carries the span
+        # offset the reader will adopt.  Assert it instead of rewriting, so a
+        # future coordinate change fails here rather than in the manifest.
+        # Coverage rather than equality: slicing rounds its bounds out to the granularity the
+        # transition is stored in, so the trimmed window may reach a few tokens past the seam and
+        # past the end. What matters is that it still contains the span the reader will use.
+        if trimmed.token_start > seam or trimmed.token_end < span_end:
+            raise PICWorkerUnsupported(
+                "published transition does not cover the segment-local span: "
+                f"operator=[{trimmed.token_start},{trimmed.token_end}) "
+                f"expected=[{seam},{span_end})"
+            )
+        # Store the matrix, not the recurrence. It is built over exactly the window the reader will
+        # apply it to, so the reader can return it untouched and multiply once per layer. Building
+        # costs one pass over that window here, where a document is published once, instead of on
+        # every reader that imports it - and on the reader it could not even be done, because the
+        # window it needs is narrower than the capture and a trimmed window has its own chunk grid.
+        compacted_operator = self._pic_compact_operator(trimmed)
+        if compacted_operator is not None:
+            trimmed = compacted_operator
+            # Release the token-level capture now. It is about 1.9 GB per request - eighteen layers of
+            # per-token recurrence plus its chunk intermediates - and nothing after this point reads it:
+            # the matrix is what the reader applies. Keeping both until the request ended is what put
+            # four concurrent requests at risk of exhausting memory.
+            try:
+                request_state.pic_transition_operators[segment_index] = compacted_operator
+            except Exception:  # noqa: BLE001 - releasing memory must never fail a publish
+                pass
+            if _pic_trace_enabled():
+                logger.warning(
+                    "[PIC-TRACE] publish-matrix request=%s segment=%d tokens=%d span=[%d,%d)",
+                    request_state.req_id,
+                    segment_index,
+                    expected_tokens,
+                    seam,
+                    span_end,
+                )
+        external_key = f"segment/{segment.seg_hash.hex()}/hybrid-state"
+        try:
+            manifest = self.pic_mooncake_object_store.load_transition_manifest(
+                external_key
+            )
+            if (
+                manifest.token_count != expected_tokens
+                or manifest.span_start != seam
+            ):
+                raise ValueError("existing hybrid transition length mismatch")
+        except Exception:
+            manifest = self.pic_mooncake_object_store.publish_transition_operator(
+                external_key=external_key,
+                operator=trimmed,
+            )
+            if (
+                manifest.token_count != expected_tokens
+                or manifest.span_start != seam
+            ):
+                raise ValueError("published hybrid transition length mismatch")
+        request_state.pic_mooncake_transition_keys[segment_index] = external_key
+        self._pic_debug(
+            "Mooncake hybrid transition published request=%s segment=%d "
+            "key=%s tokens=%d span=[%d,%d)",
+            request_state.req_id,
+            segment_index,
+            external_key,
+            # The matrix is the window, not the segment: reporting the segment length here made a
+            # published transition look like it covered the segment when it deliberately does not.
+            expected_tokens,
+            seam,
+            span_end,
+        )
+
+    def _materialize_pic_private_kv(
+        self, request_state: "CachedRequestState", row_idx: int
+    ) -> None:
+        """Materialize unaligned PIC KV into the request's private KV row.
+
+        SGLang's non-prefix path writes hit slots into the current request's
+        ``req_to_token`` row.  vLLM's equivalent is the ordinary block table:
+        the request already owns these blocks, so copying the public hit into
+        them gives the attention backend a private, lifecycle-safe view.  The
+        public PIC blocks are never changed.  The later seam/miss forward can
+        therefore overwrite the edge tokens in the private row normally.
+        """
+        profile = _pic_import_profile_enabled()
+        total_start = time.perf_counter() if profile else 0.0
+        slot_setup_ms = 0.0
+        gather_ms = 0.0
+        rotary_lookup_ms = 0.0
+        rerotation_ms = 0.0
+        copy_ms = 0.0
+        layer_count = 0
+        slot_count = 0
+        mapping = request_state.pic_native_kv_mapping
+        if mapping is None:
+            return
+        _pic_log_cuda_memory(
+            "private_kv_materialization_begin", request_state.req_id, self.device
+        )
+        layout = get_kv_cache_layout()
+        for slot_plan in mapping.slot_plans:
+            if not slot_plan.requires_private_materialization:
+                continue
+            slot_count += 1
+            group_id = slot_plan.kv_cache_group_id
+            group = self.kv_cache_config.kv_cache_groups[group_id]
+            if not isinstance(group.kv_cache_spec, AttentionSpec):
+                raise PICWorkerUnsupported(
+                    "PIC private materialization requires an attention KV group"
+                )
+            block_table = self.input_batch.block_table[group_id]
+            if block_table.pcp_world_size != 1 or block_table.dcp_world_size != 1:
+                raise PICWorkerUnsupported(
+                    "PIC private materialization requires single-rank KV"
+                )
+            num_blocks = int(block_table.num_blocks_per_row[row_idx])
+            block_ids = tuple(
+                int(block_id)
+                for block_id in block_table.get_numpy_array()[row_idx, :num_blocks]
+            )
+            materialization_key = (
+                group_id,
+                slot_plan.target_start,
+                slot_plan.target_end,
+                slot_plan.source_start,
+                slot_plan.token_count,
+                block_ids,
+            )
+            if materialization_key in request_state.pic_private_kv_materialized:
+                allocation = PICNativeKVAllocation.from_slot_plan(
+                    slot_plan,
+                    private_block_ids=block_ids,
+                )
+                request_state.pic_native_kv_allocations[
+                    (
+                        allocation.kv_cache_group_id,
+                        allocation.target_start,
+                        allocation.target_end,
+                    )
+                ] = allocation
+                self._retain_pic_allocation(request_state, allocation)
+                self._pic_debug(
+                    "private KV materialization reused request=%s group=%d "
+                    "range=[%d,%d)",
+                    request_state.req_id,
+                    group_id,
+                    slot_plan.target_start,
+                    slot_plan.target_end,
+                )
+                self.pic_metrics.record_materialization(kind="private", reused=True)
+                continue
+            slot_setup_start = time.perf_counter() if profile else 0.0
+            target_slots = build_kv_slot_mapping(
+                block_ids,
+                block_size=block_table.block_size,
+                token_start=slot_plan.target_start,
+                token_end=slot_plan.target_end,
+                device=self.device,
+            )
+            # Where the stored key sits now, which is not where it was captured: a published object
+            # is stored at canonical position zero, so this is one rotation by the target position
+            # rather than by the distance between two capture positions; both are integers the plan
+            # already carries.
+            _pic_profile_sync(profile, self.device)
+            if profile:
+                slot_setup_ms += (time.perf_counter() - slot_setup_start) * 1000.0
+            for layer_name in group.layer_names:
+                layer = self.compilation_config.static_forward_context.get(layer_name)
+                if layer is None or not hasattr(layer, "impl"):
+                    raise PICWorkerUnsupported(
+                        f"PIC private materialization cannot find layer {layer_name}"
+                    )
+                kv_cache = getattr(layer, "kv_cache", None)
+                copy_impl = getattr(layer.impl, "do_kv_cache_update", None)
+                if kv_cache is None or copy_impl is None:
+                    raise PICWorkerUnsupported(
+                        "PIC private materialization has no KV update path "
+                        f"for {layer_name}"
+                    )
+                _pic_profile_sync(profile, self.device)
+                gather_start = time.perf_counter() if profile else 0.0
+                key, value = gather_native_kv_slots(
+                    kv_cache,
+                    slot_plan.slot_mapping,
+                    block_size=slot_plan.block_size,
+                    layout=layout,
+                )
+                _pic_profile_sync(profile, self.device)
+                if profile:
+                    gather_ms += (time.perf_counter() - gather_start) * 1000.0
+                rotary_lookup_start = time.perf_counter() if profile else 0.0
+                rotary_emb = self._pic_rotary_embedding(layer_name, layer)
+                if profile:
+                    rotary_lookup_ms += (
+                        time.perf_counter() - rotary_lookup_start
+                    ) * 1000.0
+                if rotary_emb is None:
+                    raise PICWorkerUnsupported(
+                        "PIC private materialization cannot resolve RoPE "
+                        f"for {layer_name}"
+                    )
+                _pic_profile_sync(profile, self.device)
+                rerotation_start = time.perf_counter() if profile else 0.0
+                key = rerotate_native_key(
+                    key,
+                    rotary_emb=rotary_emb,
+                    source_start=int(slot_plan.source_origin),
+                    target_start=int(slot_plan.target_start),
+                    token_count=int(slot_plan.token_count),
+                )
+                _pic_profile_sync(profile, self.device)
+                if profile:
+                    rerotation_ms += (
+                        time.perf_counter() - rerotation_start
+                    ) * 1000.0
+                _pic_profile_sync(profile, self.device)
+                copy_start = time.perf_counter() if profile else 0.0
+                copy_impl(layer, key, value, kv_cache, target_slots)
+                _pic_profile_sync(profile, self.device)
+                if profile:
+                    copy_ms += (time.perf_counter() - copy_start) * 1000.0
+                layer_count += 1
+            request_state.pic_private_kv_materialized.add(materialization_key)
+            allocation = PICNativeKVAllocation.from_slot_plan(
+                slot_plan,
+                private_block_ids=block_ids,
+            )
+            if _pic_trace_enabled():
+                logger.warning(
+                    "[PIC-TRACE] materialize request=%s group=%d tokens=%d "
+                    "target=[%d,%d) source_start=%d layers=%d",
+                    request_state.req_id,
+                    group_id,
+                    slot_plan.token_count,
+                    slot_plan.target_start,
+                    slot_plan.target_end,
+                    slot_plan.source_start,
+                    layer_count,
+                )
+            request_state.pic_native_kv_allocations[
+                (
+                    allocation.kv_cache_group_id,
+                    allocation.target_start,
+                    allocation.target_end,
+                )
+            ] = allocation
+            self._retain_pic_allocation(request_state, allocation)
+            self._pic_debug(
+                "private KV materialized request=%s group=%d range=[%d,%d) "
+                "source=[%d,%d)",
+                request_state.req_id,
+                group_id,
+                slot_plan.target_start,
+                slot_plan.target_end,
+                slot_plan.source_start,
+                slot_plan.source_start + slot_plan.token_count,
+            )
+            self.pic_metrics.record_materialization(kind="private")
+        if profile:
+            logger.warning(
+                "[PIC-PROFILE] native-materialization request=%s "
+                "kind=private slots=%d layers=%d rerotation_ms=%.3f "
+                "copy_ms=%.3f slot_setup_ms=%.3f gather_ms=%.3f "
+                "rotary_lookup_ms=%.3f materialization_ms=%.3f",
+                request_state.req_id,
+                slot_count,
+                layer_count,
+                rerotation_ms,
+                copy_ms,
+                slot_setup_ms,
+                gather_ms,
+                rotary_lookup_ms,
+                (time.perf_counter() - total_start) * 1000.0,
+            )
+        _pic_log_cuda_memory(
+            "private_kv_materialization_end", request_state.req_id, self.device
+        )
+
+    def _pic_rotary_embedding(self, layer_name: str, layer: Any) -> Any | None:
+        """Find the model-side RoPE object corresponding to an attention layer."""
+        rotary_emb = getattr(layer, "rotary_emb", None)
+        if rotary_emb is not None:
+            return rotary_emb
+
+        # Most vLLM attention layers register ``...self_attn.attn`` in the
+        # static forward context while the model owns the sibling
+        # ``...self_attn.rotary_emb`` module.  Resolve that sibling without
+        # changing the model or backend interfaces.
+        if not layer_name.endswith(".attn"):
+            return None
+        rotary_name = layer_name[: -len(".attn")] + ".rotary_emb"
+        for root in (
+            self.model,
+            getattr(self.model, "model", None),
+            getattr(getattr(self.model, "model", None), "model", None),
+        ):
+            if root is None or not hasattr(root, "named_modules"):
+                continue
+            modules = dict(root.named_modules())
+            rotary_emb = modules.get(rotary_name)
+            if rotary_emb is None:
+                rotary_emb = modules.get(rotary_name.removeprefix("model."))
+            if rotary_emb is None:
+                # The static context stores the Attention child, while the
+                # RoPE object is a sibling on its model-side parent.  Identity
+                # lookup handles wrappers whose module-name prefix differs.
+                for module_name, module in modules.items():
+                    if module is not layer or "." not in module_name:
+                        continue
+                    parent = modules.get(module_name.rsplit(".", 1)[0])
+                    rotary_emb = getattr(parent, "rotary_emb", None)
+                    if rotary_emb is not None:
+                        break
+            if rotary_emb is not None:
+                return rotary_emb
+        return None
+
+    def _run_pic_single_request_ranges(
+        self,
+        scheduler_output: "SchedulerOutput",
+        runtime_plan: PICSingleRequestRuntimePlan,
+        intermediate_tensors: IntermediateTensors | None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Run only miss ranges with the existing attention backend.
+
+        This first executable path is intentionally narrow: one text-only
+        request, one pipeline rank, eager mode, and no speculative decoding.
+        Each miss range is a normal vLLM forward with an absolute position and
+        a request-local native block table. Reused ranges never enter the
+        model; hybrid recurrent state advances through a cached transition.
+        ``num_computed_tokens`` is restored after every temporary view and is
+        never used to communicate a non-prefix hit to the scheduler.
+        """
+        if intermediate_tensors is not None:
+            raise PICWorkerUnsupported("PIC runtime does not support PP tensors")
+        if self.speculative_config is not None:
+            raise PICWorkerUnsupported(
+                "PIC runtime does not support speculative decoding"
+            )
+        if request_id is None:
+            if self.input_batch.num_reqs != 1:
+                raise PICWorkerUnsupported(
+                    "PIC runtime requires a request ID for a multi-request batch"
+                )
+            request_id = self.input_batch.req_ids[0]
+        if request_id not in self.input_batch.req_id_to_index:
+            raise PICWorkerUnsupported(f"PIC request {request_id} is not in the batch")
+        req_id = request_id
+        request_state = self.requests[request_id]
+        if request_state.mm_features or request_state.prompt_embeds is not None:
+            raise PICWorkerUnsupported(
+                "PIC runtime does not support requests with multimodal inputs"
+            )
+        if self.is_pooling_model:
+            raise PICWorkerUnsupported("PIC runtime requires generation, not pooling")
+        if self.kv_cache_config.has_mamba_layers and (
+            self.pic_live_capture is None
+            or not self.vllm_config.pic_config.restore_live
+        ):
+            raise PICWorkerUnsupported("hybrid PIC runtime requires live state restore")
+        # The Stage 9-B prototype must not emulate a one-request microbatch by
+        # leaving zero-token rows in the persistent InputBatch.  Attention
+        # metadata and several model backends still use the batch row count,
+        # which makes that representation invalid for FlashAttention/GDN.
+        # Build a real one-row view instead.  The view reuses the request's
+        # native block IDs, so this is an execution isolation boundary, not a
+        # second KV allocation.
+        timeline_profile = _pic_detail_profile_enabled()
+        timeline_request_ids = str(request_id)
+        timeline_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+        original_input_batch = self.input_batch
+        phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+        with record_function_or_nullcontext("pic:isolated_batch"):
+            isolated_input_batch = self._make_pic_isolated_input_batch(request_state)
+        self.input_batch = isolated_input_batch
+        _pic_profile_phase_end(
+            timeline_profile,
+            phase_start_ns,
+            request_ids=timeline_request_ids,
+            mode="pic",
+            stage="pic_range.make_isolated_input_batch",
+            device=self.device,
+        )
+        req_index = 0
+        # Read the request's own counter, which is a Python int. Indexing the batch array
+        # here reached a device tensor: the scalar read became a DtoH copy that waited for
+        # the whole prefill to drain, and a single one of those measured 2.5 s.
+        original_computed = int(request_state.num_computed_tokens)
+        result: dict[str, Any] | None = None
+        try:
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+            with record_function_or_nullcontext("pic:range_attach"):
+                self._attach_pic_native_slots()
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode="pic",
+                stage="pic_range.attach_native_slots",
+                device=self.device,
+            )
+            # Built once: every range asked for the same mapping.
+            num_scheduled: np.ndarray | None = None
+            reuse_matches: dict[int, Any] = {}
+            if request_state.pic_cache_plan is not None:
+                reuse_matches = dict(request_state.pic_cache_plan.matches)
+            for runtime_range in runtime_plan.ranges:
+                if runtime_range.action == "reuse":
+                    cache_plan = request_state.pic_cache_plan
+                    if cache_plan is None:
+                        raise PICWorkerUnsupported("PIC state plan is missing")
+                    matched_entry = reuse_matches.get(runtime_range.segment_index)
+                    segment = (
+                        request_state.pic_segments[runtime_range.segment_index]
+                        if 0
+                        <= runtime_range.segment_index
+                        < len(request_state.pic_segments)
+                        else None
+                    )
+                    if matched_entry is None or segment is None:
+                        raise PICWorkerUnsupported(
+                            "PIC runtime transition entry is missing"
+                        )
+                    local_start = runtime_range.start - segment.start
+                    local_end = runtime_range.end - segment.start
+                    if self.kv_cache_config.has_mamba_layers:
+                        if self.pic_live_capture is None:
+                            raise PICWorkerUnsupported(
+                                "PIC live capture manager is unavailable"
+                            )
+                        transition_handle = request_state.pic_transition_handles.get(
+                            runtime_range.segment_index
+                        )
+                        if transition_handle is not None:
+                            matched_entry = replace(
+                                matched_entry,
+                                transition_state_handle=transition_handle,
+                            )
+                        transition_profile = _pic_import_profile_enabled()
+                        _pic_profile_sync(transition_profile, self.device)
+                        transition_start = (
+                            time.perf_counter() if transition_profile else 0.0
+                        )
+                        apply_matched_mamba_transition(
+                            self.pic_live_capture,
+                            request_id=req_id,
+                            segment_index=runtime_range.segment_index,
+                            segment=segment,
+                            entry=matched_entry,
+                            request_state=request_state,
+                            kv_cache_config=self.kv_cache_config,
+                            forward_context=(
+                                self.compilation_config.static_forward_context
+                            ),
+                            state_position=runtime_range.end - 1,
+                            local_start=local_start,
+                            local_end=local_end,
+                        )
+                        _pic_profile_sync(transition_profile, self.device)
+                        if transition_profile:
+                            logger.warning(
+                                "[PIC-PROFILE] transition-apply request=%s "
+                                "segment=%d apply_ms=%.3f",
+                                req_id,
+                                runtime_range.segment_index,
+                                (time.perf_counter() - transition_start) * 1000.0,
+                            )
+                    self._pic_debug(
+                        "reuse body skipped request=%s segment=%d range=[%d,%d)",
+                        req_id,
+                        runtime_range.segment_index,
+                        runtime_range.start,
+                        runtime_range.end,
+                    )
+                    continue
+
+                self.input_batch.num_computed_tokens_cpu[req_index] = (
+                    runtime_range.start
+                )
+                scheduled_counts = {req_id: runtime_range.token_count}
+                range_output = replace(
+                    scheduler_output,
+                    num_scheduled_tokens=scheduled_counts,
+                    total_num_scheduled_tokens=runtime_range.token_count,
+                    scheduled_spec_decode_tokens={},
+                    scheduled_encoder_inputs={},
+                )
+                num_reqs = 1
+                if num_scheduled is None:
+                    # Allocated once per call and reused: the shape never changes and
+                    # only the single entry is written.
+                    num_scheduled = np.zeros(num_reqs, dtype=np.int32)
+                num_scheduled[req_index] = runtime_range.token_count
+                range_suffix = (
+                    f"segment={runtime_range.segment_index}"
+                    f" range={runtime_range.start}-{runtime_range.end}"
+                )
+                phase_start_ns = _pic_profile_phase_start(
+                    timeline_profile, self.device
+                )
+                if self.cache_config.mamba_cache_mode == "align":
+                    mamba_bufs = self._get_mamba_bufs()
+                    mamba_utils.preprocess_mamba(
+                        range_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        mamba_bufs.preprocess,
+                    )
+                _pic_profile_phase_end(
+                    timeline_profile,
+                    phase_start_ns,
+                    request_ids=timeline_request_ids,
+                    mode="pic",
+                    stage=f"pic_range.mamba_preprocess {range_suffix}",
+                    device=self.device,
+                )
+                phase_start_ns = _pic_profile_phase_start(
+                    timeline_profile, self.device
+                )
+                logits_indices, spec_decode_metadata = self._prepare_inputs(
+                    range_output, num_scheduled
+                )
+                _pic_profile_phase_end(
+                    timeline_profile,
+                    phase_start_ns,
+                    request_ids=timeline_request_ids,
+                    mode="pic",
+                    stage=f"pic_range.prepare_inputs {range_suffix}",
+                    device=self.device,
+                )
+                phase_start_ns = _pic_profile_phase_start(
+                    timeline_profile, self.device
+                )
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    _should_ubatch,
+                    num_tokens_across_dp,
+                    cudagraph_stats,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=runtime_range.token_count,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled,
+                    max_num_scheduled_tokens=runtime_range.token_count,
+                    use_cascade_attn=False,
+                    allow_microbatching=False,
+                    # A range used to be forced eager, so every step paid ~2800 kernel
+                    # launches: a trace shows 29.5% kernel time and 70% GPU idle, about
+                    # 27 us of gap per launch. Cudagraph capture is opt-in because PIC
+                    # ranges vary in size and the captured path pads to a capture size;
+                    # a CUDA-graph run must be paired with a server started without
+                    # --enforce-eager.
+                    force_eager=True,
+                    num_encoder_reqs=0,
+                )
+                _pic_profile_phase_end(
+                    timeline_profile,
+                    phase_start_ns,
+                    request_ids=timeline_request_ids,
+                    mode="pic",
+                    stage=f"pic_range.schedule_and_padding {range_suffix}",
+                    device=self.device,
+                )
+                num_tokens_padded = batch_desc.num_tokens
+                phase_start_ns = _pic_profile_phase_start(
+                    timeline_profile, self.device
+                )
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs_padded=num_reqs,
+                    num_tokens_unpadded=runtime_range.token_count,
+                    ubatch_slices=None,
+                )
+                _pic_profile_phase_end(
+                    timeline_profile,
+                    phase_start_ns,
+                    request_ids=timeline_request_ids,
+                    mode="pic",
+                    stage=f"pic_range.slot_mapping {range_suffix}",
+                    device=self.device,
+                )
+                phase_start_ns = _pic_profile_phase_start(
+                    timeline_profile, self.device
+                )
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
+                        num_tokens=runtime_range.token_count,
+                        num_reqs=num_reqs,
+                        max_query_len=runtime_range.token_count,
+                        logits_indices=logits_indices,
+                        use_spec_decode=False,
+                        num_scheduled_tokens=range_output.num_scheduled_tokens,
+                        slot_mappings=slot_mappings_by_group,
+                    )
+                )
+                _pic_profile_phase_end(
+                    timeline_profile,
+                    phase_start_ns,
+                    request_ids=timeline_request_ids,
+                    mode="pic",
+                    stage=f"pic_range.attention_metadata {range_suffix}",
+                    device=self.device,
+                )
+                phase_start_ns = _pic_profile_phase_start(
+                    timeline_profile, self.device
+                )
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    range_intermediate_tensors,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(range_output, num_tokens_padded, None)
+                _pic_profile_phase_end(
+                    timeline_profile,
+                    phase_start_ns,
+                    request_ids=timeline_request_ids,
+                    mode="pic",
+                    stage=f"pic_range.preprocess_inputs {range_suffix}",
+                    device=self.device,
+                )
+                phase_start_ns = _pic_profile_phase_start(
+                    timeline_profile, self.device
+                )
+                with set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=None,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=False,
+                ):
+                    self.pic_metrics.record_forward(
+                        kind="single",
+                        token_count=runtime_range.token_count,
+                    )
+                    model_output = self._pic_profiled_model_forward(
+                        mode="pic",
+                        request_ids=(req_id,),
+                        prefill_tokens=runtime_range.token_count,
+                        decode_tokens=0,
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=range_intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
+                _pic_profile_phase_end(
+                    timeline_profile,
+                    phase_start_ns,
+                    request_ids=timeline_request_ids,
+                    mode="pic",
+                    stage=f"pic_range.forward_dispatch {range_suffix}",
+                    device=self.device,
+                )
+                result = {
+                    "model_output": model_output,
+                    "attn_metadata": attn_metadata,
+                    "spec_decode_common_attn_metadata": (
+                        spec_decode_common_attn_metadata
+                    ),
+                    "spec_decode_metadata": spec_decode_metadata,
+                    "input_ids": input_ids,
+                    "inputs_embeds": inputs_embeds,
+                    "positions": positions,
+                    "intermediate_tensors": range_intermediate_tensors,
+                    "model_kwargs": model_kwargs,
+                    "ec_connector_output": ec_connector_output,
+                    "cudagraph_mode": cudagraph_mode,
+                    "batch_desc": batch_desc,
+                    "num_tokens_padded": num_tokens_padded,
+                    "num_tokens_across_dp": num_tokens_across_dp,
+                    "cudagraph_stats": cudagraph_stats,
+                    "slot_mappings": slot_mappings,
+                    "logits_indices": logits_indices,
+                }
+                if runtime_range.segment_index >= 0:
+                    segment = next(
+                        (
+                            item
+                            for item in request_state.pic_segments
+                            if item.start <= runtime_range.start
+                            and item.end >= runtime_range.end
+                        ),
+                        None,
+                    )
+                    if (
+                        segment is not None
+                        and runtime_range.start == segment.start
+                        and runtime_range.end < segment.end
+                    ):
+                        self._pic_debug(
+                            "seam forward request=%s segment=%d range=[%d,%d)",
+                            req_id,
+                            runtime_range.segment_index,
+                            runtime_range.start,
+                            runtime_range.end,
+                        )
+        finally:
+            self.input_batch.num_computed_tokens_cpu[req_index] = original_computed
+            self.input_batch = original_input_batch
+
+        if result is None:
+            raise PICWorkerUnsupported("PIC runtime has no recompute range")
+        _pic_profile_phase_end(
+            timeline_profile,
+            timeline_start_ns,
+            request_ids=timeline_request_ids,
+            mode="pic",
+            stage="pic_range.total",
+            device=self.device,
+        )
+        return result
+
+    def _make_pic_isolated_input_batch(
+        self, request_state: CachedRequestState
+    ) -> InputBatch:
+        """Build the one-row InputBatch used by the Stage 9-B prototype.
+
+        A zero-scheduled-token row in the persistent batch is not equivalent to
+        a removed row: attention metadata still sees the persistent row count,
+        while the input buffers contain only the active request's tokens.  This
+        helper gives the existing vLLM preparation/backend code the same
+        request-row contract it has in the normal single-request path.
+        """
+        # A trace showed the batch construction at ~2.4 ms of allocation plus ~1.3 ms of
+        # block-table construction, paid once per step even though the shape never
+        # changes: one request, same model length. The instance is kept and refilled.
+        cached = getattr(self, "_pic_isolated_batch", None)
+        if cached is not None:
+            try:
+                for req_id in tuple(cached.req_ids):
+                    if req_id is not None:
+                        cached.remove_request(req_id)
+                cached.condense()
+                cached.add_request(request_state)
+                return cached
+            except Exception:
+                # Reuse is only an optimisation; any surprise rebuilds from scratch.
+                self._pic_isolated_batch = None
+        source = self.input_batch
+        isolated = InputBatch(
+            max_num_reqs=1,
+            max_model_len=max(self.max_model_len, self.max_encoder_len),
+            max_num_batched_tokens=self.max_num_tokens,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            vocab_size=source.vocab_size,
+            block_sizes=list(self._init_block_sizes),
+            kernel_block_sizes=list(self._init_kernel_block_sizes),
+            num_spec_tokens=0,
+            logitsprocs=source.logitsprocs,
+            logitsprocs_need_output_token_ids=source.logitsprocs_need_output_token_ids,
+            is_pooling_model=self.is_pooling_model,
+            cp_kv_cache_interleave_size=(
+                self.parallel_config.cp_kv_cache_interleave_size
+            ),
+            reasoning_config=self.vllm_config.reasoning_config,
+        )
+        self._pic_isolated_batch = isolated
+        isolated.add_request(request_state)
+        # These counters are named ``*_cpu``. Reading a scalar from one that actually lives on
+        # the device turns into a device-to-host copy that waits for the whole step, which is
+        # how a two-and-a-half-second stall hid behind an innocent-looking int(). Say it once
+        # rather than rediscovering it from a trace.
+        buffer = getattr(isolated, "num_computed_tokens_cpu", None)
+        if not getattr(self, "_pic_isolated_batch_checked", False) and buffer is not None:
+            self._pic_isolated_batch_checked = True
+            device = getattr(buffer, "device", None)
+            if device is not None and getattr(device, "type", "cpu") != "cpu":
+                logger.warning(
+                    "PIC isolated batch counter buffer lives on %s, not host memory; "
+                    "reading a scalar from it synchronises the stream",
+                    device,
+                )
+        return isolated
+
+    def _pic_debug(self, message: str, *args: object) -> None:
+        if self.vllm_config.pic_config.debug:
+            if args:
+                message = message % args
+            logger.warning("[PIC-DEBUG] %s", message)
+
+    def get_pic_metrics(self) -> dict[str, Any]:
+        """Return worker-local PIC counters and current resource gauges."""
+        pool = self.pic_live_capture.pool if self.pic_live_capture is not None else None
+        return self.pic_metrics.snapshot(
+            lease_snapshot=self.pic_lease_registry.snapshot(),
+            pool_capacity_bytes=(pool.capacity_bytes if pool is not None else None),
+            pool_free_bytes=(pool.free_bytes if pool is not None else None),
+        )
+
+    def _build_pic_transition_capture(
+        self, request_state: "CachedRequestState", *, max_tokens: int | None = None
+    ) -> PICGDNTransitionCapture | None:
+        """Prepare a model hook for one PIC prefill request.
+
+        This is intentionally restricted to a single request and GDN layers.
+        Other recurrent backends remain on the existing safe fallback until
+        they provide an explicit transition extractor.
+        """
+        if (
+            self.pic_live_capture is None
+            or not self.vllm_config.pic_config.capture_live
+            or not request_state.pic_enabled
+            or not request_state.pic_segments
+            or bool(request_state.mm_features)
+            or request_state.prompt_embeds is not None
+        ):
+            return None
+
+        gdn_layer_names = ordered_gdn_layer_names(
+            self.kv_cache_config,
+            self.compilation_config.static_forward_context,
+        )
+        if not gdn_layer_names:
+            return None
+
+        request_state.pic_transition_operators.clear()
+        return PICGDNTransitionCapture(
+            request_state=request_state,
+            segments=request_state.pic_segments,
+            layer_names=gdn_layer_names,
+            debug=self.vllm_config.pic_config.debug,
+            max_tokens=None if max_tokens is None else int(max_tokens),
+        )
+
+    def _capture_completed_pic_states(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
+        """Capture hybrid state only at an exact PIC segment boundary.
+
+        Stage 7-A is deliberately capture-only.  The ordinary forward path is
+        unchanged, and any capture failure falls back to the same request
+        without publishing a partial materialization.  Pipeline-parallel state
+        composition is deferred until a later stage; this bridge is restricted
+        to a single worker rank for now.
+        """
+        manager = self.pic_live_capture
+        # Where a step's wall time goes without guessing: this hook runs once per step, so the
+        # gap since the previous call is the step's own duration, and the token counts say how
+        # much work it carried. A step that decodes one token but takes seconds is spending the
+        # time somewhere other than compute.
+        now = time.perf_counter()
+        previous = getattr(self, "_pic_step_last_ts", None)
+        self._pic_step_last_ts = now
+        if _pic_trace_enabled() and previous is not None:
+            logger.warning(
+                "[PIC-PROFILE] step wall_ms=%.1f scheduled=%d reqs=%d",
+                (now - previous) * 1000.0,
+                int(scheduler_output.total_num_scheduled_tokens),
+                len(scheduler_output.num_scheduled_tokens),
+            )
+        self._pic_debug(
+            "capture check manager=%s pp_world=%s scheduled=%d",
+            manager is not None,
+            get_pp_group().world_size,
+            len(scheduler_output.num_scheduled_tokens),
+        )
+        if manager is None or get_pp_group().world_size != 1:
+            return
+
+        for (
+            req_id,
+            num_scheduled_tokens,
+        ) in scheduler_output.num_scheduled_tokens.items():
+            request_state = self.requests.get(req_id)
+            if (
+                request_state is None
+                or not request_state.pic_enabled
+                or not request_state.pic_segments
+                or num_scheduled_tokens <= 0
+            ):
+                continue
+
+            completed_end = request_state.num_computed_tokens + num_scheduled_tokens
+            self._pic_debug(
+                "capture candidate request=%s scheduled=%d computed=%d "
+                "completed_end=%d segments=%s",
+                req_id,
+                num_scheduled_tokens,
+                request_state.num_computed_tokens,
+                completed_end,
+                [(s.start, s.end) for s in request_state.pic_segments],
+            )
+            transition_operators = getattr(
+                request_state, "pic_transition_operators", {}
+            )
+            if _pic_trace_enabled():
+                logger.warning(
+                    "[PIC-TRACE] capture-gate request=%s completed_end=%d "
+                    "segments=%s operators=%s cacheable=%s",
+                    req_id,
+                    completed_end,
+                    [(s.start, s.end) for s in request_state.pic_segments],
+                    sorted(transition_operators),
+                    [
+                        bool(getattr(s, "cacheable", True))
+                        for s in request_state.pic_segments
+                    ],
+                )
+            externally_owned_segments = pic_external_segment_indices(
+                request_state.pic_cache_plan
+            )
+            captured_any = False
+            for segment_index, segment in enumerate(request_state.pic_segments):
+                if segment_index in externally_owned_segments:
+                    self._pic_debug(
+                        "capture skipped request=%s segment=%d "
+                        "reason=externally_owned_cache_entry",
+                        req_id,
+                        segment_index,
+                    )
+                    continue
+                if segment.length < self.vllm_config.pic_config.min_segment_tokens:
+                    self._pic_debug(
+                        "capture skipped request=%s segment=%d "
+                        "reason=segment_too_short length=%d",
+                        req_id,
+                        segment_index,
+                        segment.length,
+                    )
+                    continue
+                if not getattr(segment, "cacheable", True):
+                    self._pic_debug(
+                        "capture skipped request=%s segment=%d "
+                        "reason=segment_not_cacheable",
+                        req_id,
+                        segment_index,
+                    )
+                    continue
+                transition_operator = transition_operators.get(segment_index)
+                if transition_operator is None and segment.end != completed_end:
+                    continue
+                if transition_operator is not None:
+                    # Everything downstream stores the operator for exactly the
+                    # reusable span: the published copy and the worker-local copy
+                    # must describe the same range, otherwise a reuse window can
+                    # never match both.
+                    span_operator = self._pic_transition_span_operator(
+                        request_state, segment_index, segment, transition_operator
+                    )
+                    if span_operator is None:
+                        self._pic_debug(
+                            "capture skipped request=%s segment=%d "
+                            "reason=no_reusable_span length=%d",
+                            req_id,
+                            segment_index,
+                            segment.length,
+                        )
+                        continue
+                    transition_operator = span_operator
+                _pic_log_cuda_memory(
+                    f"capture_segment_{segment_index}_begin", req_id, self.device
+                )
+                self._pic_debug(
+                    "capture boundary request=%s segment=%d range=[%d,%d)",
+                    req_id,
+                    segment_index,
+                    segment.start,
+                    segment.end,
+                )
+                try:
+                    # First-seen attention KV is copied into scheduler-
+                    # reserved canonical public blocks before the state
+                    # materialization is published.  If this fails, the
+                    # whole publication is rejected rather than exposing
+                    # source-absolute KV as a reusable canonical entry.
+                    self._materialize_pic_public_kv(
+                        request_state,
+                        self.input_batch.req_id_to_index[req_id],
+                        segment_index,
+                        segment,
+                    )
+                    _pic_log_cuda_memory(
+                        f"capture_segment_{segment_index}_native_kv_ready",
+                        req_id,
+                        self.device,
+                    )
+                    if transition_operator is not None:
+                        self._publish_pic_transition_operator(
+                            request_state,
+                            segment_index,
+                            segment,
+                            transition_operator,
+                        )
+                    if segment.end == completed_end:
+                        materialization = capture_completed_mamba_segment(
+                            manager,
+                            request_id=req_id,
+                            segment_index=segment_index,
+                            segment=segment,
+                            completed_end=completed_end,
+                            request_state=request_state,
+                            kv_cache_config=self.kv_cache_config,
+                            forward_context=(
+                                self.compilation_config.static_forward_context
+                            ),
+                            transition_operator=transition_operator,
+                        )
+                    else:
+                        assert transition_operator is not None
+                        materialization = capture_transition_operator_segment(
+                            manager,
+                            request_id=req_id,
+                            segment_index=segment_index,
+                            segment=segment,
+                            request_state=request_state,
+                            kv_cache_config=self.kv_cache_config,
+                            operator=transition_operator,
+                            conv_tail=getattr(
+                                request_state,
+                                "pic_transition_conv_tails",
+                                {},
+                            ).get(segment_index, ()),
+                        )
+                    self._pic_debug(
+                        "capture result request=%s segment=%d materialization=%s",
+                        req_id,
+                        segment_index,
+                        materialization,
+                    )
+                    _pic_log_cuda_memory(
+                        f"capture_segment_{segment_index}_snapshot_ready",
+                        req_id,
+                        self.device,
+                    )
+                    captured_any = captured_any or materialization is not None
+                    if _pic_trace_enabled():
+                        pool = getattr(
+                            getattr(manager, "pool", None), "free_bytes", None
+                        )
+                        logger.warning(
+                            "[PIC-TRACE] capture request=%s segment=%d "
+                            "length=%d stored=%s handle=%s free_bytes=%s",
+                            req_id,
+                            segment_index,
+                            segment.length,
+                            materialization is not None,
+                            getattr(
+                                materialization, "transition_state_handle", None
+                            ),
+                            pool,
+                        )
+                except Exception:
+                    logger.warning(
+                        "PIC live state capture failed for request %s segment %s; "
+                        "continuing with the ordinary request state",
+                        req_id,
+                        segment_index,
+                        exc_info=True,
+                    )
+            if not captured_any:
+                self._pic_debug(
+                    "capture skipped request=%s completed_end=%d "
+                    "reason=no_transition_or_exact_boundary",
+                    req_id,
+                    completed_end,
+                )
+            _pic_log_cuda_memory("capture_request_end", req_id, self.device)
+
+    def _restore_pic_states(self) -> None:
+        """Restore matched PIC state into the current request's live blocks."""
+        manager = self.pic_live_capture
+        self._pic_debug(
+            "restore check manager=%s restore_live=%s pp_world=%s requests=%d",
+            manager is not None,
+            self.vllm_config.pic_config.restore_live,
+            get_pp_group().world_size,
+            len(self.input_batch.req_ids),
+        )
+        if (
+            manager is None
+            or not self.vllm_config.pic_config.restore_live
+            or get_pp_group().world_size != 1
+        ):
+            return
+
+        for req_id in self.input_batch.req_ids:
+            request_state = self.requests.get(req_id)
+            if (
+                request_state is None
+                or not request_state.pic_enabled
+                or not request_state.pic_segments
+                or request_state.pic_cache_plan is None
+            ):
+                continue
+
+            self._pic_debug(
+                "restore candidate request=%s matches=%s",
+                req_id,
+                [(i, e.seg_hash[:12]) for i, e in request_state.pic_cache_plan.matches],
+            )
+            for segment_index, entry in request_state.pic_cache_plan.matches:
+                if segment_index >= len(request_state.pic_segments):
+                    continue
+                segment = request_state.pic_segments[segment_index]
+                self._pic_debug(
+                    "restore entry request=%s segment=%d range=[%d,%d) "
+                    "recurrent=%s conv_tail=%s full_kv=%s",
+                    req_id,
+                    segment_index,
+                    segment.start,
+                    segment.end,
+                    entry.recurrent_state_handle,
+                    entry.conv_tail_handle,
+                    entry.full_kv_handles,
+                )
+                try:
+                    restore_matched_mamba_segment(
+                        manager,
+                        request_id=req_id,
+                        segment_index=segment_index,
+                        segment=segment,
+                        entry=entry,
+                        request_state=request_state,
+                        kv_cache_config=self.kv_cache_config,
+                        forward_context=(
+                            self.compilation_config.static_forward_context
+                        ),
+                    )
+                    self._pic_debug(
+                        "restore result request=%s segment=%d status=success",
+                        req_id,
+                        segment_index,
+                    )
+                except Exception:
+                    logger.warning(
+                        "PIC live state restore failed for request %s segment %s; "
+                        "continuing with the ordinary request state",
+                        req_id,
+                        segment_index,
+                        exc_info=True,
+                    )
+
+    def _build_pic_kv_targets(
+        self, req_index: int, segment: "PICSegment"
+    ) -> list[PICKVLayerTarget]:
+        """Build existing vLLM KV-cache targets for one PIC segment."""
+        targets: list[PICKVLayerTarget] = []
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not isinstance(group.kv_cache_spec, AttentionSpec):
+                continue
+            if isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+
+            block_table = self.input_batch.block_table[group_id]
+            if block_table.pcp_world_size != 1 or block_table.dcp_world_size != 1:
+                raise ValueError("PIC KV copy-back currently requires single-rank KV")
+            num_blocks = int(block_table.num_blocks_per_row[req_index])
+            block_ids = block_table.get_numpy_array()[req_index, :num_blocks]
+            slot_mapping = build_kv_slot_mapping(
+                block_ids,
+                block_size=block_table.block_size,
+                token_start=0,
+                token_end=segment.length,
+                device=self.device,
+            )
+
+            for layer_name in group.layer_names:
+                layer = self.compilation_config.static_forward_context.get(layer_name)
+                if layer is None or not hasattr(layer, "impl"):
+                    raise ValueError(
+                        f"PIC KV copy-back cannot find attention layer {layer_name}"
+                    )
+                kv_cache = getattr(layer, "kv_cache", None)
+                copy_impl = getattr(layer.impl, "do_kv_cache_update", None)
+                if kv_cache is None or copy_impl is None:
+                    raise ValueError(
+                        f"attention backend for {layer_name} has no KV update path"
+                    )
+
+                def copy_kv(
+                    key: "torch.Tensor",
+                    value: "torch.Tensor",
+                    *,
+                    _impl=copy_impl,
+                    _layer=layer,
+                    _cache=kv_cache,
+                    _slot_mapping=slot_mapping,
+                ) -> None:
+                    _impl(_layer, key, value, _cache, _slot_mapping)
+
+                targets.append(
+                    PICKVLayerTarget(
+                        layer_name=layer_name,
+                        slot_mapping=slot_mapping,
+                        copy_kv=copy_kv,
+                    )
+                )
+        return targets
+
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
     ) -> CachedRequestState:
@@ -1560,6 +5249,17 @@ class GPUModelRunner(
         req_state.prompt_embeds = new_req_data.prompt_embeds
         req_state.sampling_params = new_req_data.sampling_params
         req_state.pooling_params = new_req_data.pooling_params
+        req_state.pic_enabled = new_req_data.pic_enabled
+        req_state.pic_segments = new_req_data.pic_segments
+        req_state.pic_cache_plan = new_req_data.pic_cache_plan
+        req_state.pic_execution_plan = new_req_data.pic_execution_plan
+        req_state.pic_public_block_ids = new_req_data.pic_public_block_ids
+        (
+            req_state.pic_worker_plan,
+            req_state.pic_worker_fallback,
+        ) = self._build_pic_worker_plan(new_req_data)
+        with record_function_or_nullcontext("pic:plan_apply"):
+            self._set_pic_runtime_plan(req_state)
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
@@ -3697,6 +7397,104 @@ class GPUModelRunner(
             **model_kwargs,
         )
 
+    def _pic_profiled_model_forward(
+        self,
+        *,
+        mode: str,
+        request_ids: Sequence[str],
+        prefill_tokens: int,
+        decode_tokens: int,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **model_kwargs: dict[str, Any],
+    ) -> Any:
+        """Run one model forward and optionally profile its real GPU time.
+
+        PIC import/transition timing is intentionally kept separate from this
+        helper.  ``prefill_tokens`` counts only tokens that enter the model;
+        reused PIC tokens must be reported by the caller as zero here.
+        """
+        profile = _pic_forward_profile_enabled()
+        if not profile:
+            return self._model_forward(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **model_kwargs,
+            )
+
+        # Profiling needs a synchronize on both sides of the call, otherwise the
+        # measured interval only covers kernel launch; this is why a profiling
+        # run's wall-clock numbers are not comparable to a production run.
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        start = time.perf_counter()
+        output = self._model_forward(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **model_kwargs,
+        )
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        if prefill_tokens and decode_tokens:
+            phase = "mixed"
+        elif prefill_tokens:
+            phase = "prefill"
+        elif decode_tokens:
+            phase = "decode"
+        else:
+            phase = "other"
+        logger.warning(
+            "[PIC-PROFILE] forward request=%s mode=%s phase=%s "
+            "prefill_tokens=%d decode_tokens=%d forward_tokens=%d "
+            "forward_ms=%.3f",
+            ",".join(str(req_id) for req_id in request_ids),
+            mode,
+            phase,
+            int(prefill_tokens),
+            int(decode_tokens),
+            int(prefill_tokens + decode_tokens),
+            elapsed_ms,
+        )
+        return output
+
+    def _pic_forward_token_split(
+        self,
+        request_ids: Sequence[str],
+        num_scheduled_tokens: Mapping[str, int],
+    ) -> tuple[int, int]:
+        """Split one ordinary forward into prompt and decode token counts."""
+        prefill_tokens = 0
+        decode_tokens = 0
+        for request_id in request_ids:
+            req_index = self.input_batch.req_id_to_index[request_id]
+            scheduled = max(0, int(num_scheduled_tokens[request_id]))
+            state = self.requests.get(request_id)
+            if state is not None:
+                # The request carries both counters as Python ints. Indexing the batch
+                # arrays here read device scalars, which cost a synchronising DtoH copy
+                # per request per forward - on the critical path of this very counter.
+                computed = max(0, int(state.num_computed_tokens))
+                prompt_tokens = max(0, int(state.num_prompt_tokens))
+            else:
+                computed = max(
+                    0, int(self.input_batch.num_computed_tokens_cpu[req_index])
+                )
+                prompt_tokens = max(
+                    0, int(self.input_batch.num_prompt_tokens[req_index])
+                )
+            prompt_part = min(scheduled, max(0, prompt_tokens - computed))
+            prefill_tokens += prompt_part
+            decode_tokens += scheduled - prompt_part
+        return prefill_tokens, decode_tokens
+
     @staticmethod
     def _is_uniform_decode(
         max_num_scheduled_tokens: int,
@@ -3957,11 +7755,20 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        timeline_profile = _pic_detail_profile_enabled()
+        timeline_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+        timeline_request_ids = _pic_profile_request_ids(scheduler_output)
+        timeline_mode = "unknown"
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+
+        # HYPIC/PIC: inspect imports started on a previous step, then start the
+        # ones this step announces.  Inspecting here is safe: the previous step's
+        # forward has already been launched, so a parked import never blocks it.
+        self._pic_async_import_step(scheduler_output)
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
@@ -3989,12 +7796,30 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.entry_and_input_prep_sync",
+                device=self.device,
+            )
             # Update persistent batch states.
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.update_states",
+                device=self.device,
+            )
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4018,8 +7843,11 @@ class GPUModelRunner(
                     # is called into to avoid out of sync issues.
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
-                    # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
+                    # Return empty ModelRunnerOutput if no work to do.  Parked PIC
+                    # imports may have finished on this very step, so carry their
+                    # verdicts through: without this the scheduler never learns
+                    # that the request is ready and the request stays parked.
+                    return self._pic_with_import_reports(EMPTY_MODEL_RUNNER_OUTPUT)
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
             if self.cache_config.kv_sharing_fast_prefill:
@@ -4031,16 +7859,58 @@ class GPUModelRunner(
 
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
+            for req_id in req_ids:
+                request_state = self.requests.get(req_id)
+                if request_state is not None and request_state.pic_enabled:
+                    _pic_log_cuda_memory("execute_model_ready", req_id, self.device)
+            timeline_request_ids = ",".join(str(req_id) for req_id in req_ids)
+            timeline_mode = (
+                "pic"
+                if any(
+                    self.requests[req_id].pic_enabled
+                    for req_id in req_ids
+                    if req_id in self.requests
+                )
+                else "full"
+            )
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
+            # Native PIC block-table attachment is request-local and must be
+            # complete before _prepare_inputs computes slot_mapping.
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+            with record_function_or_nullcontext("pic:slot_attach"):
+                self._attach_pic_native_slots()
+            self._validate_pic_decode_bindings(scheduler_output)
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.pic_slot_attach",
+                device=self.device,
+            )
+
+            pic_runtime_result: dict[str, Any] | None = None
+            pic_transition_capture: PICGDNTransitionCapture | None = None
+
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.prepare_inputs",
+                device=self.device,
+            )
 
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
@@ -4086,6 +7956,14 @@ class GPUModelRunner(
                 num_reqs_padded,
                 self.parallel_config.num_ubatches,
             )
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.schedule_and_padding",
+                device=self.device,
+            )
 
             logger.debug(
                 "ubatch_slices: %s, ubatch_slices_padded: %s",
@@ -4106,6 +7984,7 @@ class GPUModelRunner(
             )
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
             if self.cache_config.mamba_cache_mode == "align":
                 # preprocess_mamba reads req_state.num_computed_tokens (CPU)
                 # to decide copy operations, so we must apply deferred
@@ -4148,21 +8027,127 @@ class GPUModelRunner(
                         self.requests,
                         self.mamba_state_idx,
                     )
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.mamba_preprocess",
+                device=self.device,
+            )
+
+            # Stage 7-B restores state after vLLM's own state relocation.  It
+            # does not alter attention metadata or select skip/recompute ranges.
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+            self._restore_pic_states()
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.restore_pic_states",
+                device=self.device,
+            )
+
+            # A single-request PIC runtime rebuilds the actual input batch,
+            # slot mapping, attention metadata, and model inputs for each miss
+            # range.  The ordinary preparation below is therefore redundant
+            # on the successful runtime path.  Try the existing narrow runtime
+            # immediately after state restore so a successful request can skip
+            # that discarded preparation.  Keep copy-back out of this fast
+            # path: it is an independent compatibility feature whose side
+            # effects must remain ordered before ordinary execution.
+            early_runtime_start_ns = _pic_profile_phase_start(
+                timeline_profile, self.device
+            )
+            if (
+                num_reqs == 1
+            ):
+                runtime_request = self.requests.get(req_ids[0])
+                if (
+                    runtime_request is not None
+                    and runtime_request.pic_runtime_plan
+                    and runtime_request.num_computed_tokens == 0
+                    and scheduler_output.num_scheduled_tokens.get(req_ids[0], 0)
+                    == runtime_request.num_prompt_tokens
+                ):
+                    try:
+                        with self._pic_inflight_leases((req_ids[0],)), (
+                            record_function_or_nullcontext("pic:ranges")
+                        ):
+                            pic_runtime_result = (
+                                self._run_pic_single_request_ranges(
+                                    scheduler_output,
+                                    runtime_request.pic_runtime_plan,
+                                    intermediate_tensors,
+                                )
+                            )
+                        self._pic_debug(
+                            "single-request early runtime executed miss ranges=%s",
+                            [
+                                (item.start, item.end)
+                                for item in runtime_request.pic_runtime_plan.recompute_ranges
+                            ],
+                        )
+                    except PICWorkerUnsupported as exc:
+                        self._disable_pic_runtime(
+                            runtime_request, "single_runtime_unsupported"
+                        )
+                        runtime_request.pic_worker_fallback = True
+                        logger.warning(
+                            "PIC Stage 9-A early runtime unavailable for request %s: %s; "
+                            "continuing with ordinary preparation",
+                            req_ids[0],
+                            exc,
+                        )
+            if pic_runtime_result is None:
+                # The fast path has five entry conditions and used to fall through
+                # silently, so a batch that never entered it looked exactly like a plan
+                # without reuse: no ranges ran, and every reuse counter stayed at zero.
+                self._pic_debug(
+                    "pic path skipped request=%s reasons=%s",
+                    req_ids[0] if req_ids else "-",
+                    self._pic_entry_skip_reasons(scheduler_output, req_ids, num_reqs),
+                )
+            _pic_profile_phase_end(
+                timeline_profile,
+                early_runtime_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.pic_runtime_early",
+                device=self.device,
+            )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update
-                else num_tokens_unpadded,
-                num_reqs_padded=(
-                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
-                ),
-                num_tokens_unpadded=num_tokens_unpadded,
-                ubatch_slices=ubatch_slices_padded,
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+            slot_mappings_by_group, slot_mappings = (
+                self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded
+                    if pad_attn or has_separate_kv_update
+                    else num_tokens_unpadded,
+                    num_reqs_padded=(
+                        num_reqs_padded
+                        if pad_attn or has_separate_kv_update
+                        else num_reqs
+                    ),
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_padded,
+                )
+                if pic_runtime_result is None
+                else (None, None)
+            )
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.slot_mapping",
+                device=self.device,
             )
 
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -4177,8 +8162,19 @@ class GPUModelRunner(
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
                 )
+                if pic_runtime_result is None
+                else (None, None)
+            )
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.attention_metadata",
+                device=self.device,
             )
 
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
             (
                 input_ids,
                 inputs_embeds,
@@ -4186,8 +8182,76 @@ class GPUModelRunner(
                 intermediate_tensors,
                 model_kwargs,
                 ec_connector_output,
-            ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
+            ) = (
+                self._preprocess(
+                    scheduler_output, num_tokens_padded, intermediate_tensors
+                )
+                if pic_runtime_result is None
+                else (None, None, None, None, {}, None)
+            )
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.preprocess_inputs",
+                device=self.device,
+            )
+
+            # A Stage 9-A runtime plan has already attached native blocks to
+            # the request-local row.  The range runner below rebuilds the
+            # metadata for each miss range and supplies the final range's
+            # output to the unchanged sampling/bookkeeping code.  For the
+            # early single-request path, the discarded slot/metadata/input
+            # preparation above is skipped; batch and fallback paths retain
+            # the original preparation order.
+            phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+            if num_reqs == 1:
+                runtime_request = self.requests.get(req_ids[0])
+                if (
+                    pic_runtime_result is None
+                    and runtime_request is not None
+                    and runtime_request.pic_runtime_plan
+                    and runtime_request.num_computed_tokens == 0
+                    and scheduler_output.num_scheduled_tokens.get(req_ids[0], 0)
+                    == runtime_request.num_prompt_tokens
+                ):
+                    try:
+                        with self._pic_inflight_leases((req_ids[0],)), (
+                            record_function_or_nullcontext("pic:ranges")
+                        ):
+                            pic_runtime_result = self._run_pic_single_request_ranges(
+                                scheduler_output,
+                                runtime_request.pic_runtime_plan,
+                                intermediate_tensors,
+                            )
+                        self._pic_debug(
+                            "single-request runtime executed miss ranges=%s",
+                            [
+                                (item.start, item.end)
+                                for item in (
+                                    runtime_request.pic_runtime_plan.recompute_ranges
+                                )
+                            ],
+                        )
+                    except PICWorkerUnsupported as exc:
+                        self._disable_pic_runtime(
+                            runtime_request, "single_runtime_unsupported"
+                        )
+                        runtime_request.pic_worker_fallback = True
+                        logger.warning(
+                            "PIC Stage 9-A runtime unavailable for request %s: %s; "
+                            "continuing with ordinary forward",
+                            req_ids[0],
+                            exc,
+                        )
+            _pic_profile_phase_end(
+                timeline_profile,
+                phase_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="execute_model.pic_runtime",
+                device=self.device,
             )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
@@ -4210,32 +8274,107 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+        phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+        if pic_runtime_result is not None:
+            attn_metadata = pic_runtime_result["attn_metadata"]
+            spec_decode_common_attn_metadata = pic_runtime_result[
+                "spec_decode_common_attn_metadata"
+            ]
+            spec_decode_metadata = pic_runtime_result["spec_decode_metadata"]
+            input_ids = pic_runtime_result["input_ids"]
+            inputs_embeds = pic_runtime_result["inputs_embeds"]
+            positions = pic_runtime_result["positions"]
+            intermediate_tensors = pic_runtime_result["intermediate_tensors"]
+            model_kwargs = pic_runtime_result["model_kwargs"]
+            ec_connector_output = pic_runtime_result["ec_connector_output"]
+            cudagraph_mode = pic_runtime_result["cudagraph_mode"]
+            batch_desc = pic_runtime_result["batch_desc"]
+            num_tokens_padded = pic_runtime_result["num_tokens_padded"]
+            num_tokens_across_dp = pic_runtime_result["num_tokens_across_dp"]
+            cudagraph_stats = pic_runtime_result["cudagraph_stats"]
+            slot_mappings = pic_runtime_result["slot_mappings"]
+            logits_indices = pic_runtime_result["logits_indices"]
+            model_output = pic_runtime_result["model_output"]
+            precomputed_logits = pic_runtime_result.get("precomputed_logits")
+            kv_connector_output = None
+        else:
+            precomputed_logits = None
+            if num_reqs == 1:
+                capture_state = self.requests[req_ids[0]]
+                capture_plan = capture_state.pic_cache_plan
+                # A request that is reusing segments publishes nothing: it applies a transition
+                # someone else recorded, and this step does not compute those tokens at all. Capturing
+                # here described a transition over rows the step never wrote, which came out
+                # non-finite and took the engine down. A first-seen document has no reused segments
+                # and is captured exactly as before - that capture is what publication is built from.
+                if capture_plan is None or not capture_plan.reused_segments:
+                    pic_transition_capture = self._build_pic_transition_capture(
+                        capture_state,
+                        # How many tokens this step actually forwards.
+                        max_tokens=num_tokens_unpadded,
+                    )
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                    additional_kwargs=(
+                        {"pic_transition_capture": pic_transition_capture}
+                        if pic_transition_capture is not None
+                        else None
+                    ),
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=defer_kv_connector_finalize,
+                ) as kv_connector_output,
+            ):
+                self.pic_metrics.record_forward(
+                    kind="ordinary",
+                    token_count=num_tokens_unpadded,
+                    request_count=num_reqs,
+                )
+                prefill_tokens, decode_tokens = self._pic_forward_token_split(
+                    req_ids,
+                    scheduler_output.num_scheduled_tokens,
+                )
+                mode = (
+                    "pic"
+                    if any(self.requests[req_id].pic_enabled for req_id in req_ids)
+                    else "full"
+                )
+                model_output = self._pic_profiled_model_forward(
+                    mode=mode,
+                    request_ids=tuple(req_ids),
+                    prefill_tokens=prefill_tokens,
+                    decode_tokens=decode_tokens,
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+        _pic_profile_phase_end(
+            timeline_profile,
+            phase_start_ns,
+            request_ids=timeline_request_ids,
+            mode=timeline_mode,
+            stage="execute_model.forward_dispatch",
+            device=self.device,
+        )
+        for req_id in req_ids:
+            request_state = self.requests.get(req_id)
+            if request_state is not None and request_state.pic_enabled:
+                _pic_log_cuda_memory("forward_dispatch_complete", req_id, self.device)
 
+        phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4264,7 +8403,11 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                logits = (
+                    precomputed_logits
+                    if precomputed_logits is not None
+                    else self.model.compute_logits(sample_hidden_states)
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4283,7 +8426,11 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    logits = (
+                        precomputed_logits
+                        if precomputed_logits is not None
+                        else self.model.compute_logits(sample_hidden_states)
+                    )
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -4294,7 +8441,16 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+        _pic_profile_phase_end(
+            timeline_profile,
+            phase_start_ns,
+            request_ids=timeline_request_ids,
+            mode=timeline_mode,
+            stage="execute_model.postprocess",
+            device=self.device,
+        )
 
+        phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4313,6 +8469,22 @@ class GPUModelRunner(
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
+        _pic_profile_phase_end(
+            timeline_profile,
+            phase_start_ns,
+            request_ids=timeline_request_ids,
+            mode=timeline_mode,
+            stage="execute_model.state_finalize",
+            device=self.device,
+        )
+        _pic_profile_phase_end(
+            timeline_profile,
+            timeline_start_ns,
+            request_ids=timeline_request_ids,
+            mode=timeline_mode,
+            stage="execute_model.total",
+            device=self.device,
+        )
 
         return None
 
@@ -4351,6 +8523,14 @@ class GPUModelRunner(
             cudagraph_stats,
             slot_mappings,
         ) = self.execute_model_state
+        timeline_profile = _pic_detail_profile_enabled()
+        timeline_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+        timeline_request_ids = _pic_profile_request_ids(scheduler_output)
+        timeline_mode = "pic" if any(
+            self.requests[request_id].pic_enabled
+            for request_id in scheduler_output.num_scheduled_tokens
+            if request_id in self.requests
+        ) else "full"
         # Clear ephemeral state.
         self.execute_model_state = None
 
@@ -4360,11 +8540,40 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        _pic_profile_phase_end(
+            timeline_profile,
+            phase_start_ns,
+            request_ids=timeline_request_ids,
+            mode=timeline_mode,
+            stage="sample_tokens.sample",
+            device=self.device,
+        )
 
+        phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
+        )
+        _pic_profile_phase_end(
+            timeline_profile,
+            phase_start_ns,
+            request_ids=timeline_request_ids,
+            mode=timeline_mode,
+            stage="sample_tokens.update_states",
+            device=self.device,
+        )
+
+        phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
+        self._capture_completed_pic_states(scheduler_output)
+        _pic_profile_phase_end(
+            timeline_profile,
+            phase_start_ns,
+            request_ids=timeline_request_ids,
+            mode=timeline_mode,
+            stage="sample_tokens.capture_pic_states",
+            device=self.device,
         )
         if self.use_async_scheduling:
             pp = get_pp_group()
@@ -4477,6 +8686,7 @@ class GPUModelRunner(
                 self._draft_prob_req_ids = None
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
+        phase_start_ns = _pic_profile_phase_start(timeline_profile, self.device)
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -4493,6 +8703,14 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+        _pic_profile_phase_end(
+            timeline_profile,
+            phase_start_ns,
+            request_ids=timeline_request_ids,
+            mode=timeline_mode,
+            stage="sample_tokens.bookkeep",
+            device=self.device,
+        )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4507,6 +8725,8 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
+
+        self._pic_debug("metrics snapshot=%s", self.get_pic_metrics())
 
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
@@ -4526,7 +8746,22 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                pic_materializations=(
+                    self.pic_live_capture.take_pending()
+                    if self.pic_live_capture is not None
+                    else []
+                ),
+                pic_finished_imports=tuple(
+                    getattr(self, "_pic_import_reports", ([], []))[0]
+                ),
+                pic_failed_imports=tuple(
+                    getattr(self, "_pic_import_reports", ([], []))[1]
+                ),
             )
+        reports = getattr(self, "_pic_import_reports", None)
+        if reports is not None:
+            reports[0].clear()
+            reports[1].clear()
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:
@@ -4538,6 +8773,14 @@ class GPUModelRunner(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
+            _pic_profile_phase_end(
+                timeline_profile,
+                timeline_start_ns,
+                request_ids=timeline_request_ids,
+                mode=timeline_mode,
+                stage="sample_tokens.total",
+                device=self.device,
+            )
             return output
 
         with record_function_or_nullcontext(
@@ -4584,6 +8827,15 @@ class GPUModelRunner(
                 async_output.sampled_token_ids_cpu,
                 async_output.async_copy_ready_event,
             )
+
+        _pic_profile_phase_end(
+            timeline_profile,
+            timeline_start_ns,
+            request_ids=timeline_request_ids,
+            mode=timeline_mode,
+            stage="sample_tokens.total",
+            device=self.device,
+        )
 
         return async_output
 
@@ -6221,6 +10473,9 @@ class GPUModelRunner(
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
+        if self.pic_live_capture is not None:
+            self.pic_live_capture.clear()
+        self.pic_lease_registry.clear()
         self.compilation_config.static_forward_context.clear()
         self.model = None  # type: ignore[assignment]
         _ROPE_DICT.clear()
@@ -7170,6 +11425,8 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        if not is_profiling:
+            self._initialize_pic_mooncake()
 
         if (
             self.speculative_config
@@ -7190,6 +11447,82 @@ class GPUModelRunner(
             else:
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+
+        # Stage 9-A's first executable backend is deliberately restricted to
+        # single-rank eager execution.  A model may advertise multimodal
+        # support, but the request-level gate above keeps actual image/video
+        # requests on the ordinary path.
+        pic_config = self.vllm_config.pic_config
+        hybrid_state_supported = not self.kv_cache_config.has_mamba_layers or (
+            self.pic_live_capture is not None
+            and pic_config.restore_live
+            and pic_config.max_cache_bytes is not None
+        )
+        capability_reasons: list[str] = []
+        if not pic_config.zero_copy:
+            capability_reasons.append("zero_copy_disabled")
+        if not pic_config.single_request:
+            capability_reasons.append("runtime_execution_disabled")
+        if self.speculative_config is not None:
+            capability_reasons.append("speculative_decoding")
+        if self.parallel_config.pipeline_parallel_size != 1:
+            capability_reasons.append("pipeline_parallel")
+        if not hybrid_state_supported:
+            capability_reasons.append("hybrid_state_restore_unavailable")
+        if self.is_pooling_model:
+            capability_reasons.append("pooling_model")
+        if len(kernel_block_sizes) != len(self.kv_cache_config.kv_cache_groups):
+            capability_reasons.append("kv_group_kernel_size_count_mismatch")
+
+        attention_block_layouts: list[tuple[int, int, int]] = []
+        for group_id, (kernel_block_size, group) in enumerate(
+            zip(kernel_block_sizes, self.kv_cache_config.kv_cache_groups)
+        ):
+            spec = group.kv_cache_spec
+            if not isinstance(spec, AttentionSpec) or isinstance(
+                spec, EncoderOnlyAttentionSpec
+            ):
+                continue
+            allocator_block_size = int(spec.block_size)
+            kernel_block_size = int(kernel_block_size)
+            if kernel_block_size <= 0 or allocator_block_size % kernel_block_size != 0:
+                capability_reasons.append(f"group_{group_id}_kernel_block_not_divisor")
+            attention_block_layouts.append(
+                (
+                    group_id,
+                    allocator_block_size,
+                    kernel_block_size,
+                )
+            )
+
+        runtime_supported = not capability_reasons
+        self.pic_worker_capabilities = PICWorkerCapabilities(
+            range_execution_supported=runtime_supported,
+            zero_copy_attention_supported=runtime_supported,
+            native_kv_bridge_supported=runtime_supported,
+            single_request_execution_supported=(
+                runtime_supported and pic_config.single_request
+            ),
+        )
+        logger.info(
+            "PIC Stage 9-A/9-B/10-A capability check: capability=%s reasons=%s "
+            "zero_copy=%s single_request=%s "
+            "spec_decode=%s pp=%s "
+            "hybrid_state_supported=%s model_supports_mm=%s "
+            "model_supports_prompt_embeds=%s pooling=%s "
+            "attention_block_layouts=%s",
+            runtime_supported,
+            capability_reasons or ("none",),
+            pic_config.zero_copy,
+            pic_config.single_request,
+            self.speculative_config is not None,
+            self.parallel_config.pipeline_parallel_size,
+            hybrid_state_supported,
+            self.supports_mm_inputs,
+            self.enable_prompt_embeds,
+            self.is_pooling_model,
+            attention_block_layouts,
+        )
 
     def _get_attention_kv_cache_gid(self) -> int:
         """Find the KV cache group index for attention layers.

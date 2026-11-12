@@ -89,6 +89,11 @@ class KVBlockZeroer:
         self.device = device
         self.pin_memory = pin_memory
         self._meta: tuple[torch.Tensor, int, int, int] | None = None
+        # Mamba/GDN state caches use a different layout from attention KV
+        # caches: each state tensor is indexed directly by the allocator block
+        # ID and has no attention block dimension or backend block mapping.
+        # Keep them separate from the Triton metadata below.
+        self._mamba_caches: tuple[torch.Tensor, ...] = ()
         self._id_cap: int = 0
         self._ids_pinned: torch.Tensor | None = None
         self._ids_gpu: torch.Tensor | None = None
@@ -112,14 +117,41 @@ class KVBlockZeroer:
         PAGE_SIZE_EL accounts for this ratio so that
         ``block_id * PAGE_SIZE_EL`` lands at the correct offset.
 
-        Only AttentionSpec layers are processed; Mamba layers are skipped.
+        Attention layers use the Triton layout. Mamba/GDN layers are kept as
+        direct row-indexed state tensors and are cleared separately.
         """
         seen_ptrs: set[int] = set()
+        mamba_caches: list[torch.Tensor] = []
         seg_addrs: list[int] = []
         page_size_el: int | None = None
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
+            if isinstance(spec, MambaSpec):
+                # MambaSpec stores one or more state tensors per layer, each
+                # shaped as (num_blocks, *state_shape).  The scheduler block
+                # IDs are therefore direct row indices for these tensors.
+                for layer_name in group.layer_names:
+                    if layer_name in runner_only_attn_layers:
+                        continue
+                    state_cache = static_forward_context[layer_name].kv_cache
+                    if isinstance(state_cache, torch.Tensor):
+                        state_tensors = (state_cache,)
+                    elif isinstance(state_cache, (list, tuple)):
+                        state_tensors = tuple(state_cache)
+                    else:
+                        continue
+                    for state_tensor in state_tensors:
+                        if not isinstance(state_tensor, torch.Tensor):
+                            continue
+                        if state_tensor.ndim < 1:
+                            continue
+                        dp = state_tensor.data_ptr()
+                        if dp in seen_ptrs:
+                            continue
+                        seen_ptrs.add(dp)
+                        mamba_caches.append(state_tensor)
+                continue
             if not isinstance(spec, FullAttentionSpec):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
@@ -167,11 +199,21 @@ class KVBlockZeroer:
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
                     seg_addrs.append(dp + off_bytes)
 
-        if not seg_addrs or page_size_el is None:
+        self._mamba_caches = tuple(mamba_caches)
+        if seg_addrs and page_size_el is not None:
+            blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
+            self._meta = (
+                torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+                page_size_el,
+                blk_size,
+                len(seg_addrs),
+            )
+        else:
             self._meta = None
+
+        if self._meta is None and not self._mamba_caches:
             return
 
-        blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
         self._id_cap = 8192
         self._ids_pinned = torch.empty(
             self._id_cap,
@@ -179,18 +221,11 @@ class KVBlockZeroer:
             pin_memory=self.pin_memory,
         )
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            page_size_el,
-            blk_size,
-            len(seg_addrs),
-        )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+        if not block_ids or (self._meta is None and not self._mamba_caches):
             return
-        seg_addrs, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2
@@ -206,15 +241,25 @@ class KVBlockZeroer:
         self._ids_pinned[:n_blocks].numpy()[:] = block_ids
         idx = self._ids_gpu[:n_blocks]
         idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
-        grid = (n_blocks * n_segs * (page_size_el // blk_size),)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            idx,
-            n_blocks,
-            N_SEGS=n_segs,
-            PAGE_SIZE_EL=page_size_el,
-            BLOCK_SIZE=blk_size,
-        )
+        if self._meta is not None:
+            seg_addrs, page_size_el, blk_size, n_segs = self._meta
+            grid = (n_blocks * n_segs * (page_size_el // blk_size),)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                idx,
+                n_blocks,
+                N_SEGS=n_segs,
+                PAGE_SIZE_EL=page_size_el,
+                BLOCK_SIZE=blk_size,
+            )
+
+        # GDN/Mamba state is not represented by the attention Triton layout.
+        # It uses the same allocator block IDs but stores each state block as
+        # one row, so clear every state tensor directly on the current CUDA
+        # stream.  Keeping this after the ID copy preserves ordering with the
+        # attention zero kernel and with the subsequent Mooncake import.
+        for state_cache in self._mamba_caches:
+            state_cache.index_fill_(0, idx, 0)
 
 
 @dataclass

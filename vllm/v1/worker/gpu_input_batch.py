@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
-from dataclasses import dataclass
-from typing import cast
+from dataclasses import dataclass, field
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -16,6 +16,18 @@ from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.collection_utils import swap_dict_values
 from vllm.v1.outputs import LogprobsTensors
+from vllm.v1.pic.cache import PICCachePlan
+from vllm.v1.pic.execution import PICExecutionPlan
+from vllm.v1.pic.lifecycle import PICLeaseToken
+from vllm.v1.pic.native_kv import (
+    PICNativeKVAllocation,
+    PICNativeKVReference,
+    PICNativeKVRequestMapping,
+)
+from vllm.v1.pic.runtime import PICSingleRequestRuntimePlan
+from vllm.v1.pic.segmenter import PICSegment
+from vllm.v1.pic.state import PICRequestStateBinding, PICTransitionOperator
+from vllm.v1.pic.worker_plan import PICWorkerPlan
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import (
     BatchUpdateBuilder,
@@ -62,6 +74,80 @@ class CachedRequestState:
     # for pooling models
     pooling_params: PoolingParams | None = None
     pooling_states: PoolingStates | None = None
+
+    # HYPIC/PIC metadata.  The ordinary input batch ignores these fields; they
+    # are consumed only by a PIC-aware worker execution stage.
+    pic_enabled: bool = False
+    pic_segments: tuple[PICSegment, ...] = ()
+    pic_cache_plan: PICCachePlan | None = None
+    pic_execution_plan: PICExecutionPlan | None = None
+    pic_worker_plan: PICWorkerPlan | None = None
+    pic_runtime_plan: PICSingleRequestRuntimePlan | None = None
+    # Persistent request-local logical-token -> native KV mapping.  This is
+    # rebuilt only when the request's PIC plan changes, not per execute_model
+    # round.
+    pic_native_kv_mapping: PICNativeKVRequestMapping | None = None
+    # Allocation-time ownership records. Public canonical blocks and the
+    # request-private row are kept separate across scheduler row moves.
+    pic_native_kv_allocations: dict[tuple[int, int, int], PICNativeKVAllocation] = (
+        field(default_factory=dict)
+    )
+    # Worker-side references for native public/private allocations. The
+    # scheduler owns the real public BlockPool lease; these tokens protect the
+    # worker request view until finish/fallback/plan refresh.
+    pic_native_kv_leases: dict[tuple[Any, ...], PICLeaseToken] = field(
+        default_factory=dict
+    )
+    # References held while one model-forward/range execution is in flight.
+    pic_inflight_leases: dict[int, PICLeaseToken] = field(default_factory=dict)
+    # Keys of private KV ranges already materialized into the current native
+    # request row.  The physical row IDs are part of each key because vLLM may
+    # reallocate a request after preemption.
+    pic_private_kv_materialized: set[tuple[Any, ...]] = field(default_factory=set)
+    # The block-table row a request attached its native blocks to, plus the mapping it used.
+    # Doc blocks do not move while the request is alive, so a decode step that finds the same
+    # signature has nothing to attach; a resumed or preempted request changes it and re-attaches.
+    pic_native_slots_signature: tuple[Any, ...] | None = None
+    pic_public_block_ids: tuple[tuple[int, int, tuple[int, ...]], ...] = ()
+    # Mooncake object keys published for canonical native KV.  The key is
+    # indexed by (segment index, KV cache group) and is converted to an
+    # external reference only after the object has been written successfully.
+    pic_mooncake_external_keys: dict[tuple[int, int], str] = field(
+        default_factory=dict
+    )
+    pic_mooncake_external_block_sizes: dict[tuple[int, int], int] = field(
+        default_factory=dict
+    )
+    # One serialized hybrid transition object per segment.  The scheduler
+    # carries only this external key; the worker resolves it to a local
+    # transition handle before building the runtime plan.
+    pic_mooncake_transition_keys: dict[int, str] = field(default_factory=dict)
+    # Worker-local imports for external native KV.  Scheduler-owned
+    # PICSegmentEntry objects must remain immutable from the worker side so a
+    # later request can import the same external references again.
+    pic_imported_native_refs: dict[int, tuple[PICNativeKVReference, ...]] = field(
+        default_factory=dict
+    )
+    # Worker-local transition handles corresponding to imported hybrid state.
+    # The scheduler entry carries only the external object key.
+    pic_transition_handles: dict[int, int] = field(default_factory=dict)
+    # Unified request-level native-KV + transition/state transfer lifecycle.
+    # This is populated only while a remote PIC runtime plan is being built.
+    pic_request_transfer: Any | None = None
+    pic_worker_fallback: bool = False
+    # Stage 9-A-1 model-specific operators keyed by PIC segment index.  The
+    # default remains empty; no ordinary vLLM request depends on this field.
+    pic_transition_operators: dict[int, PICTransitionOperator] = field(
+        default_factory=dict
+    )
+    pic_transition_conv_tails: dict[int, tuple[torch.Tensor, ...]] = field(
+        default_factory=dict
+    )
+    # Model-level Stage 9-A-1 validation results. This is diagnostic state;
+    # it is never used to enable skip/recompute by itself.
+    # Request-owned hybrid state and decode cursor. This must not be inferred
+    # from the current InputBatch row because rows move during preemption.
+    pic_state_binding: PICRequestStateBinding | None = None
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
