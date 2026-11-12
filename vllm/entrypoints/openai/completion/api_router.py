@@ -20,6 +20,8 @@ from vllm.entrypoints.utils import (
     with_cancellation,
 )
 from vllm.logger import init_logger
+from vllm.v1.engine.pic_profile import emit as pic_profile_emit
+from vllm.v1.engine.pic_profile import start as pic_profile_start
 
 logger = init_logger(__name__)
 
@@ -44,6 +46,7 @@ def completion(request: Request) -> OpenAIServingCompletion | None:
 @with_cancellation
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
+    request_start_ns = pic_profile_start()
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )
@@ -51,17 +54,50 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     if handler is None:
         raise NotImplementedError("The model does not support Completions API")
 
+    request_id = f"cmpl-{handler._base_request_id(raw_request, request.request_id)}"
+    raw_request.state.pic_profile_request_id = request_id
+    pic_profile_emit(
+        request_id,
+        "unknown",
+        "api.request_received",
+        request_start_ns,
+        request_start_ns,
+    )
+    handler_start_ns = pic_profile_start()
+    handler_create_start_ns = pic_profile_start()
     generator = await handler.create_completion(request, raw_request)
+    pic_profile_emit(
+        request_id,
+        "unknown",
+        "api.handler_create_completion",
+        handler_create_start_ns,
+    )
+    pic_profile_emit(
+        request_id,
+        "unknown",
+        "api.handler_total",
+        handler_start_ns,
+    )
 
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(
+        serialize_start_ns = pic_profile_start()
+        response = JSONResponse(
             content=generator.model_dump(), status_code=generator.error.code
         )
+        pic_profile_emit(
+            request_id, "unknown", "api.response_serialize", serialize_start_ns
+        )
+        return response
     elif isinstance(generator, CompletionResponse):
-        return JSONResponse(
+        serialize_start_ns = pic_profile_start()
+        response = JSONResponse(
             content=generator.model_dump(),
             headers=metrics_header(metrics_header_format),
         )
+        pic_profile_emit(
+            request_id, "unknown", "api.response_serialize", serialize_start_ns
+        )
+        return response
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
 

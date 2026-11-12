@@ -31,11 +31,85 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.v1.engine.pic_profile import emit as pic_profile_emit
+from vllm.v1.engine.pic_profile import start as pic_profile_start
 
 logger = init_logger("vllm.entrypoints.openai.server_utils")
 
 
 GUARDED_PREFIX = ("/v1", "/v2", "/inference")
+
+
+class PICProfileMiddleware:
+    """Measure the HTTP/ASGI boundary when PIC profiling is enabled.
+
+    Route-level timing starts after FastAPI has parsed and validated the
+    request.  This middleware covers the missing outer interval, including
+    decorator scheduling and response delivery.  It is a no-op passthrough
+    unless ``HYPIC_PIC_DEBUG`` is set to a positive value.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    def __call__(self, scope: Scope, receive: Receive, send: Send) -> Awaitable[None]:
+        if scope["type"] != "http":
+            return self.app(scope, receive, send)
+        request_start_ns = pic_profile_start()
+        if request_start_ns == 0:
+            return self.app(scope, receive, send)
+
+        state = scope.setdefault("state", {})
+        fallback_request_id = f"http-{id(scope):x}"
+        response_start_ns: int | None = None
+        response_end_ns: int | None = None
+
+        async def send_with_profile(message: Message) -> None:
+            nonlocal response_start_ns, response_end_ns
+            request_id = state.get("pic_profile_request_id", fallback_request_id)
+            if message["type"] == "http.response.start":
+                response_start_ns = pic_profile_start()
+                pic_profile_emit(
+                    request_id,
+                    "unknown",
+                    "api.asgi_response_start",
+                    response_start_ns,
+                )
+            await send(message)
+            if (
+                message["type"] == "http.response.body"
+                and not message.get("more_body", False)
+            ):
+                response_end_ns = pic_profile_start()
+                if response_start_ns is not None:
+                    pic_profile_emit(
+                        request_id,
+                        "unknown",
+                        "api.asgi_response_write",
+                        response_start_ns,
+                        response_end_ns,
+                    )
+
+        return self._run_profiled(scope, receive, send_with_profile, request_start_ns)
+
+    async def _run_profiled(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        request_start_ns: int,
+    ) -> None:
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            state = scope.setdefault("state", {})
+            request_id = state.get("pic_profile_request_id", f"http-{id(scope):x}")
+            pic_profile_emit(
+                request_id,
+                "unknown",
+                "api.asgi_request_total",
+                request_start_ns,
+            )
 
 
 class AuthenticationMiddleware:

@@ -17,10 +17,12 @@ if TYPE_CHECKING:
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+    from vllm.v1.pic.materialization import PICMaterialization
 else:
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
+    PICMaterialization = object
 
 
 class LogprobsLists(NamedTuple):
@@ -262,6 +264,13 @@ class ModelRunnerOutput:
 
     ec_connector_output: ECConnectorOutput | None = None
 
+    # HYPIC/PIC: request ids whose external import finished on this step.
+    # The scheduler promotes them out of WAITING_FOR_REMOTE_KVS on the next
+    # step; failures are reported through ``pic_failed_imports`` so the request
+    # falls back to a full recompute instead of waiting forever.
+    pic_finished_imports: tuple[str, ...] = ()
+    pic_failed_imports: tuple[str, ...] = ()
+
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
@@ -278,6 +287,10 @@ class ModelRunnerOutput:
     # its slot buffer via ``slot_buffer[slot_mapping] = routing_data``.
     # ``None`` when ``enable_return_routed_experts`` is off.
     routed_experts: RoutedExpertsLists | None = None
+
+    # Worker-owned PIC snapshots returned to the scheduler control plane.
+    # This remains empty until a PIC-aware worker actually materializes state.
+    pic_materializations: list[PICMaterialization] = field(default_factory=list)
 
 
 # ModelRunnerOutput wrapper for async scheduling.

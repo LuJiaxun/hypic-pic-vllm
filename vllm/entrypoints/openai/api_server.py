@@ -33,6 +33,7 @@ from vllm.entrypoints.openai.engine.protocol import GenerationError
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.server_utils import (
+    PICProfileMiddleware,
     engine_error_handler,
     exception_handler,
     generation_error_handler,
@@ -302,6 +303,10 @@ def build_app(
             raise ValueError(
                 f"Invalid middleware {middleware}. Must be a function or a class."
             )
+
+    # Keep the HTTP boundary visible in the opt-in PIC timeline. The
+    # middleware is a direct passthrough when detail profiling is disabled.
+    app.add_middleware(PICProfileMiddleware)
 
     app = sagemaker_standards_bootstrap(app)
     return app

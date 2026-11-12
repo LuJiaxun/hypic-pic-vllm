@@ -68,6 +68,9 @@ from vllm.v1.engine import (
     UtilityResult,
 )
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
+from vllm.v1.engine.pic_profile import emit as pic_profile_emit
+from vllm.v1.engine.pic_profile import mode_for_requests as pic_profile_modes
+from vllm.v1.engine.pic_profile import start as pic_profile_start
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
@@ -436,22 +439,59 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        scheduler_start_ns = pic_profile_start()
         scheduler_output = self.scheduler.schedule()
+        request_ids = tuple(scheduler_output.num_scheduled_tokens.keys())
+        scheduler_requests = getattr(self.scheduler, "requests", {})
+        requests = [
+            scheduler_requests[req_id]
+            for req_id in request_ids
+            if req_id in scheduler_requests
+        ]
+        request_ids_text = ",".join(request_ids)
+        pic_profile_emit(
+            request_ids_text,
+            pic_profile_modes(requests),
+            "engine.scheduler_step",
+            scheduler_start_ns,
+        )
+
+        execute_start_ns = pic_profile_start()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        pic_profile_emit(
+            request_ids_text,
+            pic_profile_modes(requests),
+            "engine.execute_model_entry",
+            execute_start_ns,
+        )
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            wait_start_ns = pic_profile_start()
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+        pic_profile_emit(
+            request_ids_text,
+            pic_profile_modes(requests),
+            "engine.execute_model_wait",
+            wait_start_ns,
+        )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        update_start_ns = pic_profile_start()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        pic_profile_emit(
+            request_ids_text,
+            pic_profile_modes(requests),
+            "engine.scheduler_update_from_output",
+            update_start_ns,
         )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -494,11 +534,33 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            scheduler_start_ns = pic_profile_start()
             scheduler_output = self.scheduler.schedule()
+            request_ids = tuple(scheduler_output.num_scheduled_tokens.keys())
+            scheduler_requests = getattr(self.scheduler, "requests", {})
+            requests = [
+                scheduler_requests[req_id]
+                for req_id in request_ids
+                if req_id in scheduler_requests
+            ]
+            request_ids_text = ",".join(request_ids)
+            pic_profile_emit(
+                request_ids_text,
+                pic_profile_modes(requests),
+                "engine.scheduler_step",
+                scheduler_start_ns,
+            )
+            execute_start_ns = pic_profile_start()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            pic_profile_emit(
+                request_ids_text,
+                pic_profile_modes(requests),
+                "engine.execute_model_entry",
+                execute_start_ns,
+            )
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -540,22 +602,44 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        request_ids = tuple(scheduler_output.num_scheduled_tokens.keys())
+        scheduler_requests = getattr(self.scheduler, "requests", {})
+        requests = [
+            scheduler_requests[req_id]
+            for req_id in request_ids
+            if req_id in scheduler_requests
+        ]
+        request_ids_text = ",".join(request_ids)
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            wait_start_ns = pic_profile_start()
             model_output = future.result()
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        pic_profile_emit(
+            request_ids_text,
+            pic_profile_modes(requests),
+            "engine.execute_model_wait",
+            wait_start_ns,
+        )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        update_start_ns = pic_profile_start()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
+        )
+        pic_profile_emit(
+            request_ids_text,
+            pic_profile_modes(requests),
+            "engine.scheduler_update_from_output",
+            update_start_ns,
         )
 
         # NOTE(nick): We can either handle the deferred tasks here or save

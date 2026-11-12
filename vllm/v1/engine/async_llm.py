@@ -43,6 +43,10 @@ from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.engine.pic_profile import emit as pic_profile_emit
+from vllm.v1.engine.pic_profile import enabled as pic_profile_enabled
+from vllm.v1.engine.pic_profile import mode_for_request as pic_profile_mode
+from vllm.v1.engine.pic_profile import start as pic_profile_start
 from vllm.v1.executor import Executor
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
@@ -300,6 +304,9 @@ class AsyncLLM(EngineClient):
         if self.errored:
             raise EngineDeadError()
 
+        profile = pic_profile_enabled()
+        input_start_ns = pic_profile_start(profile)
+
         is_pooling = isinstance(params, PoolingParams)
 
         if (
@@ -367,6 +374,13 @@ class AsyncLLM(EngineClient):
 
         self.input_processor.assign_request_id(request)
 
+        pic_profile_emit(
+            request.request_id,
+            pic_profile_mode(request),
+            "engine.input_processor_total",
+            input_start_ns,
+        )
+
         # We start the output_handler on the first call to add_request() so
         # we can call __init__ before the event loop, which enables us
         # to handle startup failure gracefully in the OpenAI server.
@@ -409,7 +423,14 @@ class AsyncLLM(EngineClient):
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
+        enqueue_start_ns = pic_profile_start()
         await self.engine_core.add_request_async(request)
+        pic_profile_emit(
+            request.request_id,
+            pic_profile_mode(request),
+            "engine.scheduler_enqueue",
+            enqueue_start_ns,
+        )
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
@@ -555,6 +576,9 @@ class AsyncLLM(EngineClient):
         """
 
         q: RequestOutputCollector | None = None
+        request_start_ns = pic_profile_start()
+        detail_profile = pic_profile_enabled()
+        stream_start_ns = pic_profile_start(detail_profile)
         try:
             q = await self.add_request(
                 request_id,
@@ -569,6 +593,12 @@ class AsyncLLM(EngineClient):
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
             )
+            pic_profile_emit(
+                q.request_id,
+                "unknown",
+                "engine.generate_add_request",
+                request_start_ns,
+            )
 
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
@@ -576,7 +606,17 @@ class AsyncLLM(EngineClient):
             while not finished:
                 # Note: drain queue without await if possible (avoids
                 # task switching under load which helps performance).
-                out = q.get_nowait() or await q.get()
+                if detail_profile:
+                    output_wait_start_ns = pic_profile_start(True)
+                    out = q.get_nowait() or await q.get()
+                    pic_profile_emit(
+                        q.request_id,
+                        "unknown",
+                        "engine.request_output_wait",
+                        output_wait_start_ns,
+                    )
+                else:
+                    out = q.get_nowait() or await q.get()
 
                 # Note: both OutputProcessor and EngineCore handle their
                 # own request cleanup based on finished.
@@ -632,6 +672,12 @@ class AsyncLLM(EngineClient):
             raise EngineGenerateError() from e
         finally:
             if q is not None:
+                pic_profile_emit(
+                    q.request_id,
+                    "unknown",
+                    "engine.generate_stream_total",
+                    stream_start_ns,
+                )
                 q.close()
 
     def _run_output_handler(self):
@@ -657,7 +703,17 @@ class AsyncLLM(EngineClient):
             try:
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
+                    output_wait_start_ns = pic_profile_start()
                     outputs = await engine_core.get_output_async()
+                    output_req_ids = ",".join(
+                        output.request_id for output in outputs.outputs
+                    )
+                    pic_profile_emit(
+                        output_req_ids,
+                        "unknown",
+                        "engine.get_output",
+                        output_wait_start_ns,
+                    )
                     num_outputs = len(outputs.outputs)
 
                     iteration_stats = (
@@ -672,8 +728,15 @@ class AsyncLLM(EngineClient):
                         end = start + chunk_size
                         outputs_slice = engine_core_outputs[start:end]
                         # 2) Process EngineCoreOutputs.
+                        process_start_ns = pic_profile_start()
                         processed_outputs = output_processor.process_outputs(
                             outputs_slice, outputs.timestamp, iteration_stats
+                        )
+                        pic_profile_emit(
+                            ",".join(output.request_id for output in outputs_slice),
+                            "unknown",
+                            "engine.output_processor",
+                            process_start_ns,
                         )
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
