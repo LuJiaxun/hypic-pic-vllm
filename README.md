@@ -1,110 +1,186 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# Hybrid-Attention PIC for vLLM
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+Position-independent caching (PIC) for hybrid attention + recurrent models on
+top of **vLLM 0.22.1**.
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+Prefix caching requires a cached segment to sit at the position it was cached
+at. PIC removes that requirement: a prompt splits at `<<PIC_SEP>>`, and each
+segment's **KV** and its **GDN recurrent state** are reused across requests even
+when the segment lands at a different offset. Ordinary requests keep running on
+the native vLLM path, untouched.
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+## Relationship to the original HYPIC implementation
 
----
+The design is informed by the
+[original HYPIC implementation for SGLang](https://github.com/redai-studio/HYPIC).
+This is an independent vLLM implementation: the PIC ideas are adapted to vLLM's
+scheduler, GPU worker, native KV pool, block table and attention metadata rather
+than reusing the SGLang runtime.
 
-## About
+这是基于 vLLM 0.22.1 的 HYPIC PIC 实现，面向混合注意力（注意力 + GDN/Mamba
+递推）模型提供**位置无关**的 segment 复用；普通请求仍走 vLLM 原生路径。
+设计参考 [SGLang 版 HYPIC](https://github.com/redai-studio/HYPIC)，但代码是
+重新适配到 vLLM 的 scheduler / worker / native KV pool / block table /
+attention metadata，不是移植。
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+## How it works
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
+Two mechanisms, one per half of a hybrid model:
 
-vLLM is fast with:
+- **Attention KV.** Cached keys are re-rotated to the new positions, and the
+  segment's blocks are mapped onto the new request's native KV slots. The
+  numbering is defined once and shared by the exporter and the importer
+  (`vllm/v1/pic/kv_slots.py`), so the attention kernel never sees a second
+  cache layout.
+- **Recurrent state.** A recurrent layer's output state is an affine function of
+  its input state, so one segment reduces to **one matrix plus a bias**
+  (`state @ M + c`). The matrix comes from the model's own prefill kernel
+  (`chunk_gated_delta_rule_fwd_h`); reuse is a single matmul. No custom kernel
+  and no hand-written recurrence.
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
+Segments travel between processes through **Mooncake**, published under a key
+derived from their tokens. The import overlaps the request's wait instead of
+blocking the step it was scheduled with, and a failed validation never
+publishes — a wrong transition must not spread.
 
-vLLM is flexible and easy to use with:
+## Highlights
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
+- Non-prefix segment reuse: a segment cached at one offset is reused at another.
+- Native vLLM KV slots and attention metadata; no external KV view for the kernel.
+- GDN recurrent state carried as a linear operator produced by the model's own kernel.
+- Publication span == reuse window (`[seam, length-1)`), so the two can never drift.
+- Mooncake-backed store with async import while the request waits.
+- Fail-closed everywhere: no recorded backend means an exception, not a silent fallback.
 
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
+## Validation snapshot
 
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
+Measured on 2× RTX 4090 (24 GB), Qwen3.5-2B, Mooncake 0.3.10, eager, one server
+publishes and one reuses. Shape B (`system <<PIC_SEP>> doc <<PIC_SEP>> query`),
+document of 6976 tokens, five rounds with the first discarded.
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+| Metric (c=4) | PIC on | PIC off |
+| --- | ---: | ---: |
+| Throughput (req/s) | **5.90** | 4.40 |
+| Wall for 20 requests (ms) | **3387** | 4578 |
+| p50 latency (ms) | 617 | 959 |
+| p95 latency (ms) | 878 | — |
 
-## Getting Started
+**+34% throughput** at c=4. Cross-check: `4578/3387 = 1.35` and `5.90/4.40 =
+1.34`, so wall and throughput agree.
 
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
+| Correctness | Result |
+| --- | --- |
+| Shapes a / b / c, nine criteria each | all pass |
+| Semantic answer (shape c) | the word only the reused documents contain |
+| `fallback_reasons` | `{}` on every request |
+| Reuse alignment | 49/49 exact ranges |
+
+PIC trades single-request latency for throughput: at c=1 the p50 is 367 ms
+against 294 ms without PIC, because a lone request pays the import and the
+matmul without anything to amortise them over. **PIC is a throughput feature.**
+
+## Quick start
+
+Start a Mooncake master, point the servers at it, then two servers — one that
+publishes, one that reuses:
 
 ```bash
-uv pip install vllm
+# a store, and a config file that names it
+mooncake_master --rpc_port 50088 --client_ttl 3600 &
+export MOONCAKE_CONFIG_PATH=/path/to/mooncake_config.json
+
+# publisher on GPU 0
+CUDA_VISIBLE_DEVICES=0 vllm serve /path/to/Qwen3.5-2B \
+  --served-model-name qwen3.5-2b --port 8000 \
+  --max-model-len 8192 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.5 --enforce-eager \
+  --no-enable-prefix-caching \
+  --pic-enable --pic-max-cache-bytes 4294967296 --pic-min-segment-tokens 512
 ```
 
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
+The same command on GPU 1 with `--port 8001` is the reusing server. **One switch
+is enough**: the bridge, the per-range loop, capture/restore, the external
+store and the async import all follow `--pic-enable`. The two numbers are
+deployment choices and are stated out loud.
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+Publish by sending the segment once; reuse by sending a prompt that contains it:
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+```bash
+# publish: the document enclosed by separators
+curl -s localhost:8000/v1/completions -H 'Content-Type: application/json' \
+  -d "{\"model\":\"qwen3.5-2b\",\"prompt\":$(jq -Rs . < publish.txt),\"max_tokens\":1}"
 
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
+# reuse: the same document, now behind a system prompt, with a question
+curl -s localhost:8001/v1/chat/completions -H 'Content-Type: application/json' \
+  -d "{\"model\":\"qwen3.5-2b\",\"messages\":[{\"role\":\"user\",\"content\":$(jq -Rs . < reuse.txt)}],
+       \"max_tokens\":32,\"temperature\":0,\"chat_template_kwargs\":{\"enable_thinking\":false}}"
 ```
 
-## Contact Us
+## Test commands
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+Everything the numbers above came from is in this repository; no external script
+is needed.
 
-## Media Kit
+```bash
+# three prompt shapes, nine criteria each, plus a semantic check on the answer
+bash tools/test_all.sh
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+# shape B, five rounds, median of the last four
+bash tools/run_pic_test.sh perf
+
+# the same fixtures, the same hardware, no PIC flags at all
+bash tools/run_pic_test.sh off
+```
+
+Each shape's script starts its own servers, publishes, reuses and judges, so a
+failure names the shape and the criterion:
+
+```text
+PASS A publish-matrix     a transition matrix was published
+PASS A native-kv          native KV blocks were published
+PASS B lookup-hit         the segment was found
+PASS B transition-applied the transition was applied
+PASS B executed           the PIC path ran
+```
+
+## Code map
+
+- `vllm/v1/pic/segmenter.py` — split a prompt at the separator, hash the segments.
+- `vllm/v1/pic/cache.py`, `runtime.py`, `single_request.py` — plan reuse per segment.
+- `vllm/v1/pic/state.py`, `gdn_transition.py` — the recurrent state as an operator.
+- `vllm/v1/pic/native_kv.py`, `kv_slots.py` — rerotation and KV slot mapping.
+- `vllm/v1/pic/mooncake_kv.py`, `async_import.py` — the store and the import.
+- `vllm/v1/worker/gpu_model_runner.py` — the range loop: reuse, recompute, reuse.
+- `vllm/v1/core/sched/scheduler.py` — lookup, reserved blocks, parked imports.
+- `tests/v1/pic/` — unit tests and the committed fixtures (three shapes, 17 files).
+- `docs/` — design notes, verification and measurements.
+
+Design notes and the rules a later change has to keep:
+[docs/hypic_pic_patch_summary.md](docs/hypic_pic_patch_summary.md).
+
+## Scope and limitations
+
+- Single GPU, eager, text-only hybrid models. No CUDA Graph, deliberately.
+- **Throughput, not latency**: c=1 is slower than without PIC.
+- The c=4 tail (p95 ≈ 878 ms) comes from imports being serialised per store
+  connection. Raising the worker count made p50 worse in measurement, so it
+  stays at one.
+- Documents above ~8000 tokens exceed 24 GB at c=4.
+- A failed capture or validation does not publish; that request falls back to a
+  full prefill, which is correct but unreused.
+- This is an independent research branch, not an official vLLM feature, and it
+  is not proposed to the vLLM upstream repository.
+
+## TODO
+
+- Overlap import with forward instead of parking the request.
+- Fuse the transition matmul into the state update where profiling shows it pays.
+- A real RDMA transport for the store; today it is a TCP object store.
+- CUDA Graph for the recompute ranges, once the range loop is stable enough.
+- Multi-request batching for PIC ranges. Two prototypes existed and were removed;
+  the single-request path is the one that is measured.
+
+## License and upstream
+
+The codebase is derived from vLLM 0.22.1 and retains the upstream license and
+notices. See [vllm-project/vllm](https://github.com/vllm-project/vllm).
