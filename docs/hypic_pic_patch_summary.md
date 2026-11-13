@@ -1,8 +1,14 @@
 # PIC patch 说明（vLLM 0.22.1 / cu129）
 
-**Patch**：`hypic-pic-vllm-0221-cu129-stage0-11E-E-C1c-full.patch`
+**Patch**：`hypic-pic-tp-dev-20261113-patchcmd.patch`（纯 unified diff，`patch -p1` 可直接打）
 **Base**：`0decac0d96c42b49572498019f0a0e3600f50398`（= vLLM `v0.22.1`，干净镜像直接打）
-**规模**：171 文件 / `+39757 −126`；代码侧 152 文件 / `+31419 −126`（`vllm` + `tools` + `tests`）
+**规模**：161 文件（134 新建 / 27 修改 / 0 删除）
+
+> 传输形状已经改了：发布与接收都走 store 的 `batch_put/get_from_multi_buffers`，**没有 host staging**。
+> transition 状态是**一个对象、一块设备 slab**。理由与三版实测数据见
+> [`hypic_pic_tp_design.md`](hypic_pic_tp_design.md) 第 9 节。
+>
+> 模型路径与主机名已脱敏：`/path/to/Qwen3.5-2B`、`HOST_A` / `HOST_B`，运行时用 `export PIC_MODEL=...`。
 
 ---
 

@@ -21,14 +21,12 @@ import warnings
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from threading import Lock
 from typing import Any, Protocol
 from weakref import finalize
 
 from vllm.v1.pic.external_kv import PICExternalKVImportRequest
 from vllm.v1.pic.native_kv import (
     PICWindow,
-    register_pending_upload,
     PICKVPositionMode,
     PICNativeKVKind,
     PICNativeKVReference,
@@ -206,15 +204,6 @@ def _pic_payload_checksum_enabled() -> bool:
     return False
 
 
-def _pic_profile_sync(torch_module: Any, device: Any, enabled: bool) -> None:
-    """Synchronize only when import profiling explicitly requests it."""
-    if (
-        not enabled
-        or getattr(device, "type", None) != "cuda"
-        or not torch_module.cuda.is_available()
-    ):
-        return
-    torch_module.cuda.synchronize(device)
 
 
 def connect_mooncake_native_kv_store() -> MooncakeNativeKVObjectStore:
@@ -370,32 +359,10 @@ class PICNativeKVObject:
 
 
 @dataclass(frozen=True)
-class PICNativeKVHostStaging:
-    """One host arena holding every layer payload of a native KV object.
-
-    Produced by the batched Store receive: a single
-    ``batch_get_into_multi_buffers()`` writes all layers into ``arena`` at the
-    offsets in ``layers``.  Materialization uploads the arena once and scatters
-    each layer into its native blocks.
-    """
-
-    arena: Any
-    layers: tuple[tuple[str, int, int], ...]
-    _release: Any = None
-
-    def release(self, event: Any = None) -> None:
-        if self._release is not None:
-            self._release(event)
-            object.__setattr__(self, "_release", None)
-
-
-@dataclass(frozen=True)
 class PICNativeKVReceived:
-    """Native KV payloads received from Mooncake but not yet materialized."""
+    """Native KV payloads received from Mooncake, already in their destination blocks."""
 
     obj: PICNativeKVObject
-    # Batched Store receives land in one host arena and are uploaded once.
-    host_staging: PICNativeKVHostStaging | None = None
 
 
 @dataclass(frozen=True)
@@ -495,6 +462,47 @@ def _thread_upload_stream(torch: Any, device: Any) -> Any:
 # Last upload detail, so callers (and the profile log) can report whether the
 # copy was pinned and how much of the wait was device time.
 _h2d_last_upload: dict[str, Any] = {}
+def _pic_block_span(kv_cache: Any, layout: str | None) -> tuple[int, int] | None:
+    """Physical block geometry, when the blocks sit back to back.
+
+    Returns ``(block_axis, span_elements)`` where ``span_elements`` is one whole block - every axis except
+    the block axis - and ``stride(block_axis)`` equals it. With the cache stored block-major that holds,
+    and a run of consecutive blocks is one contiguous region.
+    """
+    kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
+    span = 1
+    for axis in range(kv_cache.ndim):
+        if axis != block_axis:
+            span *= int(kv_cache.shape[axis])
+    if int(kv_cache.stride(block_axis)) != span:
+        return None
+    return block_axis, span
+
+
+def _pic_flat_run(kv_cache: Any, ids: Sequence[int], layout: str | None) -> Any | None:
+    """A 1-D view over one consecutive run of blocks, or None when the run is not contiguous."""
+    if not ids:
+        return None
+    first = int(ids[0])
+    for offset, block_id in enumerate(ids):
+        if int(block_id) != first + offset:
+            return None
+    geometry = _pic_block_span(kv_cache, layout)
+    if geometry is None:
+        return None
+    block_axis, span = geometry
+    stride = int(kv_cache.stride(block_axis))
+    total = len(ids) * span
+    offset = first * stride
+    storage = kv_cache.untyped_storage()
+    if offset < 0 or offset + total > storage.nbytes() // kv_cache.element_size():
+        return None
+    return _torch().as_strided(
+        kv_cache,
+        size=(total,),
+        stride=(1,),
+        storage_offset=int(kv_cache.storage_offset()) + offset,
+    )
 
 
 def _h2d_on_private_stream(cpu_tensor: Any, device: Any) -> Any:
@@ -576,47 +584,45 @@ def _h2d_on_private_stream(cpu_tensor: Any, device: Any) -> Any:
     return out
 
 
-def _pic_block_span(kv_cache: Any, layout: str | None) -> tuple[int, int] | None:
-    """Physical block geometry, when the blocks sit back to back.
+def _compact_arena_tensor(arena: Any, record: Mapping[str, Any]) -> Any:
+    """Build one zero-copy GPU view of an aligned tensor inside ``arena``.
 
-    Returns ``(block_axis, span_elements)`` where ``span_elements`` is one whole block - every axis except
-    the block axis - and ``stride(block_axis)`` equals it. With the cache stored block-major that holds,
-    and a run of consecutive blocks is one contiguous region.
+    ``arena`` is one device buffer holding the whole compact payload data
+    region.  Every version-4 record offset is 16-byte aligned, so a byte view
+    can be reinterpreted in place instead of paying one H2D copy per tensor.
     """
-    kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
-    span = 1
-    for axis in range(kv_cache.ndim):
-        if axis != block_axis:
-            span *= int(kv_cache.shape[axis])
-    if int(kv_cache.stride(block_axis)) != span:
-        return None
-    return block_axis, span
-
-
-def _pic_flat_run(kv_cache: Any, ids: Sequence[int], layout: str | None) -> Any | None:
-    """A 1-D view over one consecutive run of blocks, or None when the run is not contiguous."""
-    if not ids:
-        return None
-    first = int(ids[0])
-    for offset, block_id in enumerate(ids):
-        if int(block_id) != first + offset:
-            return None
-    geometry = _pic_block_span(kv_cache, layout)
-    if geometry is None:
-        return None
-    block_axis, span = geometry
-    stride = int(kv_cache.stride(block_axis))
-    total = len(ids) * span
-    offset = first * stride
-    storage = kv_cache.untyped_storage()
-    if offset < 0 or offset + total > storage.nbytes() // kv_cache.element_size():
-        return None
-    return _torch().as_strided(
-        kv_cache,
-        size=(total,),
-        stride=(1,),
-        storage_offset=int(kv_cache.storage_offset()) + offset,
-    )
+    torch = _torch()
+    dtype_name = str(record["dtype"])
+    if dtype_name not in _COMPACT_TRANSITION_DTYPES:
+        raise ValueError(f"unsupported compact transition dtype: {dtype_name!r}")
+    dtype = getattr(torch, dtype_name, None)
+    if dtype is None:
+        raise ValueError(
+            f"torch does not provide compact transition dtype: {dtype_name!r}"
+        )
+    shape = tuple(int(item) for item in record["shape"])
+    if any(item < 0 for item in shape):
+        raise ValueError("compact transition tensor shape contains a negative extent")
+    offset = int(record["offset"])
+    nbytes = int(record["nbytes"])
+    if offset < 0 or nbytes < 0 or offset + nbytes > int(arena.numel()):
+        raise ValueError("compact transition tensor exceeds payload bounds")
+    expected = 1
+    for extent in shape:
+        expected *= extent
+    element_bytes = int(torch.empty((), dtype=dtype).element_size())
+    if expected * element_bytes != nbytes:
+        raise ValueError("compact transition tensor byte size is incompatible")
+    if nbytes == 0:
+        return torch.empty(shape, dtype=dtype, device=arena.device)
+    view = arena.narrow(0, offset, nbytes)
+    if offset % element_bytes:
+        # Version 4 always aligns offsets.  Keep a correct path for a payload
+        # written by a partially upgraded publisher instead of failing open.
+        aligned = torch.empty(nbytes, dtype=torch.uint8, device=arena.device)
+        aligned.copy_(view)
+        view = aligned
+    return view.view(dtype).reshape(shape)
 
 
 def _native_cache_axes(
@@ -891,49 +897,6 @@ def _compact_tensor_from_record(
             warnings.simplefilter("ignore", UserWarning)
             cpu = torch.frombuffer(view, dtype=dtype, count=expected).reshape(shape)
     return _h2d_on_private_stream(cpu, device)
-
-
-def _compact_arena_tensor(arena: Any, record: Mapping[str, Any]) -> Any:
-    """Build one zero-copy GPU view of an aligned tensor inside ``arena``.
-
-    ``arena`` is one device buffer holding the whole compact payload data
-    region.  Every version-4 record offset is 16-byte aligned, so a byte view
-    can be reinterpreted in place instead of paying one H2D copy per tensor.
-    """
-    torch = _torch()
-    dtype_name = str(record["dtype"])
-    if dtype_name not in _COMPACT_TRANSITION_DTYPES:
-        raise ValueError(f"unsupported compact transition dtype: {dtype_name!r}")
-    dtype = getattr(torch, dtype_name, None)
-    if dtype is None:
-        raise ValueError(
-            f"torch does not provide compact transition dtype: {dtype_name!r}"
-        )
-    shape = tuple(int(item) for item in record["shape"])
-    if any(item < 0 for item in shape):
-        raise ValueError("compact transition tensor shape contains a negative extent")
-    offset = int(record["offset"])
-    nbytes = int(record["nbytes"])
-    if offset < 0 or nbytes < 0 or offset + nbytes > int(arena.numel()):
-        raise ValueError("compact transition tensor exceeds payload bounds")
-    expected = 1
-    for extent in shape:
-        expected *= extent
-    element_bytes = int(torch.empty((), dtype=dtype).element_size())
-    if expected * element_bytes != nbytes:
-        raise ValueError("compact transition tensor byte size is incompatible")
-    if nbytes == 0:
-        return torch.empty(shape, dtype=dtype, device=arena.device)
-    view = arena.narrow(0, offset, nbytes)
-    if offset % element_bytes:
-        # Version 4 always aligns offsets.  Keep a correct path for a payload
-        # written by a partially upgraded publisher instead of failing open.
-        aligned = torch.empty(nbytes, dtype=torch.uint8, device=arena.device)
-        aligned.copy_(view)
-        view = aligned
-    return view.view(dtype).reshape(shape)
-
-
 def _deserialize_compact_transition_operator(
     raw: bytes, *, device: Any
 ) -> PICTransitionOperator:
@@ -1094,214 +1057,6 @@ def _deserialize_transition_operator(raw: bytes, *, device: Any) -> PICTransitio
 
 
 
-def _parse_byte_size(value: str, *, name: str) -> int:
-    """Parse a byte size that may carry a K/M/G suffix.
-
-    ``int(os.getenv(...))`` silently rejected "512M", and the rejection surfaced
-    three imports later as "import disabled", which reads like a code regression.
-    Parse once, at construction, and fail loudly instead.
-    """
-    text = str(value).strip().upper().replace("_", "")
-    multipliers = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
-    if text and text[-1] in multipliers:
-        number, factor = text[:-1], multipliers[text[-1]]
-    else:
-        number, factor = text, 1
-    try:
-        parsed = int(float(number) * factor)
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"{name} must be a byte count such as 536870912, 512M or 2G; "
-            f"got {value!r}"
-        ) from None
-    if parsed <= 0:
-        raise ValueError(f"{name} must be positive; got {value!r}")
-    return parsed
-
-
-class _PinnedStagingPool:
-    """A few reusable pinned host arenas for transition transfers.
-
-    Pinning a buffer and registering it with the transport cost more than the copy
-    that uses them, and an arena sized to one object cannot serve the next object of
-    a different size - so a run over many distinct objects paid both costs once per
-    object.  A fixed number of arenas, all grown to the largest object seen and
-    reused across objects, pays them once.
-
-    The transfer itself is synchronous between receive and upload, so a slot is only
-    held for that window; a slot per import thread keeps concurrent imports apart.
-    """
-
-    def __init__(
-        self,
-        *,
-        slots: int,
-        granularity: int,
-        register: Callable[..., Any] | None = None,
-        unregister: Callable[[int], None] | None = None,
-    ) -> None:
-        self._slots = max(1, int(slots))
-        self._granularity = max(1, int(granularity))
-        self._register = register
-        self._unregister = unregister
-        self._free: list[Any] = []
-        # Arenas handed back while a copy still reads them, with the event that ends that read.
-        self._pending: list[tuple[Any, Any]] = []
-        self._busy = 0
-        self._capacity = 0
-        self._condition = threading.Condition()
-        self.allocations = 0
-
-    def _reap(self) -> None:
-        """Move arenas whose copy finished back to the free list."""
-        still_reading: list[tuple[Any, Any]] = []
-        for arena, event in self._pending:
-            try:
-                finished = bool(event.query())
-            except Exception:  # noqa: BLE001 - a dead event must not pin an arena forever
-                finished = True
-            if finished:
-                self._free.append(arena)
-                self._busy = max(0, self._busy - 1)
-            else:
-                still_reading.append((arena, event))
-        self._pending[:] = still_reading
-
-    def _round_up(self, nbytes: int) -> int:
-        return (
-            (int(nbytes) + self._granularity - 1) // self._granularity
-        ) * self._granularity
-
-    def acquire(self, nbytes: int, *, pin: bool) -> Any:
-        torch = _torch()
-        want = self._round_up(nbytes)
-        profile = _pic_import_profile_enabled()
-        with self._condition:
-            while True:
-                if want > self._capacity:
-                    self._capacity = want
-                for index, arena in enumerate(self._free):
-                    if int(arena.numel()) >= self._capacity:
-                        self._free.pop(index)
-                        self._busy += 1
-                        if profile:
-                            # A reuse line per transfer plus one allocation line per
-                            # arena is what tells "paid once" from "paid per object".
-                            logger.warning(
-                                "[PIC-PROFILE] staging-pool-use bytes=%d arena=%d "
-                                "allocations=%d",
-                                int(nbytes),
-                                int(arena.numel()),
-                                self.allocations,
-                            )
-                        return arena
-                drop = None
-                if self._free:
-                    # A free arena is too small for the grown capacity: replace it
-                    # rather than carry two sizes around.
-                    drop = self._free.pop()
-                elif len(self._free) + self._busy >= self._slots:
-                    if self._pending:
-                        # Every slot is out, and the ones still out are only waiting for a copy
-                        # that already runs on the copy engine. Waiting for that copy is short and
-                        # bounded, while waiting on the condition alone could block forever because
-                        # nothing signals it when a copy completes.
-                        arena, event = self._pending[0]
-                        with suppress(BaseException):
-                            if not event.query():
-                                event.synchronize()
-                        self._reap()
-                        continue
-                    self._condition.wait()
-                    continue
-                if drop is not None and self._unregister is not None:
-                    with suppress(BaseException):
-                        self._unregister(int(drop.data_ptr()))
-                previous = 0 if drop is None else int(drop.numel())
-                # Pinning an arena costs more than the copy that uses it - measured at a hundred and
-                # ninety milliseconds for thirty-eight megabytes - and paying it per request put that
-                # cost on the critical path of every import. The first request allocates the whole
-                # pool instead, so every later one borrows.
-                warm = drop is None and self.allocations == 0
-                self._busy += 1
-                alloc_start = time.perf_counter()
-                arena = torch.empty(
-                    self._capacity, dtype=torch.uint8, pin_memory=pin
-                )
-                alloc_ms = (time.perf_counter() - alloc_start) * 1000.0
-                self.allocations += 1
-                register_ms = 0.0
-                if self._register is not None:
-                    register_start = time.perf_counter()
-                    self._register(
-                        address=int(arena.data_ptr()),
-                        nbytes=int(arena.numel()),
-                        role="transition-host-arena",
-                    )
-                    register_ms = (time.perf_counter() - register_start) * 1000.0
-                if profile:
-                    logger.warning(
-                        "[PIC-PROFILE] staging-pool bytes=%d previous=%d pin=%s "
-                        "alloc_ms=%.3f register_ms=%.3f allocation=%d",
-                        int(arena.numel()),
-                        previous,
-                        pin,
-                        alloc_ms,
-                        register_ms,
-                        self.allocations,
-                    )
-                if warm:
-                    for _ in range(max(0, self._slots - 1)):
-                        extra = torch.empty(
-                            self._capacity, dtype=torch.uint8, pin_memory=pin
-                        )
-                        self.allocations += 1
-                        if self._register is not None:
-                            with suppress(BaseException):
-                                self._register(
-                                    address=int(extra.data_ptr()),
-                                    nbytes=int(extra.numel()),
-                                    role="transition-host-arena",
-                                )
-                        self._free.append(extra)
-                    if profile:
-                        logger.warning(
-                            "[PIC-PROFILE] staging-pool warmed slots=%d capacity=%d",
-                            self._slots,
-                            self._capacity,
-                        )
-                    self._condition.notify_all()
-                return arena
-
-    def release(self, arena: Any, event: Any = None) -> None:
-        """Return an arena to the pool once its copy has finished.
-
-        A returned arena is about to be reused by another object, so handing it back while the copy
-        engine is still reading it would corrupt that object's transfer. The event defers the return
-        instead of waiting for it, which is what keeps the upload off the critical path.
-        """
-        if event is not None:
-            try:
-                finished = bool(event.query())
-            except Exception:  # noqa: BLE001 - a dead event must not pin an arena
-                finished = True
-            if not finished:
-                with self._condition:
-                    self._pending.append((arena, event))
-                return
-        self._release_now(arena)
-
-    def _release_now(self, arena: Any) -> None:
-        with self._condition:
-            self._busy = max(0, self._busy - 1)
-            self._free.append(arena)
-            self._condition.notify()
-
-    def stats(self) -> tuple[int, int, int]:
-        with self._condition:
-            return self.allocations, self._capacity, len(self._free) + self._busy
-
-
 # The number of key/value heads the model has, set once at start-up.  When it is smaller than the tensor
 # parallel size several ranks hold the same KV shard, and the connector this follows writes one copy:
 # ``put_step = tp_size // num_kv_heads``, with ``tp_rank // put_step`` naming the shard.
@@ -1418,9 +1173,6 @@ class MooncakeNativeKVObjectStore:
         # what a batched call needs when several layers share one scratch allocation.
         self._registered_regions: list[tuple[int, int]] = []
         # One device buffer, grown on demand, that the store can write into directly.  The host
-        # staging pool stays for the paths that still need bytes in hand (fallback and checksum).
-        self._gpu_scratch: dict[str, Any] = {}
-        self._gpu_scratch_device: Any = None
         self._gpu_direct_available = True
         # The put call takes a replicate config.  Built once, and left None when the installed
         # binding does not expose it, in which case the three-argument form is tried.
@@ -1429,43 +1181,8 @@ class MooncakeNativeKVObjectStore:
         # Layer name to KV tensor, handed over once by the worker.  A receive that can address the
         # destination blocks needs them; without them it falls back to the host arena.
         self._kv_cache_layers: dict[str, Any] = {}
-        # One arena per import thread, all grown to the largest object seen: the
-        # pin and the registration are paid once instead of once per object.
-        staging_slots = 4
-        # Escape hatch for an A/B run: the pool is only useful if the per-object
-        # arena was expensive, and that has to be measurable, not assumed.
-        self._shared_staging = True
-        self._staging_pool = _PinnedStagingPool(
-            slots=staging_slots,
-            granularity=1 << 20,
-            register=self._register_store_buffer_best_effort,
-            unregister=self._unregister_store_buffer,
-        )
-        # Parsed once so a malformed value fails at startup instead of silently
-        # disabling imports a few requests later.
-        self._native_arena_cache_bytes = _parse_byte_size(
-            os.getenv(
-                "HYPIC_PIC_NATIVE_ARENA_CACHE_BYTES", str(512 * 1024 * 1024)
-            ),
-            name="native arena cache",
-        )
-        self._native_arena_evictions = 0
-        # Keep the warm blocks. Dropping them only hands them back to the pinned
-        # allocator's cache, which then may decline to serve a slightly smaller
-        # request - measured as the same forty to two hundred millisecond pin landing
-        # on a request anyway. Holding them makes the request path a pure memcpy.
-        self._free_native_arenas: list[Any] = []
-        self._pending_native_arenas: list[tuple[Any, Any]] = []
-        self._native_pool_lock = Lock()
-        self._warm_native_arenas()
         self._owned_native_keys: set[str] = set()
         self._owned_state_keys: set[str] = set()
-        # Store direct state receives use request-independent, registered GPU
-        # tensors keyed by external object.  The operator keeps the tensors
-        # alive for the request; the finalizer releases the cache entry when
-        # the request drops its operator.  This avoids registering a fresh
-        # destination range on every reuse while preserving the Store ABI.
-        self._store_state_buffers: dict[str, dict[str, Any]] = {}
         # ``register_buffer`` is a transfer optimisation, not a correctness
         # requirement: Full Attention keeps using the destination address when
         # registration fails because the Store still copies into it.  Report
@@ -1481,10 +1198,6 @@ class MooncakeNativeKVObjectStore:
         # the process and affected requests recompute instead.
         self._native_batch_failures = 0
         self._native_store_disabled = False
-        # Batched native KV receives land in one host arena per external object.
-        # The arena is rented for the receive -> materialize window so a
-        # concurrent receive of the same object cannot overwrite it mid-upload.
-        self._native_arenas: dict[str, dict[str, Any]] = {}
 
     def _key(self, external_key: str) -> str:
         key = str(external_key).strip("/")
@@ -1553,9 +1266,6 @@ class MooncakeNativeKVObjectStore:
         self._kv_cache_layers = {
             str(name): tensor for name, tensor in kv_caches.items()
         }
-        logger.warning(
-            "PIC-DIRECT kv-layers registered layers=%d", len(self._kv_cache_layers)
-        )
 
     def _replicate_config(self) -> Any:
         """The store's replicate config, or None when the binding does not have one."""
@@ -1572,42 +1282,12 @@ class MooncakeNativeKVObjectStore:
     def _gpu_direct_enabled(self) -> bool:
         """Whether the store can move bytes to and from a device buffer directly."""
         if not self._gpu_direct_available:
-            logger.warning("PIC-DIRECT enabled=False reason=_gpu_direct_available")
             return False
         get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
         put = getattr(self.store, "batch_put_from_multi_buffers", None)
         if not callable(get_into) or not callable(put):
-            logger.warning(
-                "PIC-DIRECT enabled=False reason=api get_into=%s put=%s",
-                callable(get_into),
-                callable(put),
-            )
             return False
         return True
-
-    def _scratch_for(self, nbytes: int, role: str) -> Any | None:
-        """A registered device buffer of at least ``nbytes``, kept per role.
-
-        One tensor per role, grown on demand and registered once: registering a fresh temporary on every
-        layer would cost more than the copy it saves.  Publish and import run in different threads and can
-        overlap, so they do not share a buffer.
-        """
-        if nbytes <= 0:
-            return None
-        pooled = self._gpu_scratch.get(role)
-        if pooled is not None:
-            tensor, capacity = pooled
-            if capacity >= nbytes and tensor.device == self._gpu_scratch_device:
-                return tensor[:nbytes]
-        tensor = _torch().empty(nbytes, dtype=_torch().uint8, device=self._gpu_scratch_device)
-        # Registering is an optimisation, not a permission: without a pin the store still copies into
-        # this address through its own staging.  Only a failed call decides the path.
-        self._register_store_buffer_best_effort(
-            address=tensor.data_ptr(), nbytes=int(tensor.numel()), role=f"gpu-scratch-{role}"
-        )
-        self._gpu_scratch[role] = (tensor, int(tensor.numel()))
-        return tensor
-
     def _layer_block_segments(
         self, kv_cache: Any, ids: Sequence[int], layout: str, *, for_device: Any
     ) -> list[tuple[int, int]] | None:
@@ -1618,14 +1298,8 @@ class MooncakeNativeKVObjectStore:
         before all value blocks - so it is derived from the axes rather than assumed.
         """
         if int(kv_cache.data_ptr()) == 0:
-            logger.warning("PIC-DIRECT segments=None reason=data_ptr == 0")
             return None
         if kv_cache.device != for_device:
-            logger.warning(
-                "PIC-DIRECT segments=None reason=device %s != %s",
-                kv_cache.device,
-                for_device,
-            )
             return None
         kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
         element = kv_cache.element_size()
@@ -1635,14 +1309,6 @@ class MooncakeNativeKVObjectStore:
         expected = element
         for axis in range(len(kv_cache.shape) - 1, block_axis, -1):
             if strides[axis] != expected:
-                logger.warning(
-                    "PIC-DIRECT segments=None reason=block tail not contiguous shape=%s strides=%s "
-                    "axis=%d expected=%d",
-                    tuple(kv_cache.shape),
-                    tuple(strides),
-                    axis,
-                    expected,
-                )
                 return None
             expected *= int(kv_cache.shape[axis])
         # Pinning this range is optional; the call below is what decides whether the store can take it.
@@ -1719,28 +1385,9 @@ class MooncakeNativeKVObjectStore:
             try:
                 status = put(keys, addrs, sizes)
             except Exception as exc:  # noqa: BLE001 - fall back to the staged path
-                logger.warning(
-                    "PIC-DIRECT put raised entries=%d segments=%d error=%r",
-                    len(entries),
-                    sum(len(segments) for _, segments in entries),
-                    exc,
-                )
                 return False
         except Exception as exc:  # noqa: BLE001 - fall back to the staged path
-            logger.warning(
-                "PIC-DIRECT put raised entries=%d segments=%d error=%r",
-                len(entries),
-                sum(len(segments) for _, segments in entries),
-                exc,
-            )
             return False
-        logger.warning(
-            "PIC-DIRECT put status=%s entries=%d segments=%d first_key=%s",
-            status,
-            len(entries),
-            sum(len(segments) for _, segments in entries),
-            entries[0][0] if entries else "",
-        )
         return (
             status is not None
             and len(status) == len(entries)
@@ -1768,20 +1415,7 @@ class MooncakeNativeKVObjectStore:
                 [[nbytes for _, nbytes in segments] for _, segments in entries],
             )
         except Exception as exc:  # noqa: BLE001 - fall back to the staged path
-            logger.warning(
-                "PIC-DIRECT get_into raised entries=%d segments=%d error=%r",
-                len(entries),
-                sum(len(segments) for _, segments in entries),
-                exc,
-            )
             return False
-        logger.warning(
-            "PIC-DIRECT get_into status=%s entries=%d segments=%d first_key=%s",
-            status,
-            len(entries),
-            sum(len(segments) for _, segments in entries),
-            entries[0][0] if entries else "",
-        )
         return (
             status is not None
             and len(status) == len(entries)
@@ -1794,49 +1428,6 @@ class MooncakeNativeKVObjectStore:
             if base <= address and address + nbytes <= base + size:
                 return True
         return False
-
-    def _put_batch_from_device(
-        self, entries: Sequence[tuple[str, int, int]]
-    ) -> bool:
-        """Store several objects' bytes straight from device memory, in one call."""
-        if not self._gpu_direct_enabled() or not entries:
-            return False
-        put = getattr(self.store, "batch_put_from_multi_buffers", None)
-        try:
-            status = put(
-                [key for key, _, _ in entries],
-                [[address] for _, address, _ in entries],
-                [[nbytes] for _, _, nbytes in entries],
-            )
-        except Exception:  # noqa: BLE001 - fall back to the host path
-            return False
-        return (
-            status is not None
-            and len(status) == len(entries)
-            and all(int(value) >= 0 for value in status)
-        )
-
-    def _get_batch_into_device(
-        self, entries: Sequence[tuple[str, int, int]]
-    ) -> bool:
-        """Read several objects' bytes straight into device memory, in one call."""
-        if not self._gpu_direct_enabled() or not entries:
-            return False
-        get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
-        try:
-            status = get_into(
-                [key for key, _, _ in entries],
-                [[address] for _, address, _ in entries],
-                [[nbytes] for _, _, nbytes in entries],
-            )
-        except Exception:  # noqa: BLE001 - fall back to the host path
-            return False
-        return (
-            status is not None
-            and len(status) == len(entries)
-            and all(int(value) >= 0 for value in status)
-        )
-
     def _register_store_buffer_best_effort(
         self, *, address: int, nbytes: int, role: str
     ) -> bool:
@@ -1883,20 +1474,6 @@ class MooncakeNativeKVObjectStore:
         if callable(unregister):
             with suppress(BaseException):
                 unregister(int(address))
-
-    def _release_store_state_buffers(self, entry: dict[str, Any]) -> None:
-        """Unregister only the state buffers whose registration succeeded.
-
-        The host staging arena is owned by the pool now, so it is not released
-        here: the pool keeps exactly a few arenas alive for the whole process and
-        unregisters one only when it replaces it with a larger arena.
-        """
-        registered = entry.get("registered", {})
-        for role, tensor in entry.get("buffers", {}).items():
-            if not registered.get(role):
-                continue
-            self._unregister_store_buffer(int(tensor.data_ptr()))
-
     def _put_layer_until_present(self, key: str, payload: bytes) -> int:
         """Write one layer blob and confirm the key exists before moving on.
 
@@ -2082,15 +1659,10 @@ class MooncakeNativeKVObjectStore:
                 )
                 total_bytes += nbytes
 
-            # Pass two: send the blocks where they are, or fall back to staging them.
-            staging = None
+            # Pass two: send the blocks where they are.  There is no host path - a refusal is an
+            # error, because the silent copy through the host is what this replaced.
             sent_all = False
-            offsets: list[int] = []
-            if self._gpu_scratch_device is None and planned:
-                self._gpu_scratch_device = planned[0][1].device
-            # The device path cannot hash bytes it never holds, so taking it is a choice about the
-            # checksum, not about profiling.
-            if not _pic_payload_checksum_enabled() and planned:
+            if planned:
                 device = planned[0][1].device
                 entries: list[tuple[str, list[tuple[int, int]]]] = []
                 for layer_name, kv_cache, _, _, _, _, _ in planned:
@@ -2107,92 +1679,20 @@ class MooncakeNativeKVObjectStore:
                             kv_cache, ids, layout, for_device=device
                         )
                     if segments is None:
-                        logger.warning(
-                            "PIC-DIRECT publish plan abandoned layer=%s", layer_name
+                        raise RuntimeError(
+                            "PIC native KV publish cannot address the blocks of layer "
+                            f"{layer_name}"
                         )
-                        entries = []
-                        break
                     entries.append((f"{base_key}/layers/{layer_name}", segments))
-                logger.warning(
-                    "PIC-DIRECT publish planned=%d entries=%d segments=%d ids=%s",
-                    len(planned),
-                    len(entries),
-                    sum(len(segments) for _, segments in entries),
-                    list(ids),
+                sent_all = self._put_batch_from_segments(entries)
+            if not sent_all:
+                raise RuntimeError(
+                    "PIC native KV publish needs the store's buffer API: "
+                    "batch_put_from_multi_buffers refused the blocks"
                 )
-                if entries:
-                    sent_all = self._put_batch_from_segments(entries)
-                logger.warning("PIC-DIRECT publish sent_all=%s", sent_all)
-            if not sent_all and not _pic_payload_checksum_enabled():
-                staging = self._scratch_for(int(total_bytes), "publish")
-            if staging is not None and not sent_all:
-                offset = 0
-                for _, kv_cache, block_axis, _, shape, _, nbytes in planned:
-                    flat = _pic_flat_run(kv_cache, ids, layout)
-                    if flat is not None:
-                        selected = flat
-                    else:
-                        index = _torch().tensor(
-                            ids, dtype=_torch().long, device=kv_cache.device
-                        )
-                        selected = kv_cache.index_select(block_axis, index).contiguous()
-                    staging[offset : offset + nbytes].view(kv_cache.dtype).reshape(
-                        shape
-                    ).copy_(selected)
-                    offsets.append(offset)
-                    offset += nbytes
-                entries_staged = [
-                    (
-                        f"{base_key}/layers/{layer_name}",
-                        int(staging.data_ptr()) + offset,
-                        nbytes,
-                    )
-                    for offset, (layer_name, _, _, _, _, _, nbytes) in zip(
-                        offsets, planned
-                    )
-                ]
-                sent_all = self._put_batch_from_device(entries_staged)
-
-            for position, (
-                layer_name,
-                kv_cache,
-                block_axis,
-                kv_axis,
-                shape,
-                dtype,
-                nbytes,
-            ) in enumerate(planned):
+            for layer_name, _, _, _, shape, dtype, nbytes in planned:
                 layer_key = f"{base_key}/layers/{layer_name}"
-                payload: bytes | None = None
-                if not sent_all:
-                    if staging is not None:
-                        # The batch was refused: the bytes are already on device, so the fallback only
-                        # pays the copy back to the host instead of gathering again.
-                        offset = offsets[position]
-                        payload = (
-                            staging[offset : offset + nbytes]
-                            .view(kv_cache.dtype)
-                            .reshape(shape)
-                            .cpu()
-                            .numpy()
-                            .tobytes()
-                        )
-                    else:
-                        flat = _pic_flat_run(kv_cache, ids, layout)
-                        if flat is not None:
-                            payload = _tensor_bytes(flat.reshape(shape))
-                        else:
-                            index = _torch().tensor(
-                                ids, dtype=_torch().long, device=kv_cache.device
-                            )
-                            selected = kv_cache.index_select(
-                                block_axis, index
-                            ).contiguous()
-                            payload = _tensor_bytes(selected)
-                    self._put_layer_until_present(layer_key, payload)
-                    written.append(layer_key)
-                else:
-                    written.append(layer_key)
+                written.append(layer_key)
                 layers.append(
                     PICNativeKVLayerObject(
                         layer_name=layer_name,
@@ -2200,11 +1700,7 @@ class MooncakeNativeKVObjectStore:
                         shape=tuple(int(item) for item in shape),
                         dtype=dtype,
                         nbytes=int(nbytes),
-                        checksum=(
-                            None
-                            if payload is None
-                            else hashlib.sha256(payload).hexdigest()
-                        ),
+                        checksum=None,
                     )
                 )
             manifest = PICNativeKVObject(
@@ -2484,61 +1980,6 @@ class MooncakeNativeKVObjectStore:
             raise ValueError(f"Mooncake hybrid state manifest is missing: {key}/manifest")
         return PICHybridStateObject.from_dict(json.loads(bytes(raw).decode("utf-8")))
 
-    def _store_state_cache_key(self, external_key: str, device: Any) -> str:
-        return f"{external_key}|device={device}"
-
-    def _release_store_state_entry(
-        self, cache_key: str, entry: dict[str, Any]
-    ) -> None:
-        current = self._store_state_buffers.get(cache_key)
-        if current is not entry:
-            return
-        entry["users"] = int(entry.get("users", 1)) - 1
-        if entry["users"] > 0:
-            return
-        self._store_state_buffers.pop(cache_key, None)
-        self._release_store_state_buffers(entry)
-
-    def _discard_store_state_entry(self, cache_key: str) -> None:
-        entry = self._store_state_buffers.get(cache_key)
-        if entry is None or int(entry.get("users", 0)) != 0:
-            return
-        self._store_state_buffers.pop(cache_key, None)
-        self._release_store_state_buffers(entry)
-
-    def _store_state_tensor(
-        self,
-        *,
-        cache_key: str,
-        entry: dict[str, Any],
-        role: str,
-        record: Mapping[str, Any],
-        device: Any,
-    ) -> Any:
-        torch = _torch()
-        shape = tuple(int(item) for item in record["shape"])
-        dtype = _dtype_from_name(str(record["dtype"]))
-        nbytes = int(record["nbytes"])
-        if any(item < 0 for item in shape) or nbytes <= 0:
-            raise ValueError(f"invalid Store transition tensor metadata: {role}")
-        expected = 1
-        for extent in shape:
-            expected *= extent
-        if expected * int(torch.empty((), dtype=dtype).element_size()) != nbytes:
-            raise ValueError(f"Store transition tensor size mismatch: {role}")
-        buffers = entry.setdefault("buffers", {})
-        registered = entry.setdefault("registered", {})
-        tensor = buffers.get(role)
-        if tensor is None or tuple(tensor.shape) != shape or tensor.dtype != dtype:
-            tensor = torch.empty(shape, dtype=dtype, device=device)
-            registered[role] = self._register_store_buffer_best_effort(
-                address=int(tensor.data_ptr()),
-                nbytes=nbytes,
-                role=role,
-            )
-            buffers[role] = tensor
-        return tensor
-
     @staticmethod
     def _store_layout_tensor_records(
         layout: Mapping[str, Any],
@@ -2563,66 +2004,6 @@ class MooncakeNativeKVObjectStore:
         if len(statuses) != expected:
             return False
         return all(int(status) >= 0 for status in statuses)
-
-    def _store_state_host_layout(
-        self,
-        *,
-        records: Sequence[tuple[str, Mapping[str, Any]]],
-    ) -> tuple[dict[str, tuple[int, int]], int]:
-        """Compute aligned offsets for one packed state transfer.
-
-        The arena itself comes from the staging pool, so this stays a pure layout
-        step: it runs once per object and must not allocate anything.
-        """
-        plan: dict[str, tuple[int, int]] = {}
-        total = 0
-        alignment = _COMPACT_TRANSITION_ALIGNMENT
-        for role, record in records:
-            nbytes = int(record["nbytes"])
-            if nbytes <= 0:
-                raise ValueError(f"invalid Store transition tensor metadata: {role}")
-            offset = ((total + alignment - 1) // alignment) * alignment
-            plan[role] = (offset, nbytes)
-            total = offset + nbytes
-        return plan, total
-
-    def _store_state_host_targets(
-        self,
-        *,
-        entry: dict[str, Any],
-        records: Sequence[tuple[str, Mapping[str, Any]]],
-        host_plan: Mapping[str, tuple[int, int]],
-        host: Any,
-        device: Any,
-    ) -> dict[str, Any]:
-        """Upload the arena once and build aligned device views."""
-        cache = entry.setdefault("host_staging", {})
-        device_tensor = cache.get("device")
-        self._last_transition_upload_ms = 0.0
-        if device_tensor is None or str(device_tensor.device) != str(device):
-            # Blocking on purpose: the operator becomes visible to the caller
-            # right after this, and a same-stream ordering assumption would
-            # break as soon as the forward runs on a non-default stream.
-            upload_start = time.perf_counter()
-            device_tensor = _h2d_on_private_stream(host, device)
-            self._last_transition_upload_ms = (
-                time.perf_counter() - upload_start
-            ) * 1000.0
-            cache["device"] = device_tensor
-        targets: dict[str, Any] = {}
-        for role, record in records:
-            offset, nbytes = host_plan[role]
-            targets[role] = _compact_arena_tensor(
-                device_tensor,
-                {
-                    "dtype": record["dtype"],
-                    "shape": record["shape"],
-                    "offset": offset,
-                    "nbytes": nbytes,
-                },
-            )
-        return targets
-
     def _load_transition_operator_store(
         self, manifest: PICHybridStateObject, *, device: Any
     ) -> PICTransitionOperator:
@@ -2656,12 +2037,7 @@ class MooncakeNativeKVObjectStore:
             except Exception:  # noqa: BLE001 - fall back to the host arena
                 slab = None
             if slab is not None:
-                logger.warning(
-                    "PIC-DIRECT transition representation=device-direct tensors=%d bytes=%d status=%s",
-                    len(records),
-                    total,
-                    result,
-                )
+                pass
         if slab is None:
             representation = "store-host-staging"
             host = _torch().empty(total, dtype=_torch().uint8, pin_memory=on_cuda)
@@ -2779,9 +2155,6 @@ class MooncakeNativeKVObjectStore:
             except (NotImplementedError, ValueError, RuntimeError) as exc:
                 if _is_cuda_oom_error(exc):
                     raise
-                self._discard_store_state_entry(
-                    self._store_state_cache_key(manifest.external_key, device)
-                )
                 self._store_transition_failures += 1
                 if self._store_transition_failures >= self._STORE_TRANSITION_FAILURE_BUDGET:
                     self._store_transition_disabled = True
@@ -2889,426 +2262,38 @@ class MooncakeNativeKVObjectStore:
         )
 
     def restore_native_blocks(
-        self,
-        obj: PICNativeKVObject,
-        *,
-        kv_caches: Mapping[str, Any],
-        block_ids: Sequence[int],
-    ) -> None:
-        """Restore object blocks into caller-owned native KV blocks."""
+        self, obj: PICNativeKVObject, *, kv_caches: Mapping[str, Any], block_ids: Sequence[int]
+    ) -> int:
+        """Read a published object straight into its destination blocks."""
         ids = tuple(int(block_id) for block_id in block_ids)
         if len(ids) != obj.block_count or len(set(ids)) != len(ids):
             raise ValueError("native KV destination block span does not match object")
-        torch = _torch()
-        profile = _pic_import_profile_enabled()
-        verify_checksum = _pic_payload_checksum_enabled()
-        total_start = time.perf_counter() if profile else 0.0
-        total_bytes = 0
-        total_get_ms = 0.0
-        total_checksum_ms = 0.0
-        total_cpu_ms = 0.0
-        total_h2d_ms = 0.0
-        # Straight into the request's blocks when the store can address them: the destination is a list
-        # of per-block segments, so there is nothing to stage.  Validation runs first - a mismatch must
-        # fail before a byte is written.
-        logger.warning(
-            "PIC-DIRECT restore profile=%s verify_checksum=%s layers=%d",
-            profile,
-            verify_checksum,
-            len(obj.layers),
-        )
-        if not profile and not verify_checksum:
-            direct_entries: list[tuple[str, list[tuple[int, int]]]] = []
-            for member in obj.layers:
-                target = kv_caches.get(member.layer_name)
-                if target is None:
-                    logger.warning(
-                        "PIC-DIRECT restore break: no target layer=%s",
-                        member.layer_name,
-                    )
-                    direct_entries = []
-                    break
-                _, target_block_axis = _native_cache_axes(target, layout=obj.layout)
-                if len(target.shape) != len(member.shape) or any(
-                    left != right
-                    for position, (left, right) in enumerate(
-                        zip(target.shape, member.shape)
-                    )
-                    if position != target_block_axis
-                ):
-                    logger.warning(
-                        "PIC-DIRECT restore break: shape layer=%s target=%s want=%s",
-                        member.layer_name,
-                        tuple(target.shape),
-                        tuple(member.shape),
-                    )
-                    direct_entries = []
-                    break
-                if _dtype_name(target.dtype) != member.dtype:
-                    logger.warning(
-                        "PIC-DIRECT restore break: dtype layer=%s target=%s want=%s",
-                        member.layer_name,
-                        _dtype_name(target.dtype),
-                        member.dtype,
-                    )
-                    direct_entries = []
-                    break
+        entries: list[tuple[str, list[tuple[int, int]]]] = []
+        for member in obj.layers:
+            target = kv_caches.get(member.layer_name)
+            if target is None:
+                raise ValueError(f"missing native KV layer: {member.layer_name}")
+            flat = _pic_flat_run(target, ids, obj.layout)
+            if flat is not None:
+                segments = [
+                    (int(flat.data_ptr()), int(flat.numel()) * target.element_size())
+                ]
+            else:
                 segments = self._layer_block_segments(
                     target, ids, obj.layout, for_device=target.device
                 )
-                if segments is None:
-                    logger.warning(
-                        "PIC-DIRECT restore break: segments layer=%s contiguous=%s device=%s",
-                        member.layer_name,
-                        target.is_contiguous(),
-                        target.device,
-                    )
-                    direct_entries = []
-                    break
-                direct_entries.append((member.key, segments))
-            logger.warning(
-                "PIC-DIRECT restore direct_entries=%d segments=%d",
-                len(direct_entries),
-                sum(len(segments) for _, segments in direct_entries),
-            )
-            if direct_entries and self._get_batch_into_segments(direct_entries):
-                if profile:
-                    logger.warning(
-                        "[PIC-PROFILE] native-direct key=%s layers=%d bytes=%d",
-                        obj.external_key,
-                        len(direct_entries),
-                        sum(int(member.nbytes) for member in obj.layers),
-                    )
-                return
-
-        # One call for the whole group when the store can write into device memory; the offsets are
-        # reused per layer below.
-        device_staging = None
-        device_batch_offsets: dict[str, int] | None = None
-        if not profile:
-            total_device_bytes = sum(int(member.nbytes) for member in obj.layers)
-            if self._gpu_scratch_device is None and obj.layers:
-                first_layer = kv_caches.get(obj.layers[0].layer_name)
-                self._gpu_scratch_device = (
-                    first_layer.device if first_layer is not None else None
+            if segments is None:
+                raise RuntimeError(
+                    "PIC native KV restore cannot address the blocks of layer "
+                    f"{member.layer_name}"
                 )
-            device_staging = self._scratch_for(int(total_device_bytes), "import")
-            if device_staging is not None:
-                device_batch_offsets = {}
-                entries: list[tuple[str, int, int]] = []
-                offset = 0
-                for member in obj.layers:
-                    device_batch_offsets[member.key] = offset
-                    entries.append(
-                        (
-                            member.key,
-                            int(device_staging.data_ptr()) + offset,
-                            int(member.nbytes),
-                        )
-                    )
-                    offset += int(member.nbytes)
-                if not self._get_batch_into_device(entries):
-                    device_staging = None
-                    device_batch_offsets = None
-
-        for member in obj.layers:
-            kv_cache = kv_caches.get(member.layer_name)
-            if kv_cache is None:
-                raise ValueError(f"missing native KV layer: {member.layer_name}")
-            _, block_axis = _native_cache_axes(kv_cache, layout=obj.layout)
-            if len(kv_cache.shape) != len(member.shape) or any(
-                left != right
-                for index, (left, right) in enumerate(zip(kv_cache.shape, member.shape))
-                if index != block_axis
-            ):
-                raise ValueError("native KV layer shape is incompatible")
-            if _dtype_name(kv_cache.dtype) != member.dtype:
-                raise ValueError("native KV layer dtype is incompatible")
-            get_start = time.perf_counter() if profile else 0.0
-            device_values = None
-            if device_batch_offsets is not None:
-                offset = device_batch_offsets.get(member.key)
-                if offset is not None:
-                    device_values = device_staging[
-                        offset : offset + int(member.nbytes)
-                    ].view(_dtype_from_name(member.dtype)).reshape(member.shape)
-            if device_values is not None:
-                flat = (
-                    _pic_flat_run(kv_cache, ids, obj.layout)
-                    if device_values.numel() == member.nbytes // kv_cache.element_size()
-                    and device_values.ndim == 1
-                    else None
-                )
-                if flat is not None:
-                    flat.copy_(device_values.reshape(-1))
-                else:
-                    index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
-                    kv_cache.index_copy_(block_axis, index, device_values)
-                total_bytes += int(member.nbytes)
-                continue
-            raw = self.store.get(member.key)
-            get_ms = (time.perf_counter() - get_start) * 1000.0 if profile else 0.0
-            if len(raw) != member.nbytes:
-                raise ValueError("native KV layer payload size is incompatible")
-            checksum_start = time.perf_counter() if profile and verify_checksum else 0.0
-            if (
-                verify_checksum
-                and member.checksum is not None
-                and hashlib.sha256(bytes(raw)).hexdigest() != member.checksum
-            ):
-                raise ValueError("native KV layer payload checksum is incompatible")
-            checksum_ms = (
-                (time.perf_counter() - checksum_start) * 1000.0
-                if profile and verify_checksum
-                else 0.0
+            entries.append((member.key, segments))
+        if not self._get_batch_into_segments(entries):
+            raise RuntimeError(
+                "PIC native KV restore needs the store's buffer API: "
+                "batch_get_into_multi_buffers refused the blocks"
             )
-            cpu_start = time.perf_counter() if profile else 0.0
-            values = torch.frombuffer(
-                memoryview(raw), dtype=_dtype_from_name(member.dtype)
-            )
-            values = values.clone().reshape(member.shape)
-            cpu_ms = (time.perf_counter() - cpu_start) * 1000.0 if profile else 0.0
-            _pic_profile_sync(torch, kv_cache.device, profile)
-            h2d_start = time.perf_counter() if profile else 0.0
-            values = values.to(device=kv_cache.device)
-            flat = (
-                _pic_flat_run(kv_cache, ids, obj.layout)
-                if values.ndim == 1
-                else None
-            )
-            if flat is not None:
-                flat.copy_(values.reshape(-1))
-            else:
-                index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
-                kv_cache.index_copy_(block_axis, index, values)
-            _pic_profile_sync(torch, kv_cache.device, profile)
-            h2d_ms = (time.perf_counter() - h2d_start) * 1000.0 if profile else 0.0
-            total_bytes += len(raw)
-            total_get_ms += get_ms
-            total_checksum_ms += checksum_ms
-            total_cpu_ms += cpu_ms
-            total_h2d_ms += h2d_ms
-            if profile:
-                logger.warning(
-                    "[PIC-PROFILE] native-layer key=%s layer=%s bytes=%d "
-                    "get_ms=%.3f checksum_enabled=%s checksum_ms=%.3f "
-                    "cpu_ms=%.3f h2d_index_ms=%.3f total_ms=%.3f",
-                    obj.external_key,
-                    member.layer_name,
-                    len(raw),
-                    get_ms,
-                    verify_checksum,
-                    checksum_ms,
-                    cpu_ms,
-                    h2d_ms,
-                    (time.perf_counter() - get_start) * 1000.0,
-                )
-        if profile:
-            logger.warning(
-                "[PIC-PROFILE] native-total key=%s layers=%d bytes=%d "
-                "get_ms=%.3f checksum_ms=%.3f cpu_ms=%.3f h2d_index_ms=%.3f "
-                "total_ms=%.3f",
-                obj.external_key,
-                len(obj.layers),
-                total_bytes,
-                total_get_ms,
-                total_checksum_ms,
-                total_cpu_ms,
-                total_h2d_ms,
-                (time.perf_counter() - total_start) * 1000.0,
-            )
-
-    @staticmethod
-    def _native_host_plan(
-        obj: PICNativeKVObject,
-    ) -> tuple[dict[str, tuple[int, int]], int]:
-        """Byte layout of every layer inside one host arena."""
-        plan: dict[str, tuple[int, int]] = {}
-        total = 0
-        for member in obj.layers:
-            nbytes = int(member.nbytes)
-            if nbytes <= 0:
-                raise ValueError("native KV layer payload is empty")
-            offset = (
-                (total + _NATIVE_STAGING_ALIGNMENT - 1)
-                // _NATIVE_STAGING_ALIGNMENT
-            ) * _NATIVE_STAGING_ALIGNMENT
-            plan[member.layer_name] = (offset, nbytes)
-            total = offset + nbytes
-        return plan, total
-
-    def _warm_native_arenas(self) -> None:
-        """Pin the first arena at construction instead of during a request.
-
-        ``torch.empty(pin_memory=True)`` is cheap once the pinned allocator has a
-        block of that size and expensive when it must ask the driver for one, and the
-        expensive case landed on the first request of every cold process. Allocating
-        and dropping a few blocks here leaves them in the allocator's cache, which is
-        exactly what the request path then reuses.
-        """
-        torch = _torch()
-        try:
-            if not torch.cuda.is_available():
-                return
-        except Exception:  # pragma: no cover - non-CUDA builds
-            return
-        try:
-            nbytes = _parse_byte_size(
-                os.getenv("HYPIC_PIC_KV_ARENA_BYTES", str(64 * 1024 * 1024)),
-                name="HYPIC_PIC_KV_ARENA_BYTES",
-            )
-            count = 4
-            blocks = [
-                torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-                for _ in range(count)
-            ]
-            with self._native_pool_lock:
-                self._free_native_arenas.extend(blocks)
-            if _pic_import_profile_enabled():
-                logger.warning(
-                    "[PIC-PROFILE] kv-arena-warmup bytes=%d count=%d", nbytes, count
-                )
-        except Exception as exc:  # noqa: BLE001 - warmup must never block startup
-            logger.warning("PIC KV arena warmup skipped: %s", exc)
-
-    def _evict_native_arenas(self, incoming: int) -> None:
-        """Keep the pinned arena cache inside its byte budget.
-
-        Pinned host memory is a finite resource, so idle arenas are dropped when
-        a new receive would push the cache over budget.  Busy arenas are never
-        evicted: they are serving an in-flight receive/materialize window.
-        """
-        budget = getattr(
-            self, "_native_arena_cache_bytes", 512 * 1024 * 1024
-        )
-        cached = sum(int(entry["arena"].numel()) for entry in self._native_arenas.values())
-        if cached + incoming <= budget:
-            return
-        for key, entry in tuple(self._native_arenas.items()):
-            if cached + incoming <= budget:
-                break
-            with entry["lock"]:
-                if entry["busy"]:
-                    continue
-                pending = entry.get("pending")
-                if pending is not None:
-                    # A completed upload event no longer protects the buffer. Only
-                    # an in-flight copy does. Leaving it set made every entry that
-                    # had uploaded once permanently unevictable, so the cache grew
-                    # without bound and later pinnings got slower and slower.
-                    if not pending.query():
-                        continue
-                    entry["pending"] = None
-            self._native_arenas.pop(key, None)
-            self._native_arena_evictions = (
-                getattr(self, "_native_arena_evictions", 0) + 1
-            )
-            cached -= int(entry["arena"].numel())
-
-    def _take_warm_arena(self, total: int) -> Any | None:
-        """Return a retained arena that fits, recycling finished uploads first."""
-        with self._native_pool_lock:
-            pending = self._pending_native_arenas
-            for item in tuple(pending):
-                arena, event = item
-                if event is None or event.query():
-                    pending.remove(item)
-                    self._free_native_arenas.append(arena)
-            for index, arena in enumerate(self._free_native_arenas):
-                if int(arena.numel()) >= total:
-                    self._free_native_arenas.pop(index)
-                    return arena
-        return None
-
-    def _rent_native_arena(
-        self, external_key: str, total: int
-    ) -> tuple[Any, Callable[..., None]]:
-        """Rent the cached arena for a receive -> materialize window.
-
-        The device upload reads this buffer asynchronously, so the cached arena
-        may only be reused once the previous upload finished.  ``release``
-        therefore carries the upload event, and a rent whose predecessor is
-        still in flight gets a throwaway buffer instead of blocking.  Without
-        that check the profile-off path has no ``cuda.synchronize`` to drain the
-        copy and the next ``batch_get`` can overwrite bytes the copy still
-        reads.
-        """
-        torch = _torch()
-        pin = bool(torch.cuda.is_available())
-        pooled = self._take_warm_arena(total)
-        if pooled is not None:
-            def release_pooled(event: Any = None) -> None:
-                # The upload reads the arena asynchronously, so it only returns to
-                # the free list once that copy has finished.
-                with self._native_pool_lock:
-                    self._pending_native_arenas.append((pooled, event))
-
-            return pooled, release_pooled
-        entry = self._native_arenas.get(external_key)
-        if entry is None or int(entry["arena"].numel()) < total:
-            profile = _pic_import_profile_enabled()
-            # A new object needs a new pinned arena, and pinning 53 MB is neither
-            # free nor reusable across differently sized objects. This is the cost
-            # that a repeated object never pays and a first-seen one always does.
-            evicted = len(self._native_arenas)
-            self._evict_native_arenas(total)
-            evicted -= len(self._native_arenas)
-            alloc_start = time.perf_counter() if profile else 0.0
-            entry = {
-                "arena": torch.empty(total, dtype=torch.uint8, pin_memory=pin),
-                "busy": False,
-                "pending": None,
-                "lock": Lock(),
-            }
-            alloc_ms = (time.perf_counter() - alloc_start) * 1000.0 if profile else 0.0
-            self._native_arenas[external_key] = entry
-            if profile:
-                logger.warning(
-                    "[PIC-PROFILE] kv-arena key=%s bytes=%d alloc_ms=%.3f "
-                    "pinned=%s evicted=%d cached_bytes=%d budget_bytes=%d",
-                    external_key,
-                    int(total),
-                    alloc_ms,
-                    pin,
-                    evicted,
-                    sum(
-                        int(item["arena"].numel())
-                        for item in self._native_arenas.values()
-                    ),
-                    getattr(self, "_native_arena_cache_bytes", 0),
-                )
-        elif _pic_import_profile_enabled():
-            logger.warning(
-                "[PIC-PROFILE] kv-arena key=%s bytes=%d hit=True cached=%d",
-                external_key,
-                int(total),
-                len(self._native_arenas),
-            )
-        with entry["lock"]:
-            if not entry["busy"]:
-                pending = entry.get("pending")
-                if pending is None or pending.query():
-                    entry["pending"] = None
-                    entry["busy"] = True
-                    arena = entry["arena"]
-                    released = False
-
-                    def release(event: Any = None) -> None:
-                        nonlocal released
-                        with entry["lock"]:
-                            if released:
-                                return
-                            released = True
-                            if event is not None:
-                                entry["pending"] = event
-                            entry["busy"] = False
-
-                    return arena, release
-        # Either the same object is already in flight or its previous upload is
-        # still reading the cached arena: use a throwaway buffer, never block.
-        return torch.empty(total, dtype=torch.uint8, pin_memory=pin), (
-            lambda event=None: None
-        )
+        return sum(int(member.nbytes) for member in obj.layers)
 
     def _receive_native_blocks_host_batch(
         self, obj: PICNativeKVObject, *, block_ids: Sequence[int]
@@ -3327,9 +2312,6 @@ class MooncakeNativeKVObjectStore:
             for member in obj.layers:
                 target = self._kv_cache_layers.get(member.layer_name)
                 if target is None:
-                    logger.warning(
-                        "PIC-DIRECT receive break: no layer %s", member.layer_name
-                    )
                     direct = []
                     break
                 flat = _pic_flat_run(target, ids, obj.layout)
@@ -3345,79 +2327,14 @@ class MooncakeNativeKVObjectStore:
                         target, ids, obj.layout, for_device=target.device
                     )
                 if segments is None:
-                    logger.warning(
-                        "PIC-DIRECT receive break: segments %s", member.layer_name
-                    )
                     direct = []
                     break
                 direct.append((member.key, segments))
-            logger.warning(
-                "PIC-DIRECT receive direct_layers=%d segments=%d",
-                len(direct),
-                sum(len(segments) for _, segments in direct),
-            )
             if direct and self._get_batch_into_segments(direct):
                 return PICNativeKVReceived(obj=obj)
-        plan, total = self._native_host_plan(obj)
-        arena, release = self._rent_native_arena(obj.external_key, total)
-        base = int(arena.data_ptr())
-        keys: list[str] = []
-        addrs: list[list[int]] = []
-        sizes: list[list[int]] = []
-        layout: list[tuple[str, int, int]] = []
-        for member in obj.layers:
-            offset, nbytes = plan[member.layer_name]
-            keys.append(member.key)
-            addrs.append([base + offset])
-            sizes.append([nbytes])
-            layout.append((member.layer_name, offset, nbytes))
-        logger.warning(
-            "PIC-DIRECT receive arena=host layers=%d bytes=%d roles=%s",
-            len(keys),
-            total,
-            "host-arena",
+        raise RuntimeError(
+            "PIC native KV receive needs the store's buffer API and the destination layer tensors"
         )
-        start = time.perf_counter()
-        try:
-            result = batch_get(keys, addrs, sizes)
-        except BaseException:
-            release()
-            raise
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-        logger.warning(
-            "PIC-DIRECT receive status=%s keys=%d",
-            result,
-            len(keys),
-        )
-        if not self._store_batch_succeeded(result, len(keys)):
-            release()
-            raise RuntimeError("Mooncake native KV batch receive failed")
-        if _pic_import_profile_enabled():
-            logger.warning(
-                "[PIC-PROFILE] native-receive-batch key=%s layers=%d bytes=%d "
-                "get_ms=%.3f",
-                obj.external_key,
-                len(keys),
-                total,
-                elapsed_ms,
-            )
-            logger.warning(
-                "[PIC-PROFILE] native-receive-total key=%s mode=batch layers=%d "
-                "bytes=%d total_ms=%.3f n_gets=1 per_get_median=%.3f "
-                "per_get_max=%.3f",
-                obj.external_key,
-                len(keys),
-                total,
-                elapsed_ms,
-                elapsed_ms,
-                elapsed_ms,
-            )
-        staging = PICNativeKVHostStaging(
-            arena=arena,
-            layers=tuple(layout),
-            _release=release,
-        )
-        return PICNativeKVReceived(obj=obj, host_staging=staging)
 
     def receive_native_blocks(
         self,
@@ -3476,88 +2393,10 @@ class MooncakeNativeKVObjectStore:
         kv_caches: Mapping[str, Any],
         block_ids: Sequence[int],
     ) -> None:
-        """Materialize a received native object into vLLM KV blocks."""
-        if received is None:
-            return
-        if received.host_staging is not None:
-            # One device upload for the whole arena, then one scatter per layer.
-            torch = _torch()
-            obj = received.obj
-            ids = tuple(int(block_id) for block_id in block_ids)
-            if len(ids) != obj.block_count or len(set(ids)) != len(ids):
-                raise ValueError(
-                    "native KV destination block span does not match object"
-                )
-            staging = received.host_staging
-            members = {member.layer_name: member for member in obj.layers}
-            first = next(iter(kv_caches.values()), None)
-            if first is None:
-                staging.release()
-                raise ValueError("native KV staging has no destination cache")
-            profile = _pic_import_profile_enabled()
-            total_start = time.perf_counter() if profile else 0.0
-            upload_start = time.perf_counter() if profile else 0.0
-            device_arena = staging.arena.to(device=first.device)
-            # The upload reads staging.arena asynchronously.  Record when it
-            # finished so a later rent cannot overwrite bytes the copy still
-            # reads, which matters on the profile-off path because there is no
-            # synchronize there to drain it.
-            upload_event = None
-            if first.device.type == "cuda":
-                with suppress(Exception):
-                    upload_event = torch.cuda.Event()
-                    upload_event.record()
-            # Without this the upload time is only the enqueue cost and the real
-            # copy shows up later in the forward bucket.
-            _pic_profile_sync(torch, first.device, profile)
-            upload_ms = (
-                (time.perf_counter() - upload_start) * 1000.0 if profile else 0.0
-            )
-            scatter_start = time.perf_counter() if profile else 0.0
-            try:
-                for layer_name, offset, nbytes in staging.layers:
-                    member = members.get(layer_name)
-                    kv_cache = kv_caches.get(layer_name)
-                    if member is None or kv_cache is None:
-                        raise ValueError(f"missing native KV layer: {layer_name}")
-                    if _dtype_name(kv_cache.dtype) != member.dtype:
-                        raise ValueError("native KV layer dtype is incompatible")
-                    block_axis = _native_cache_axes(kv_cache, layout=obj.layout)[1]
-                    values = (
-                        device_arena.narrow(0, offset, nbytes)
-                        .view(_dtype_from_name(member.dtype))
-                        .reshape(member.shape)
-                    )
-                    index = torch.tensor(
-                        ids, dtype=torch.long, device=kv_cache.device
-                    )
-                    kv_cache.index_copy_(block_axis, index, values)
-                _pic_profile_sync(torch, first.device, profile)
-            finally:
-                staging.release(upload_event)
-            if profile:
-                scatter_ms = (time.perf_counter() - scatter_start) * 1000.0
-                staged_bytes = sum(item[2] for item in staging.layers)
-                logger.warning(
-                    "[PIC-PROFILE] native-materialize-batch key=%s layers=%d "
-                    "bytes=%d h2d_ms=%.3f scatter_ms=%.3f",
-                    obj.external_key,
-                    len(staging.layers),
-                    staged_bytes,
-                    upload_ms,
-                    scatter_ms,
-                )
-                logger.warning(
-                    "[PIC-PROFILE] native-materialize-total key=%s mode=batch "
-                    "layers=%d bytes=%d cpu_ms=0.000 h2d_index_ms=%.3f "
-                    "total_ms=%.3f",
-                    obj.external_key,
-                    len(staging.layers),
-                    staged_bytes,
-                    upload_ms + scatter_ms,
-                    (time.perf_counter() - total_start) * 1000.0,
-                )
-            return
+        """A receive already wrote the destination blocks, so there is nothing to materialize."""
+        del kv_caches, block_ids
+        if received is not None:
+            self._last_materialized_key = received.obj.external_key
 
     def remove(self, obj: PICNativeKVObject) -> None:
         for member in obj.layers:
