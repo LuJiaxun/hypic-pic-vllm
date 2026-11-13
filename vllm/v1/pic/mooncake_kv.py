@@ -1562,17 +1562,36 @@ class MooncakeNativeKVObjectStore:
         The order is not block-major in every layout - with the KV axis leading, all key blocks come
         before all value blocks - so it is derived from the axes rather than assumed.
         """
-        if not kv_cache.is_contiguous():
-            return None
         if int(kv_cache.data_ptr()) == 0:
+            logger.warning("PIC-DIRECT segments=None reason=data_ptr == 0")
             return None
         if kv_cache.device != for_device:
+            logger.warning(
+                "PIC-DIRECT segments=None reason=device %s != %s",
+                kv_cache.device,
+                for_device,
+            )
             return None
-        # Pinning this range is optional; the call below is what decides whether the store can take it.
-        self._ensure_registered(kv_cache, role="kv-cache")
         kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
         element = kv_cache.element_size()
         strides = [int(stride) * element for stride in kv_cache.stride()]
+        # What a segment list needs is that one block's trailing dimensions run back to back.  The tensor
+        # as a whole may be a view of a packed allocation, and requiring is_contiguous() threw those away.
+        expected = element
+        for axis in range(len(kv_cache.shape) - 1, block_axis, -1):
+            if strides[axis] != expected:
+                logger.warning(
+                    "PIC-DIRECT segments=None reason=block tail not contiguous shape=%s strides=%s "
+                    "axis=%d expected=%d",
+                    tuple(kv_cache.shape),
+                    tuple(strides),
+                    axis,
+                    expected,
+                )
+                return None
+            expected *= int(kv_cache.shape[axis])
+        # Pinning this range is optional; the call below is what decides whether the store can take it.
+        self._ensure_registered(kv_cache, role="kv-cache")
         tail = 1
         for dimension in kv_cache.shape[block_axis + 1 :]:
             tail *= int(dimension)
@@ -1999,6 +2018,9 @@ class MooncakeNativeKVObjectStore:
                         kv_cache, ids, layout, for_device=device
                     )
                     if segments is None:
+                        logger.warning(
+                            "PIC-DIRECT publish plan abandoned layer=%s", layer_name
+                        )
                         entries = []
                         break
                     entries.append((f"{base_key}/layers/{layer_name}", segments))
@@ -3200,6 +3222,12 @@ class MooncakeNativeKVObjectStore:
             addrs.append([base + offset])
             sizes.append([nbytes])
             layout.append((member.layer_name, offset, nbytes))
+        logger.warning(
+            "PIC-DIRECT receive arena=host layers=%d bytes=%d roles=%s",
+            len(keys),
+            total,
+            "host-arena",
+        )
         start = time.perf_counter()
         try:
             result = batch_get(keys, addrs, sizes)
@@ -3207,6 +3235,11 @@ class MooncakeNativeKVObjectStore:
             release()
             raise
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.warning(
+            "PIC-DIRECT receive status=%s keys=%d",
+            result,
+            len(keys),
+        )
         if not self._store_batch_succeeded(result, len(keys)):
             release()
             raise RuntimeError("Mooncake native KV batch receive failed")
