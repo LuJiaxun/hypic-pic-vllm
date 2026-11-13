@@ -9,8 +9,26 @@
 
 | tag | 日期 | 状态 | 关键数字 |
 |---|---|---|---|
+| `pic-tp-seal-2026-11-13` | 2026-11-13 | **当前封版**：TP 键 + store 直连 + transition 单对象；host staging 已删除 | TP=1 三形状 9 条判据全 PASS、`fallback_reasons={}`；c=1 p50 **416.9** / c=4 p50 **653.1** / tput **5.5395**；patch MD5 见 §1.1 |
 | `pic-shapeA-2026-11-11` | 2026-11-11 | **复用链路首次跑通**（执行层已验；**输出一致性未验**） | 形状 A：c=4 tput **6.49**、窗口 4830（`279 + 4830 + 1 = 5110`）、`transition applied range=[279,5109)`、`state_position=5108`、`publish-matrix span=[8,4838) tokens=4830`、`native KV blocks=153` |
 | `pic-fixed-tput59-2026-11-10` | 2026-11-10 | 上一稳定点（H2D 不阻塞、位置校验、attach 去重、`cudaMemGetInfo` 删除） | 形状 A：c=1 p50 **268.9 ms** / tput 3.77、c=4 tput **5.9**、1-token step 27.1 ms |
+
+
+### 1.1 本封版的产物
+
+| 用途 | 文件 | MD5 |
+|---|---|---|
+| 服务器直跑（含真实路径） | `hypic-pic-tp-run-20261113.patch` | `9EB9C139E367DA5BFB42655A409090E4` |
+| 发布脱敏（与 GitHub 一致） | `hypic-pic-tp-dev-20261113-patchcmd.patch` | `7338FF4D3D5C394C116DD6E5DEEA5844` |
+
+两份的 `vllm/` 代码完全一致，差异只有 9 行路径字符串。
+
+**perf 口径**：c=1 p50 在三次会话间为 **381 → 399 → 413 → 417**（每会话 +4~5%、单调），
+会话内四轮稳定（413–425）——属会话级环境漂移，**不是回归**；`c=4 tput` 前三会话 5.85/5.84/5.78，
+本会话 5.54，同行内异常轮（r3=738.5 ms）与僵尸 master 相关。
+
+**未验证项**：TP=2（代码已实现键、分片、全 shard 校验，未上机）；RDMA（`protocol: tcp` 下
+`register_buffer` 不可用，直连靠 store 自身中转）。
 
 两个封版点都有 **annotated tag + 同名 backup 分支 + 离线副本**：
 
