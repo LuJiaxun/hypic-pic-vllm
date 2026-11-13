@@ -576,6 +576,49 @@ def _h2d_on_private_stream(cpu_tensor: Any, device: Any) -> Any:
     return out
 
 
+def _pic_block_span(kv_cache: Any, layout: str | None) -> tuple[int, int] | None:
+    """Physical block geometry, when the blocks sit back to back.
+
+    Returns ``(block_axis, span_elements)`` where ``span_elements`` is one whole block - every axis except
+    the block axis - and ``stride(block_axis)`` equals it. With the cache stored block-major that holds,
+    and a run of consecutive blocks is one contiguous region.
+    """
+    kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
+    span = 1
+    for axis in range(kv_cache.ndim):
+        if axis != block_axis:
+            span *= int(kv_cache.shape[axis])
+    if int(kv_cache.stride(block_axis)) != span:
+        return None
+    return block_axis, span
+
+
+def _pic_flat_run(kv_cache: Any, ids: Sequence[int], layout: str | None) -> Any | None:
+    """A 1-D view over one consecutive run of blocks, or None when the run is not contiguous."""
+    if not ids:
+        return None
+    first = int(ids[0])
+    for offset, block_id in enumerate(ids):
+        if int(block_id) != first + offset:
+            return None
+    geometry = _pic_block_span(kv_cache, layout)
+    if geometry is None:
+        return None
+    block_axis, span = geometry
+    stride = int(kv_cache.stride(block_axis))
+    total = len(ids) * span
+    offset = first * stride
+    storage = kv_cache.untyped_storage()
+    if offset < 0 or offset + total > storage.nbytes() // kv_cache.element_size():
+        return None
+    return _torch().as_strided(
+        kv_cache,
+        size=(total,),
+        stride=(1,),
+        storage_offset=int(kv_cache.storage_offset()) + offset,
+    )
+
+
 def _native_cache_axes(
     kv_cache: Any, *, layout: str | None = None
 ) -> tuple[int, int]:
@@ -2017,17 +2060,23 @@ class MooncakeNativeKVObjectStore:
                     first_dtype = dtype
                 elif first_dtype != dtype:
                     raise ValueError("native KV layers have different dtypes")
-                # The published shape is what index_select produces: the block axis replaced by the
-                # number of blocks taken, every other axis unchanged.  With the blocks-first layout that
-                # axis is not the first one, so it is replaced where it sits.
-                shape = tuple(
-                    len(ids) if position == block_axis else int(size)
-                    for position, size in enumerate(kv_cache.shape)
-                )
-                nbytes = 1
-                for dimension in shape:
-                    nbytes *= int(dimension)
-                nbytes *= kv_cache.element_size()
+                # A consecutive run of blocks is already one contiguous region in a block-major cache,
+                # so the payload is a view of it: one segment per layer instead of one per block.
+                flat = _pic_flat_run(kv_cache, ids, layout)
+                if flat is not None:
+                    shape = (int(flat.numel()),)
+                    nbytes = int(flat.numel()) * kv_cache.element_size()
+                else:
+                    # The published shape is what index_select produces: the block axis replaced by the
+                    # number of blocks taken, every other axis unchanged.
+                    shape = tuple(
+                        len(ids) if position == block_axis else int(size)
+                        for position, size in enumerate(kv_cache.shape)
+                    )
+                    nbytes = 1
+                    for dimension in shape:
+                        nbytes *= int(dimension)
+                    nbytes *= kv_cache.element_size()
                 planned.append(
                     (layer_name, kv_cache, block_axis, kv_axis, shape, dtype, nbytes)
                 )
@@ -2045,9 +2094,18 @@ class MooncakeNativeKVObjectStore:
                 device = planned[0][1].device
                 entries: list[tuple[str, list[tuple[int, int]]]] = []
                 for layer_name, kv_cache, _, _, _, _, _ in planned:
-                    segments = self._layer_block_segments(
-                        kv_cache, ids, layout, for_device=device
-                    )
+                    flat = _pic_flat_run(kv_cache, ids, layout)
+                    if flat is not None:
+                        segments = [
+                            (
+                                int(flat.data_ptr()),
+                                int(flat.numel()) * kv_cache.element_size(),
+                            )
+                        ]
+                    else:
+                        segments = self._layer_block_segments(
+                            kv_cache, ids, layout, for_device=device
+                        )
                     if segments is None:
                         logger.warning(
                             "PIC-DIRECT publish plan abandoned layer=%s", layer_name
@@ -2070,10 +2128,14 @@ class MooncakeNativeKVObjectStore:
             if staging is not None and not sent_all:
                 offset = 0
                 for _, kv_cache, block_axis, _, shape, _, nbytes in planned:
-                    index = _torch().tensor(
-                        ids, dtype=_torch().long, device=kv_cache.device
-                    )
-                    selected = kv_cache.index_select(block_axis, index).contiguous()
+                    flat = _pic_flat_run(kv_cache, ids, layout)
+                    if flat is not None:
+                        selected = flat
+                    else:
+                        index = _torch().tensor(
+                            ids, dtype=_torch().long, device=kv_cache.device
+                        )
+                        selected = kv_cache.index_select(block_axis, index).contiguous()
                     staging[offset : offset + nbytes].view(kv_cache.dtype).reshape(
                         shape
                     ).copy_(selected)
@@ -2116,11 +2178,17 @@ class MooncakeNativeKVObjectStore:
                             .tobytes()
                         )
                     else:
-                        index = _torch().tensor(
-                            ids, dtype=_torch().long, device=kv_cache.device
-                        )
-                        selected = kv_cache.index_select(block_axis, index).contiguous()
-                        payload = _tensor_bytes(selected)
+                        flat = _pic_flat_run(kv_cache, ids, layout)
+                        if flat is not None:
+                            payload = _tensor_bytes(flat.reshape(shape))
+                        else:
+                            index = _torch().tensor(
+                                ids, dtype=_torch().long, device=kv_cache.device
+                            )
+                            selected = kv_cache.index_select(
+                                block_axis, index
+                            ).contiguous()
+                            payload = _tensor_bytes(selected)
                     self._put_layer_until_present(layer_key, payload)
                     written.append(layer_key)
                 else:
@@ -2970,8 +3038,17 @@ class MooncakeNativeKVObjectStore:
                         offset : offset + int(member.nbytes)
                     ].view(_dtype_from_name(member.dtype)).reshape(member.shape)
             if device_values is not None:
-                index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
-                kv_cache.index_copy_(block_axis, index, device_values)
+                flat = (
+                    _pic_flat_run(kv_cache, ids, obj.layout)
+                    if device_values.numel() == member.nbytes // kv_cache.element_size()
+                    and device_values.ndim == 1
+                    else None
+                )
+                if flat is not None:
+                    flat.copy_(device_values.reshape(-1))
+                else:
+                    index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
+                    kv_cache.index_copy_(block_axis, index, device_values)
                 total_bytes += int(member.nbytes)
                 continue
             raw = self.store.get(member.key)
@@ -2999,8 +3076,16 @@ class MooncakeNativeKVObjectStore:
             _pic_profile_sync(torch, kv_cache.device, profile)
             h2d_start = time.perf_counter() if profile else 0.0
             values = values.to(device=kv_cache.device)
-            index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
-            kv_cache.index_copy_(block_axis, index, values)
+            flat = (
+                _pic_flat_run(kv_cache, ids, obj.layout)
+                if values.ndim == 1
+                else None
+            )
+            if flat is not None:
+                flat.copy_(values.reshape(-1))
+            else:
+                index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
+                kv_cache.index_copy_(block_axis, index, values)
             _pic_profile_sync(torch, kv_cache.device, profile)
             h2d_ms = (time.perf_counter() - h2d_start) * 1000.0 if profile else 0.0
             total_bytes += len(raw)
@@ -3252,9 +3337,18 @@ class MooncakeNativeKVObjectStore:
                     )
                     direct = []
                     break
-                segments = self._layer_block_segments(
-                    target, ids, obj.layout, for_device=target.device
-                )
+                flat = _pic_flat_run(target, ids, obj.layout)
+                if flat is not None:
+                    segments = [
+                        (
+                            int(flat.data_ptr()),
+                            int(flat.numel()) * target.element_size(),
+                        )
+                    ]
+                else:
+                    segments = self._layer_block_segments(
+                        target, ids, obj.layout, for_device=target.device
+                    )
                 if segments is None:
                     logger.warning(
                         "PIC-DIRECT receive break: segments %s", member.layer_name
