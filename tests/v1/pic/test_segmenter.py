@@ -41,6 +41,8 @@ from vllm.v1.pic.live_capture import (
 )
 from vllm.v1.pic.metrics import PICMetrics
 from vllm.v1.pic.mooncake_kv import (
+    pic_hybrid_state_key,
+    pic_native_kv_key,
     MooncakeNativeKVObjectStore,
     PICHybridStateObject,
     PICMooncakeReferenceIndex,
@@ -541,7 +543,7 @@ def test_mooncake_native_kv_object_rejects_wrong_destination_shape() -> None:
 def test_mooncake_reference_index_builds_external_nonfinal_hit() -> None:
     class Store:
         def load(self, key: str) -> PICNativeKVObject:
-            assert key == f"segment/{segment.seg_hash.hex()}/group-0"
+            assert key == pic_native_kv_key(segment.seg_hash, 0)
             return PICNativeKVObject(
                 external_key="hypic/native-kv/v1/" + key,
                 kv_cache_group_id=0,
@@ -822,8 +824,8 @@ def test_mooncake_reference_index_requires_hybrid_state_when_requested() -> None
     )
     entry = present.lookup(segment, (0,))
     assert entry is not None
-    assert entry.external_transition_key == (
-        f"segment/{segment.seg_hash.hex()}/hybrid-state"
+    assert entry.external_transition_key == pic_hybrid_state_key(
+        segment.seg_hash
     )
 
 
