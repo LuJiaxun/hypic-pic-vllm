@@ -1379,6 +1379,10 @@ class MooncakeNativeKVObjectStore:
         self._gpu_scratch: dict[str, Any] = {}
         self._gpu_scratch_device: Any = None
         self._gpu_direct_available = True
+        # The put call takes a replicate config.  Built once, and left None when the installed
+        # binding does not expose it, in which case the three-argument form is tried.
+        self._replicate_config_ready = False
+        self._replicate_config_value: Any = None
         # One arena per import thread, all grown to the largest object seen: the
         # pin and the registration are paid once instead of once per object.
         staging_slots = 4
@@ -1498,6 +1502,18 @@ class MooncakeNativeKVObjectStore:
         if result not in (None, 0):
             raise RuntimeError(f"Mooncake {operation} failed: {result}")
 
+    def _replicate_config(self) -> Any:
+        """The store's replicate config, or None when the binding does not have one."""
+        if not self._replicate_config_ready:
+            self._replicate_config_ready = True
+            try:
+                from mooncake.store import ReplicateConfig  # type: ignore
+
+                self._replicate_config_value = ReplicateConfig()
+            except Exception:  # noqa: BLE001 - the three-argument form may still work
+                self._replicate_config_value = None
+        return self._replicate_config_value
+
     def _gpu_direct_enabled(self) -> bool:
         """Whether the store can move bytes to and from a device buffer directly."""
         if not self._gpu_direct_available:
@@ -1600,12 +1616,27 @@ class MooncakeNativeKVObjectStore:
             if not segments:
                 return False
         put = getattr(self.store, "batch_put_from_multi_buffers", None)
+        keys = [key for key, _ in entries]
+        addrs = [[address for address, _ in segments] for _, segments in entries]
+        sizes = [[nbytes for _, nbytes in segments] for _, segments in entries]
+        config = self._replicate_config()
         try:
-            status = put(
-                [key for key, _ in entries],
-                [[address for address, _ in segments] for _, segments in entries],
-                [[nbytes for _, nbytes in segments] for _, segments in entries],
-            )
+            if config is not None:
+                status = put(keys, addrs, sizes, config)
+            else:
+                status = put(keys, addrs, sizes)
+        except TypeError:
+            # An older binding without the parameter: retry the short form before giving up.
+            try:
+                status = put(keys, addrs, sizes)
+            except Exception as exc:  # noqa: BLE001 - fall back to the staged path
+                logger.warning(
+                    "PIC-DIRECT put raised entries=%d segments=%d error=%r",
+                    len(entries),
+                    sum(len(segments) for _, segments in entries),
+                    exc,
+                )
+                return False
         except Exception as exc:  # noqa: BLE001 - fall back to the staged path
             logger.warning(
                 "PIC-DIRECT put raised entries=%d segments=%d error=%r",
