@@ -1609,20 +1609,35 @@ class MooncakeNativeKVObjectStore:
             tail *= int(dimension)
         base = int(kv_cache.data_ptr())
         segments: list[tuple[int, int]] = []
+        per_block = tail * element
+        # Consecutive blocks can share one segment only when they sit back to back: if the block axis is
+        # padded, a merged copy would write into the padding.  With no padding the run collapses to a
+        # single copy per layer instead of one per block.
+        packed = strides[block_axis] == per_block
+        runs: list[tuple[int, int]] = []
+        for block_id in ids:
+            block = int(block_id)
+            if packed and runs and block == runs[-1][0] + runs[-1][1]:
+                runs[-1] = (runs[-1][0], runs[-1][1] + 1)
+            else:
+                runs.append((block, 1))
         if kv_axis < block_axis:
-            # KV axis outside the block axis: every key block, then every value block.
-            per_block = tail * element
+            # KV axis outside the block axis: every key block run, then every value block run.
             for kv in range(int(kv_cache.shape[kv_axis])):
                 kv_offset = kv * strides[kv_axis]
-                for block_id in ids:
+                for first, count in runs:
                     segments.append(
-                        (base + kv_offset + int(block_id) * strides[block_axis], per_block)
+                        (
+                            base + kv_offset + first * strides[block_axis],
+                            count * per_block,
+                        )
                     )
         else:
-            # Block axis outside the KV axis: one segment per block, both halves together.
-            per_block = tail * element
-            for block_id in ids:
-                segments.append((base + int(block_id) * strides[block_axis], per_block))
+            # Block axis outside the KV axis: one segment per run, both halves together.
+            for first, count in runs:
+                segments.append(
+                    (base + first * strides[block_axis], count * per_block)
+                )
         return segments
 
     def _ensure_registered(self, tensor: Any, *, role: str) -> bool:
