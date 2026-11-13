@@ -6,6 +6,8 @@
 # 环境变量：
 #   PIC_BASE      fixture 目录（默认 <repo>/tests/v1/pic/fixtures/a）
 #   PIC_MODEL     模型路径
+#   PIC_TP        tensor parallel size（默认 1；>1 时两个服务端各自需要这么多张卡）
+#   PIC_CUDA_A / PIC_CUDA_B  两个服务端各自用哪些卡（默认 0 / 1）
 #   PIC_MOONCAKE  mooncake 配置文件
 #   PIC_TRACE_DIR trace 输出目录
 #   PIC_LOG_DIR   日志与 pid 目录
@@ -27,6 +29,15 @@ BASE="${PIC_BASE:-$VLLM_DIR/tests/v1/pic/fixtures/a}"
 TRACE_DIR="${PIC_TRACE_DIR:-$VLLM_DIR/tests/v1/pic/trace}"
 LOG_DIR="${PIC_LOG_DIR:-$VLLM_DIR/tests/v1/pic/logs}"
 MODEL="${PIC_MODEL:-/path/to/Qwen3.5-2B}"
+# Tensor parallel size, and the devices each server gets.  With TP>1 one server needs several
+# devices, so they are named per side rather than assumed to be 0 and 1.
+TP="${PIC_TP:-1}"
+CUDA_A="${PIC_CUDA_A:-0}"
+CUDA_B="${PIC_CUDA_B:-1}"
+TP_FLAG=""
+if [ "$TP" -gt 1 ] 2>/dev/null; then
+  TP_FLAG="--tensor-parallel-size $TP"
+fi
 MOONCAKE_CONFIG="${PIC_MOONCAKE:-$LOG_DIR/mooncake_config.json}"
 mkdir -p "$TRACE_DIR" "$LOG_DIR"
 
@@ -47,6 +58,7 @@ case "$MODE" in
   *) echo "MODE 必须是 perf|diag|trace|serve"; exit 1 ;;
 esac
 echo "===== MODE=$MODE  DEBUG=$DEBUG  TRACE=$TRACE  BASE=$BASE  VLLM_DIR=$VLLM_DIR ====="
+echo "===== TP=$TP  A=[$CUDA_A]  B=[$CUDA_B]  FLAGS=${TP_FLAG:-none} ====="
 
 # ---------- [1] 清场 ----------
 for pat in "vllm serve" "VLLM::EngineCore" "EngineCore"; do
@@ -129,8 +141,9 @@ else
 fi
 
 # ---------- [4] 起 A ----------
-( export CUDA_VISIBLE_DEVICES=0
+( export CUDA_VISIBLE_DEVICES="$CUDA_A"
   vllm serve "$MODEL" --served-model-name qwen3.5-2b --port 8000 \
+    $TP_FLAG \
     --max-model-len 8192 --max-num-batched-tokens 8192 \
     --gpu-memory-utilization 0.5 --enforce-eager \
     --no-enable-prefix-caching \
@@ -142,8 +155,9 @@ PROF=""
 if [ "$TRACE" = "1" ]; then
   PROF="--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"$TRACE_DIR\",\"torch_profiler_with_stack\":false,\"torch_profiler_use_gzip\":false}"
 fi
-( export CUDA_VISIBLE_DEVICES=1
+( export CUDA_VISIBLE_DEVICES="$CUDA_B"
   vllm serve "$MODEL" --served-model-name qwen3.5-2b --port 8001 \
+    $TP_FLAG \
     --max-model-len 8192 --max-num-batched-tokens 8192 \
     --gpu-memory-utilization 0.5 --enforce-eager \
     --no-enable-prefix-caching \
