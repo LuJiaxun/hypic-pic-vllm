@@ -1521,12 +1521,11 @@ class MooncakeNativeKVObjectStore:
             if capacity >= nbytes and tensor.device == self._gpu_scratch_device:
                 return tensor[:nbytes]
         tensor = _torch().empty(nbytes, dtype=_torch().uint8, device=self._gpu_scratch_device)
-        registered = self._register_store_buffer_best_effort(
+        # Registering is an optimisation, not a permission: without a pin the store still copies into
+        # this address through its own staging.  Only a failed call decides the path.
+        self._register_store_buffer_best_effort(
             address=tensor.data_ptr(), nbytes=int(tensor.numel()), role=f"gpu-scratch-{role}"
         )
-        if not registered:
-            self._gpu_direct_available = False
-            return None
         self._gpu_scratch[role] = (tensor, int(tensor.numel()))
         return tensor
 
@@ -1543,10 +1542,10 @@ class MooncakeNativeKVObjectStore:
             return None
         if int(kv_cache.data_ptr()) == 0:
             return None
-        if not self._ensure_registered(kv_cache, role="kv-cache"):
-            return None
         if kv_cache.device != for_device:
             return None
+        # Pinning this range is optional; the call below is what decides whether the store can take it.
+        self._ensure_registered(kv_cache, role="kv-cache")
         kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
         element = kv_cache.element_size()
         strides = [int(stride) * element for stride in kv_cache.stride()]
@@ -1592,9 +1591,6 @@ class MooncakeNativeKVObjectStore:
         for _, segments in entries:
             if not segments:
                 return False
-            for address, nbytes in segments:
-                if not self._is_device_registered(address, nbytes):
-                    return False
         put = getattr(self.store, "batch_put_from_multi_buffers", None)
         try:
             status = put(
@@ -1619,9 +1615,6 @@ class MooncakeNativeKVObjectStore:
         for _, segments in entries:
             if not segments:
                 return False
-            for address, nbytes in segments:
-                if not self._is_device_registered(address, nbytes):
-                    return False
         get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
         try:
             status = get_into(
@@ -1650,8 +1643,6 @@ class MooncakeNativeKVObjectStore:
         """Store several objects' bytes straight from device memory, in one call."""
         if not self._gpu_direct_enabled() or not entries:
             return False
-        if not all(self._is_device_registered(address, nbytes) for _, address, nbytes in entries):
-            return False
         put = getattr(self.store, "batch_put_from_multi_buffers", None)
         try:
             status = put(
@@ -1672,8 +1663,6 @@ class MooncakeNativeKVObjectStore:
     ) -> bool:
         """Read several objects' bytes straight into device memory, in one call."""
         if not self._gpu_direct_enabled() or not entries:
-            return False
-        if not all(self._is_device_registered(address, nbytes) for _, address, nbytes in entries):
             return False
         get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
         try:
