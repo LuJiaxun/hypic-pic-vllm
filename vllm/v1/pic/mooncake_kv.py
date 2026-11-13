@@ -1371,6 +1371,11 @@ class MooncakeNativeKVObjectStore:
         self.store = store
         self.key_prefix = prefix
         self._registered_buffer_ptrs: set[int] = set()
+        # One device buffer, grown on demand, that the store can write into directly.  The host
+        # staging pool stays for the paths that still need bytes in hand (fallback and checksum).
+        self._gpu_scratch: dict[str, Any] = {}
+        self._gpu_scratch_device: Any = None
+        self._gpu_direct_available = True
         # One arena per import thread, all grown to the largest object seen: the
         # pin and the registration are paid once instead of once per object.
         staging_slots = 4
@@ -1489,6 +1494,67 @@ class MooncakeNativeKVObjectStore:
     def _check_status(result: Any, operation: str) -> None:
         if result not in (None, 0):
             raise RuntimeError(f"Mooncake {operation} failed: {result}")
+
+    def _gpu_direct_enabled(self) -> bool:
+        """Whether the store can move bytes to and from a device buffer directly."""
+        if not self._gpu_direct_available:
+            return False
+        return callable(getattr(self.store, "batch_get_into_multi_buffers", None)) and callable(
+            getattr(self.store, "batch_put_from_multi_buffers", None)
+        )
+
+    def _scratch_for(self, nbytes: int, role: str) -> Any | None:
+        """A registered device buffer of at least ``nbytes``, kept per role.
+
+        One tensor per role, grown on demand and registered once: registering a fresh temporary on every
+        layer would cost more than the copy it saves.  Publish and import run in different threads and can
+        overlap, so they do not share a buffer.
+        """
+        if nbytes <= 0:
+            return None
+        pooled = self._gpu_scratch.get(role)
+        if pooled is not None:
+            tensor, capacity = pooled
+            if capacity >= nbytes and tensor.device == self._gpu_scratch_device:
+                return tensor[:nbytes]
+        tensor = _torch().empty(nbytes, dtype=_torch().uint8, device=self._gpu_scratch_device)
+        registered = self._register_store_buffer_best_effort(
+            address=tensor.data_ptr(), nbytes=int(tensor.numel()), role=f"gpu-scratch-{role}"
+        )
+        if not registered:
+            self._gpu_direct_available = False
+            return None
+        self._gpu_scratch[role] = (tensor, int(tensor.numel()))
+        return tensor
+
+    def _put_layer_from_device(self, key: str, tensor: Any, nbytes: int) -> bool:
+        """Store one layer's bytes straight from device memory."""
+        if not self._gpu_direct_enabled() or not tensor.is_contiguous():
+            return False
+        if tensor.data_ptr() not in self._registered_buffer_ptrs:
+            return False
+        put = getattr(self.store, "batch_put_from_multi_buffers", None)
+        try:
+            status = put([key], [[tensor.data_ptr()]], [[int(nbytes)]])
+        except Exception:  # noqa: BLE001 - fall back to the host path
+            return False
+        return bool(status) and all(int(value) >= 0 for value in status)
+
+    def _get_layer_into_device(self, key: str, nbytes: int, dtype: Any, shape: Any) -> Any | None:
+        """Read one layer's bytes straight into device memory, as a view of the scratch."""
+        if not self._gpu_direct_enabled():
+            return None
+        scratch = self._scratch_for(nbytes, "import")
+        if scratch is None:
+            return None
+        get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
+        try:
+            status = get_into([key], [[scratch.data_ptr()]], [[int(nbytes)]])
+        except Exception:  # noqa: BLE001 - fall back to the host path
+            return None
+        if not status or any(int(value) < 0 for value in status):
+            return None
+        return scratch.view(dtype).reshape(shape)
 
     def _register_store_buffer_best_effort(
         self, *, address: int, nbytes: int, role: str
@@ -1713,8 +1779,20 @@ class MooncakeNativeKVObjectStore:
                 )
                 selected = kv_cache.index_select(block_axis, index).contiguous()
                 layer_key = f"{base_key}/layers/{layer_name}"
-                payload = _tensor_bytes(selected)
-                self._put_layer_until_present(layer_key, payload)
+                layer_nbytes = selected.numel() * selected.element_size()
+                payload: bytes | None = None
+                if self._gpu_scratch_device is None:
+                    self._gpu_scratch_device = selected.device
+                # The gathered tensor is a fresh allocation, so it is not a registered buffer.  Copy it
+                # into the registered scratch instead of registering every publication.
+                scratch = self._scratch_for(layer_nbytes, "publish")
+                sent = False
+                if scratch is not None:
+                    scratch.view(selected.dtype).reshape(selected.shape).copy_(selected)
+                    sent = self._put_layer_from_device(layer_key, scratch, layer_nbytes)
+                if not sent:
+                    payload = _tensor_bytes(selected)
+                    self._put_layer_until_present(layer_key, payload)
                 written.append(layer_key)
                 layers.append(
                     PICNativeKVLayerObject(
@@ -1722,8 +1800,12 @@ class MooncakeNativeKVObjectStore:
                         key=layer_key,
                         shape=tuple(int(item) for item in selected.shape),
                         dtype=dtype,
-                        nbytes=selected.numel() * selected.element_size(),
-                        checksum=hashlib.sha256(payload).hexdigest(),
+                        nbytes=layer_nbytes,
+                        checksum=(
+                            None
+                            if payload is None
+                            else hashlib.sha256(payload).hexdigest()
+                        ),
                     )
                 )
             manifest = PICNativeKVObject(
@@ -2446,6 +2528,21 @@ class MooncakeNativeKVObjectStore:
             if _dtype_name(kv_cache.dtype) != member.dtype:
                 raise ValueError("native KV layer dtype is incompatible")
             get_start = time.perf_counter() if profile else 0.0
+            device_values = None
+            if self._gpu_scratch_device is None:
+                self._gpu_scratch_device = kv_cache.device
+            if not profile:
+                device_values = self._get_layer_into_device(
+                    member.key,
+                    int(member.nbytes),
+                    _dtype_from_name(member.dtype),
+                    member.shape,
+                )
+            if device_values is not None:
+                index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
+                kv_cache.index_copy_(block_axis, index, device_values)
+                total_bytes += int(member.nbytes)
+                continue
             raw = self.store.get(member.key)
             get_ms = (time.perf_counter() - get_start) * 1000.0 if profile else 0.0
             if len(raw) != member.nbytes:
