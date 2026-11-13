@@ -2422,12 +2422,18 @@ class GPUModelRunner(
         """Register a worker-local Mooncake/native-KV adapter."""
         self.pic_external_kv.register(provider)
 
-    def _initialize_pic_mooncake(self) -> None:
+    def _initialize_pic_mooncake(
+        self, kv_caches: dict[str, Any] | None = None
+    ) -> None:
         """Connect the worker to the vLLM 0.22.1 Mooncake store API."""
         if not self.vllm_config.pic_config.mooncake:
             return
         try:
             self.pic_mooncake_object_store = connect_mooncake_native_kv_store()
+            if kv_caches:
+                # The receive side needs the destination tensors to address the blocks it was told to
+                # fill; they are process-constant, so they are handed over once here.
+                self.pic_mooncake_object_store.set_kv_caches(kv_caches)
             self.pic_external_kv.unregister("mooncake")
             self.register_pic_external_kv_provider(
                 MooncakePICExternalKVProvider(
@@ -11428,7 +11434,7 @@ class GPUModelRunner(
             kv_cache_config, kernel_block_sizes
         )
         if not is_profiling:
-            self._initialize_pic_mooncake()
+            self._initialize_pic_mooncake(kv_caches)
 
         if (
             self.speculative_config

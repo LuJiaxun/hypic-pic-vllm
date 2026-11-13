@@ -576,6 +576,49 @@ def _h2d_on_private_stream(cpu_tensor: Any, device: Any) -> Any:
     return out
 
 
+def _pic_block_span(kv_cache: Any, layout: str | None) -> tuple[int, int] | None:
+    """Physical block geometry, when the blocks sit back to back.
+
+    Returns ``(block_axis, span_elements)`` where ``span_elements`` is one whole block - every axis except
+    the block axis - and ``stride(block_axis)`` equals it. With the cache stored block-major that holds,
+    and a run of consecutive blocks is one contiguous region.
+    """
+    kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
+    span = 1
+    for axis in range(kv_cache.ndim):
+        if axis != block_axis:
+            span *= int(kv_cache.shape[axis])
+    if int(kv_cache.stride(block_axis)) != span:
+        return None
+    return block_axis, span
+
+
+def _pic_flat_run(kv_cache: Any, ids: Sequence[int], layout: str | None) -> Any | None:
+    """A 1-D view over one consecutive run of blocks, or None when the run is not contiguous."""
+    if not ids:
+        return None
+    first = int(ids[0])
+    for offset, block_id in enumerate(ids):
+        if int(block_id) != first + offset:
+            return None
+    geometry = _pic_block_span(kv_cache, layout)
+    if geometry is None:
+        return None
+    block_axis, span = geometry
+    stride = int(kv_cache.stride(block_axis))
+    total = len(ids) * span
+    offset = first * stride
+    storage = kv_cache.untyped_storage()
+    if offset < 0 or offset + total > storage.nbytes() // kv_cache.element_size():
+        return None
+    return _torch().as_strided(
+        kv_cache,
+        size=(total,),
+        stride=(1,),
+        storage_offset=int(kv_cache.storage_offset()) + offset,
+    )
+
+
 def _native_cache_axes(
     kv_cache: Any, *, layout: str | None = None
 ) -> tuple[int, int]:
@@ -1379,6 +1422,13 @@ class MooncakeNativeKVObjectStore:
         self._gpu_scratch: dict[str, Any] = {}
         self._gpu_scratch_device: Any = None
         self._gpu_direct_available = True
+        # The put call takes a replicate config.  Built once, and left None when the installed
+        # binding does not expose it, in which case the three-argument form is tried.
+        self._replicate_config_ready = False
+        self._replicate_config_value: Any = None
+        # Layer name to KV tensor, handed over once by the worker.  A receive that can address the
+        # destination blocks needs them; without them it falls back to the host arena.
+        self._kv_cache_layers: dict[str, Any] = {}
         # One arena per import thread, all grown to the largest object seen: the
         # pin and the registration are paid once instead of once per object.
         staging_slots = 4
@@ -1498,13 +1548,42 @@ class MooncakeNativeKVObjectStore:
         if result not in (None, 0):
             raise RuntimeError(f"Mooncake {operation} failed: {result}")
 
+    def set_kv_caches(self, kv_caches: Mapping[str, Any]) -> None:
+        """Remember the layer tensors so a receive can address its destination directly."""
+        self._kv_cache_layers = {
+            str(name): tensor for name, tensor in kv_caches.items()
+        }
+        logger.warning(
+            "PIC-DIRECT kv-layers registered layers=%d", len(self._kv_cache_layers)
+        )
+
+    def _replicate_config(self) -> Any:
+        """The store's replicate config, or None when the binding does not have one."""
+        if not self._replicate_config_ready:
+            self._replicate_config_ready = True
+            try:
+                from mooncake.store import ReplicateConfig  # type: ignore
+
+                self._replicate_config_value = ReplicateConfig()
+            except Exception:  # noqa: BLE001 - the three-argument form may still work
+                self._replicate_config_value = None
+        return self._replicate_config_value
+
     def _gpu_direct_enabled(self) -> bool:
         """Whether the store can move bytes to and from a device buffer directly."""
         if not self._gpu_direct_available:
+            logger.warning("PIC-DIRECT enabled=False reason=_gpu_direct_available")
             return False
-        return callable(getattr(self.store, "batch_get_into_multi_buffers", None)) and callable(
-            getattr(self.store, "batch_put_from_multi_buffers", None)
-        )
+        get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
+        put = getattr(self.store, "batch_put_from_multi_buffers", None)
+        if not callable(get_into) or not callable(put):
+            logger.warning(
+                "PIC-DIRECT enabled=False reason=api get_into=%s put=%s",
+                callable(get_into),
+                callable(put),
+            )
+            return False
+        return True
 
     def _scratch_for(self, nbytes: int, role: str) -> Any | None:
         """A registered device buffer of at least ``nbytes``, kept per role.
@@ -1521,12 +1600,11 @@ class MooncakeNativeKVObjectStore:
             if capacity >= nbytes and tensor.device == self._gpu_scratch_device:
                 return tensor[:nbytes]
         tensor = _torch().empty(nbytes, dtype=_torch().uint8, device=self._gpu_scratch_device)
-        registered = self._register_store_buffer_best_effort(
+        # Registering is an optimisation, not a permission: without a pin the store still copies into
+        # this address through its own staging.  Only a failed call decides the path.
+        self._register_store_buffer_best_effort(
             address=tensor.data_ptr(), nbytes=int(tensor.numel()), role=f"gpu-scratch-{role}"
         )
-        if not registered:
-            self._gpu_direct_available = False
-            return None
         self._gpu_scratch[role] = (tensor, int(tensor.numel()))
         return tensor
 
@@ -1539,36 +1617,70 @@ class MooncakeNativeKVObjectStore:
         The order is not block-major in every layout - with the KV axis leading, all key blocks come
         before all value blocks - so it is derived from the axes rather than assumed.
         """
-        if not kv_cache.is_contiguous():
-            return None
         if int(kv_cache.data_ptr()) == 0:
-            return None
-        if not self._ensure_registered(kv_cache, role="kv-cache"):
+            logger.warning("PIC-DIRECT segments=None reason=data_ptr == 0")
             return None
         if kv_cache.device != for_device:
+            logger.warning(
+                "PIC-DIRECT segments=None reason=device %s != %s",
+                kv_cache.device,
+                for_device,
+            )
             return None
         kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
         element = kv_cache.element_size()
         strides = [int(stride) * element for stride in kv_cache.stride()]
+        # What a segment list needs is that one block's trailing dimensions run back to back.  The tensor
+        # as a whole may be a view of a packed allocation, and requiring is_contiguous() threw those away.
+        expected = element
+        for axis in range(len(kv_cache.shape) - 1, block_axis, -1):
+            if strides[axis] != expected:
+                logger.warning(
+                    "PIC-DIRECT segments=None reason=block tail not contiguous shape=%s strides=%s "
+                    "axis=%d expected=%d",
+                    tuple(kv_cache.shape),
+                    tuple(strides),
+                    axis,
+                    expected,
+                )
+                return None
+            expected *= int(kv_cache.shape[axis])
+        # Pinning this range is optional; the call below is what decides whether the store can take it.
+        self._ensure_registered(kv_cache, role="kv-cache")
         tail = 1
         for dimension in kv_cache.shape[block_axis + 1 :]:
             tail *= int(dimension)
         base = int(kv_cache.data_ptr())
         segments: list[tuple[int, int]] = []
+        per_block = tail * element
+        # Consecutive blocks can share one segment only when they sit back to back: if the block axis is
+        # padded, a merged copy would write into the padding.  With no padding the run collapses to a
+        # single copy per layer instead of one per block.
+        packed = strides[block_axis] == per_block
+        runs: list[tuple[int, int]] = []
+        for block_id in ids:
+            block = int(block_id)
+            if packed and runs and block == runs[-1][0] + runs[-1][1]:
+                runs[-1] = (runs[-1][0], runs[-1][1] + 1)
+            else:
+                runs.append((block, 1))
         if kv_axis < block_axis:
-            # KV axis outside the block axis: every key block, then every value block.
-            per_block = tail * element
+            # KV axis outside the block axis: every key block run, then every value block run.
             for kv in range(int(kv_cache.shape[kv_axis])):
                 kv_offset = kv * strides[kv_axis]
-                for block_id in ids:
+                for first, count in runs:
                     segments.append(
-                        (base + kv_offset + int(block_id) * strides[block_axis], per_block)
+                        (
+                            base + kv_offset + first * strides[block_axis],
+                            count * per_block,
+                        )
                     )
         else:
-            # Block axis outside the KV axis: one segment per block, both halves together.
-            per_block = tail * element
-            for block_id in ids:
-                segments.append((base + int(block_id) * strides[block_axis], per_block))
+            # Block axis outside the KV axis: one segment per run, both halves together.
+            for first, count in runs:
+                segments.append(
+                    (base + first * strides[block_axis], count * per_block)
+                )
         return segments
 
     def _ensure_registered(self, tensor: Any, *, role: str) -> bool:
@@ -1592,18 +1704,43 @@ class MooncakeNativeKVObjectStore:
         for _, segments in entries:
             if not segments:
                 return False
-            for address, nbytes in segments:
-                if not self._is_device_registered(address, nbytes):
-                    return False
         put = getattr(self.store, "batch_put_from_multi_buffers", None)
+        keys = [key for key, _ in entries]
+        addrs = [[address for address, _ in segments] for _, segments in entries]
+        sizes = [[nbytes for _, nbytes in segments] for _, segments in entries]
+        config = self._replicate_config()
         try:
-            status = put(
-                [key for key, _ in entries],
-                [[address for address, _ in segments] for _, segments in entries],
-                [[nbytes for _, nbytes in segments] for _, segments in entries],
+            if config is not None:
+                status = put(keys, addrs, sizes, config)
+            else:
+                status = put(keys, addrs, sizes)
+        except TypeError:
+            # An older binding without the parameter: retry the short form before giving up.
+            try:
+                status = put(keys, addrs, sizes)
+            except Exception as exc:  # noqa: BLE001 - fall back to the staged path
+                logger.warning(
+                    "PIC-DIRECT put raised entries=%d segments=%d error=%r",
+                    len(entries),
+                    sum(len(segments) for _, segments in entries),
+                    exc,
+                )
+                return False
+        except Exception as exc:  # noqa: BLE001 - fall back to the staged path
+            logger.warning(
+                "PIC-DIRECT put raised entries=%d segments=%d error=%r",
+                len(entries),
+                sum(len(segments) for _, segments in entries),
+                exc,
             )
-        except Exception:  # noqa: BLE001 - fall back to the staged path
             return False
+        logger.warning(
+            "PIC-DIRECT put status=%s entries=%d segments=%d first_key=%s",
+            status,
+            len(entries),
+            sum(len(segments) for _, segments in entries),
+            entries[0][0] if entries else "",
+        )
         return (
             status is not None
             and len(status) == len(entries)
@@ -1613,15 +1750,16 @@ class MooncakeNativeKVObjectStore:
     def _get_batch_into_segments(
         self, entries: Sequence[tuple[str, Sequence[tuple[int, int]]]]
     ) -> bool:
-        """Read several objects straight into their destination segments."""
+        """Read several objects straight into their destination segments.
+
+        The store answers with the bytes it moved for each key - not a status - so a negative value is the
+        failure signal and anything else is a count.
+        """
         if not self._gpu_direct_enabled() or not entries:
             return False
         for _, segments in entries:
             if not segments:
                 return False
-            for address, nbytes in segments:
-                if not self._is_device_registered(address, nbytes):
-                    return False
         get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
         try:
             status = get_into(
@@ -1629,8 +1767,21 @@ class MooncakeNativeKVObjectStore:
                 [[address for address, _ in segments] for _, segments in entries],
                 [[nbytes for _, nbytes in segments] for _, segments in entries],
             )
-        except Exception:  # noqa: BLE001 - fall back to the staged path
+        except Exception as exc:  # noqa: BLE001 - fall back to the staged path
+            logger.warning(
+                "PIC-DIRECT get_into raised entries=%d segments=%d error=%r",
+                len(entries),
+                sum(len(segments) for _, segments in entries),
+                exc,
+            )
             return False
+        logger.warning(
+            "PIC-DIRECT get_into status=%s entries=%d segments=%d first_key=%s",
+            status,
+            len(entries),
+            sum(len(segments) for _, segments in entries),
+            entries[0][0] if entries else "",
+        )
         return (
             status is not None
             and len(status) == len(entries)
@@ -1649,8 +1800,6 @@ class MooncakeNativeKVObjectStore:
     ) -> bool:
         """Store several objects' bytes straight from device memory, in one call."""
         if not self._gpu_direct_enabled() or not entries:
-            return False
-        if not all(self._is_device_registered(address, nbytes) for _, address, nbytes in entries):
             return False
         put = getattr(self.store, "batch_put_from_multi_buffers", None)
         try:
@@ -1672,8 +1821,6 @@ class MooncakeNativeKVObjectStore:
     ) -> bool:
         """Read several objects' bytes straight into device memory, in one call."""
         if not self._gpu_direct_enabled() or not entries:
-            return False
-        if not all(self._is_device_registered(address, nbytes) for _, address, nbytes in entries):
             return False
         get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
         try:
@@ -1913,17 +2060,23 @@ class MooncakeNativeKVObjectStore:
                     first_dtype = dtype
                 elif first_dtype != dtype:
                     raise ValueError("native KV layers have different dtypes")
-                # The published shape is what index_select produces: the block axis replaced by the
-                # number of blocks taken, every other axis unchanged.  With the blocks-first layout that
-                # axis is not the first one, so it is replaced where it sits.
-                shape = tuple(
-                    len(ids) if position == block_axis else int(size)
-                    for position, size in enumerate(kv_cache.shape)
-                )
-                nbytes = 1
-                for dimension in shape:
-                    nbytes *= int(dimension)
-                nbytes *= kv_cache.element_size()
+                # A consecutive run of blocks is already one contiguous region in a block-major cache,
+                # so the payload is a view of it: one segment per layer instead of one per block.
+                flat = _pic_flat_run(kv_cache, ids, layout)
+                if flat is not None:
+                    shape = (int(flat.numel()),)
+                    nbytes = int(flat.numel()) * kv_cache.element_size()
+                else:
+                    # The published shape is what index_select produces: the block axis replaced by the
+                    # number of blocks taken, every other axis unchanged.
+                    shape = tuple(
+                        len(ids) if position == block_axis else int(size)
+                        for position, size in enumerate(kv_cache.shape)
+                    )
+                    nbytes = 1
+                    for dimension in shape:
+                        nbytes *= int(dimension)
+                    nbytes *= kv_cache.element_size()
                 planned.append(
                     (layer_name, kv_cache, block_axis, kv_axis, shape, dtype, nbytes)
                 )
@@ -1941,24 +2094,48 @@ class MooncakeNativeKVObjectStore:
                 device = planned[0][1].device
                 entries: list[tuple[str, list[tuple[int, int]]]] = []
                 for layer_name, kv_cache, _, _, _, _, _ in planned:
-                    segments = self._layer_block_segments(
-                        kv_cache, ids, layout, for_device=device
-                    )
+                    flat = _pic_flat_run(kv_cache, ids, layout)
+                    if flat is not None:
+                        segments = [
+                            (
+                                int(flat.data_ptr()),
+                                int(flat.numel()) * kv_cache.element_size(),
+                            )
+                        ]
+                    else:
+                        segments = self._layer_block_segments(
+                            kv_cache, ids, layout, for_device=device
+                        )
                     if segments is None:
+                        logger.warning(
+                            "PIC-DIRECT publish plan abandoned layer=%s", layer_name
+                        )
                         entries = []
                         break
                     entries.append((f"{base_key}/layers/{layer_name}", segments))
+                logger.warning(
+                    "PIC-DIRECT publish planned=%d entries=%d segments=%d ids=%s",
+                    len(planned),
+                    len(entries),
+                    sum(len(segments) for _, segments in entries),
+                    list(ids),
+                )
                 if entries:
                     sent_all = self._put_batch_from_segments(entries)
+                logger.warning("PIC-DIRECT publish sent_all=%s", sent_all)
             if not sent_all and not _pic_payload_checksum_enabled():
                 staging = self._scratch_for(int(total_bytes), "publish")
             if staging is not None and not sent_all:
                 offset = 0
                 for _, kv_cache, block_axis, _, shape, _, nbytes in planned:
-                    index = _torch().tensor(
-                        ids, dtype=_torch().long, device=kv_cache.device
-                    )
-                    selected = kv_cache.index_select(block_axis, index).contiguous()
+                    flat = _pic_flat_run(kv_cache, ids, layout)
+                    if flat is not None:
+                        selected = flat
+                    else:
+                        index = _torch().tensor(
+                            ids, dtype=_torch().long, device=kv_cache.device
+                        )
+                        selected = kv_cache.index_select(block_axis, index).contiguous()
                     staging[offset : offset + nbytes].view(kv_cache.dtype).reshape(
                         shape
                     ).copy_(selected)
@@ -2001,11 +2178,17 @@ class MooncakeNativeKVObjectStore:
                             .tobytes()
                         )
                     else:
-                        index = _torch().tensor(
-                            ids, dtype=_torch().long, device=kv_cache.device
-                        )
-                        selected = kv_cache.index_select(block_axis, index).contiguous()
-                        payload = _tensor_bytes(selected)
+                        flat = _pic_flat_run(kv_cache, ids, layout)
+                        if flat is not None:
+                            payload = _tensor_bytes(flat.reshape(shape))
+                        else:
+                            index = _torch().tensor(
+                                ids, dtype=_torch().long, device=kv_cache.device
+                            )
+                            selected = kv_cache.index_select(
+                                block_axis, index
+                            ).contiguous()
+                            payload = _tensor_bytes(selected)
                     self._put_layer_until_present(layer_key, payload)
                     written.append(layer_key)
                 else:
@@ -2181,22 +2364,29 @@ class MooncakeNativeKVObjectStore:
         call into GPU destinations instead of reading and deserializing the
         large compact operator blob.
         """
-        objects: list[tuple[str, bytes]] = []
+        blob_key = f"{source_prefix}/store/state"
+        # Every tensor goes into one blob at a recorded offset: the store charges per object, and fifty
+        # of them cost more than the bytes they carry.
+        chunks: list[bytes] = []
+        cursor = 0
 
         def add_tensor(tensor: Any, role: str) -> dict[str, Any]:
+            nonlocal cursor
             if tensor is None:
                 raise ValueError("transition Store layout contains a null tensor")
             tensor = tensor.detach().contiguous()
             raw = _tensor_bytes(tensor)
             if not raw:
                 raise ValueError("transition Store layout contains an empty tensor")
-            key = f"{source_prefix}/store/{role}"
-            objects.append((key, raw))
+            offset = cursor
+            chunks.append(raw)
+            cursor += len(raw)
             return {
-                "key": key,
+                "key": blob_key,
                 "shape": [int(item) for item in tensor.shape],
                 "dtype": _dtype_name(tensor.dtype),
                 "nbytes": len(raw),
+                "offset": offset,
             }
 
         transitions: list[dict[str, Any]] = []
@@ -2266,14 +2456,16 @@ class MooncakeNativeKVObjectStore:
                 }
             )
 
+        blob = b"".join(chunks)
         return (
             {
                 "version": 1,
                 "token_count": operator.token_end - operator.token_start,
+                "blob": {"key": blob_key, "nbytes": len(blob)},
                 "transitions": transitions,
                 "conv_transitions": conv_transitions,
             },
-            tuple(objects),
+            ((blob_key, blob),),
         )
 
     def load_transition_manifest(self, external_key: str) -> PICHybridStateObject:
@@ -2443,83 +2635,72 @@ class MooncakeNativeKVObjectStore:
         if not callable(batch_get):
             raise NotImplementedError("Mooncake Store batch receive is unavailable")
 
-        cache_key = self._store_state_cache_key(manifest.external_key, device)
-        entry = self._store_state_buffers.get(cache_key)
-        if entry is None:
-            entry = {"buffers": {}, "users": 0}
-            self._store_state_buffers[cache_key] = entry
-
         records = self._store_layout_tensor_records(layout)
-        keys = [str(record["key"]) for _, record in records]
-        targets: dict[str, Any] = {}
-        representation = "store-host-staging"
+        blob = layout.get("blob") or {}
+        blob_key = str(blob.get("key") or "")
+        total = int(blob.get("nbytes") or 0)
+        if not blob_key or total <= 0:
+            raise ValueError("Store transition descriptor has no blob")
+        on_cuda = getattr(device, "type", None) == "cuda"
+        slab = None
+        representation = "device-direct"
         elapsed_ms = 0.0
-        if not targets:
-            host_plan, total = self._store_state_host_layout(records=records)
-            on_cuda = getattr(device, "type", None) == "cuda"
-            if self._shared_staging:
-                host = self._staging_pool.acquire(total, pin=on_cuda)
-            else:
-                # Per-object arena, the behaviour before the pool existed.
-                cache = entry.setdefault("host_staging", {})
-                host = cache.get("host")
-                if host is None or int(host.numel()) < total:
-                    host = _torch().empty(
-                        total, dtype=_torch().uint8, pin_memory=on_cuda
-                    )
-                    cache["host"] = host
-                    cache["host_registered"] = (
-                        self._register_store_buffer_best_effort(
-                            address=int(host.data_ptr()),
-                            nbytes=int(host.numel()),
-                            role="transition-host-arena",
-                        )
-                    )
-                    cache["device"] = None
+        if on_cuda and self._gpu_direct_enabled():
             try:
-                addrs = [
-                    [int(host.data_ptr()) + host_plan[role][0]]
-                    for role, _ in records
-                ]
-                sizes = [[host_plan[role][1]] for role, _ in records]
+                slab = _torch().empty(total, dtype=_torch().uint8, device=device)
                 start = time.perf_counter()
-                result = batch_get(keys, addrs, sizes)
+                result = batch_get([blob_key], [[int(slab.data_ptr())]], [[total]])
                 elapsed_ms = (time.perf_counter() - start) * 1000.0
-                if not self._store_batch_succeeded(result, len(keys)):
-                    raise RuntimeError("Mooncake Store transition receive failed")
-                views_start = time.perf_counter()
-                targets = self._store_state_host_targets(
-                    entry=entry,
-                    records=records,
-                    host_plan=host_plan,
-                    host=host,
-                    device=device,
-                )
-            finally:
-                # The device copy is what the caller keeps, but the copy engine is still reading the
-                # host arena, so the arena goes back to the pool only once that copy is done - tracked
-                # by the pool, not waited for here, which is what made the upload synchronous.
-                if self._shared_staging:
-                    self._staging_pool.release(host, _h2d_last_upload.get("event"))
-            upload_ms = float(getattr(self, "_last_transition_upload_ms", 0.0) or 0.0)
-            views_ms = (time.perf_counter() - views_start) * 1000.0 - upload_ms
-            if _pic_import_profile_enabled():
-                # Splitting receive, upload and view construction is the only way
-                # to tell a slow link from a slow host-to-device copy: the two
-                # hide behind the same total and need different fixes.
-                last_upload = dict(_h2d_last_upload)
+                if not self._store_batch_succeeded(result, 1):
+                    slab = None
+            except Exception:  # noqa: BLE001 - fall back to the host arena
+                slab = None
+            if slab is not None:
                 logger.warning(
-                    "[PIC-PROFILE] transition-phases key=%s receive_ms=%.3f "
-                    "upload_ms=%.3f views_ms=%.3f total_ms=%.3f pinned=%s "
-                    "upload_device_ms=%.3f",
-                    manifest.external_key,
-                    elapsed_ms,
-                    upload_ms,
-                    max(views_ms, 0.0),
-                    elapsed_ms + upload_ms + max(views_ms, 0.0),
-                    last_upload.get("pinned"),
-                    float(last_upload.get("device_ms", 0.0) or 0.0),
+                    "PIC-DIRECT transition representation=device-direct tensors=%d bytes=%d status=%s",
+                    len(records),
+                    total,
+                    result,
                 )
+        if slab is None:
+            representation = "store-host-staging"
+            host = _torch().empty(total, dtype=_torch().uint8, pin_memory=on_cuda)
+            self._register_store_buffer_best_effort(
+                address=int(host.data_ptr()),
+                nbytes=int(host.numel()),
+                role="transition-host-arena",
+            )
+            start = time.perf_counter()
+            result = batch_get([blob_key], [[int(host.data_ptr())]], [[total]])
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if not self._store_batch_succeeded(result, 1):
+                raise RuntimeError("Mooncake Store transition receive failed")
+            slab = _h2d_on_private_stream(host, device)
+
+        targets: dict[str, Any] = {}
+        torch = _torch()
+        views_start = time.perf_counter()
+        for role, record in records:
+            offset = int(record["offset"])
+            nbytes = int(record["nbytes"])
+            dtype = _dtype_from_name(str(record["dtype"]))
+            shape = tuple(int(size) for size in record["shape"])
+            targets[role] = (
+                slab[offset : offset + nbytes]
+                .view(dtype)
+                .reshape(shape)
+            )
+        views_ms = (time.perf_counter() - views_start) * 1000.0
+        if _pic_import_profile_enabled():
+            logger.warning(
+                "[PIC-PROFILE] transition-phases key=%s receive_ms=%.3f "
+                "upload_ms=0.000 views_ms=%.3f total_ms=%.3f representation=%s",
+                manifest.external_key,
+                elapsed_ms,
+                views_ms,
+                elapsed_ms + views_ms,
+                representation,
+            )
 
         transitions: list[PICStateTransition] = []
         for index, item in enumerate(layout.get("transitions", ())):
@@ -2557,11 +2738,8 @@ class MooncakeNativeKVObjectStore:
             token_start=manifest.span_start,
             token_end=manifest.span_start + manifest.token_count,
         )
-        entry["users"] = int(entry.get("users", 0)) + 1
-        finalize(operator, self._release_store_state_entry, cache_key, entry)
-        # The device tensors may still be in flight; the reader waits on this event where it first
-        # reads them, which is one forward pass later.
-        register_pending_upload(operator, _h2d_last_upload.get("event"))
+        # The slab belongs to this operator now: the views are slices of it, so holding the operator
+        # holds the bytes.
         if _pic_import_profile_enabled():
             logger.warning(
                 "[PIC-PROFILE] transition-store-total key=%s "
@@ -2733,11 +2911,21 @@ class MooncakeNativeKVObjectStore:
         # Straight into the request's blocks when the store can address them: the destination is a list
         # of per-block segments, so there is nothing to stage.  Validation runs first - a mismatch must
         # fail before a byte is written.
+        logger.warning(
+            "PIC-DIRECT restore profile=%s verify_checksum=%s layers=%d",
+            profile,
+            verify_checksum,
+            len(obj.layers),
+        )
         if not profile and not verify_checksum:
             direct_entries: list[tuple[str, list[tuple[int, int]]]] = []
             for member in obj.layers:
                 target = kv_caches.get(member.layer_name)
                 if target is None:
+                    logger.warning(
+                        "PIC-DIRECT restore break: no target layer=%s",
+                        member.layer_name,
+                    )
                     direct_entries = []
                     break
                 _, target_block_axis = _native_cache_axes(target, layout=obj.layout)
@@ -2748,18 +2936,41 @@ class MooncakeNativeKVObjectStore:
                     )
                     if position != target_block_axis
                 ):
+                    logger.warning(
+                        "PIC-DIRECT restore break: shape layer=%s target=%s want=%s",
+                        member.layer_name,
+                        tuple(target.shape),
+                        tuple(member.shape),
+                    )
                     direct_entries = []
                     break
                 if _dtype_name(target.dtype) != member.dtype:
+                    logger.warning(
+                        "PIC-DIRECT restore break: dtype layer=%s target=%s want=%s",
+                        member.layer_name,
+                        _dtype_name(target.dtype),
+                        member.dtype,
+                    )
                     direct_entries = []
                     break
                 segments = self._layer_block_segments(
                     target, ids, obj.layout, for_device=target.device
                 )
                 if segments is None:
+                    logger.warning(
+                        "PIC-DIRECT restore break: segments layer=%s contiguous=%s device=%s",
+                        member.layer_name,
+                        target.is_contiguous(),
+                        target.device,
+                    )
                     direct_entries = []
                     break
                 direct_entries.append((member.key, segments))
+            logger.warning(
+                "PIC-DIRECT restore direct_entries=%d segments=%d",
+                len(direct_entries),
+                sum(len(segments) for _, segments in direct_entries),
+            )
             if direct_entries and self._get_batch_into_segments(direct_entries):
                 if profile:
                     logger.warning(
@@ -2822,8 +3033,17 @@ class MooncakeNativeKVObjectStore:
                         offset : offset + int(member.nbytes)
                     ].view(_dtype_from_name(member.dtype)).reshape(member.shape)
             if device_values is not None:
-                index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
-                kv_cache.index_copy_(block_axis, index, device_values)
+                flat = (
+                    _pic_flat_run(kv_cache, ids, obj.layout)
+                    if device_values.numel() == member.nbytes // kv_cache.element_size()
+                    and device_values.ndim == 1
+                    else None
+                )
+                if flat is not None:
+                    flat.copy_(device_values.reshape(-1))
+                else:
+                    index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
+                    kv_cache.index_copy_(block_axis, index, device_values)
                 total_bytes += int(member.nbytes)
                 continue
             raw = self.store.get(member.key)
@@ -2851,8 +3071,16 @@ class MooncakeNativeKVObjectStore:
             _pic_profile_sync(torch, kv_cache.device, profile)
             h2d_start = time.perf_counter() if profile else 0.0
             values = values.to(device=kv_cache.device)
-            index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
-            kv_cache.index_copy_(block_axis, index, values)
+            flat = (
+                _pic_flat_run(kv_cache, ids, obj.layout)
+                if values.ndim == 1
+                else None
+            )
+            if flat is not None:
+                flat.copy_(values.reshape(-1))
+            else:
+                index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
+                kv_cache.index_copy_(block_axis, index, values)
             _pic_profile_sync(torch, kv_cache.device, profile)
             h2d_ms = (time.perf_counter() - h2d_start) * 1000.0 if profile else 0.0
             total_bytes += len(raw)
@@ -3092,6 +3320,44 @@ class MooncakeNativeKVObjectStore:
         ids = tuple(int(block_id) for block_id in block_ids)
         if len(ids) != obj.block_count or len(set(ids)) != len(ids):
             raise ValueError("native KV destination block span does not match object")
+        # Straight into the destination blocks when the worker handed over the layers: the blocks are the
+        # same span the publisher wrote, so the segment list is computable on this side too.
+        if self._kv_cache_layers and self._gpu_direct_enabled():
+            direct: list[tuple[str, list[tuple[int, int]]]] = []
+            for member in obj.layers:
+                target = self._kv_cache_layers.get(member.layer_name)
+                if target is None:
+                    logger.warning(
+                        "PIC-DIRECT receive break: no layer %s", member.layer_name
+                    )
+                    direct = []
+                    break
+                flat = _pic_flat_run(target, ids, obj.layout)
+                if flat is not None:
+                    segments = [
+                        (
+                            int(flat.data_ptr()),
+                            int(flat.numel()) * target.element_size(),
+                        )
+                    ]
+                else:
+                    segments = self._layer_block_segments(
+                        target, ids, obj.layout, for_device=target.device
+                    )
+                if segments is None:
+                    logger.warning(
+                        "PIC-DIRECT receive break: segments %s", member.layer_name
+                    )
+                    direct = []
+                    break
+                direct.append((member.key, segments))
+            logger.warning(
+                "PIC-DIRECT receive direct_layers=%d segments=%d",
+                len(direct),
+                sum(len(segments) for _, segments in direct),
+            )
+            if direct and self._get_batch_into_segments(direct):
+                return PICNativeKVReceived(obj=obj)
         plan, total = self._native_host_plan(obj)
         arena, release = self._rent_native_arena(obj.external_key, total)
         base = int(arena.data_ptr())
@@ -3105,6 +3371,12 @@ class MooncakeNativeKVObjectStore:
             addrs.append([base + offset])
             sizes.append([nbytes])
             layout.append((member.layer_name, offset, nbytes))
+        logger.warning(
+            "PIC-DIRECT receive arena=host layers=%d bytes=%d roles=%s",
+            len(keys),
+            total,
+            "host-arena",
+        )
         start = time.perf_counter()
         try:
             result = batch_get(keys, addrs, sizes)
@@ -3112,6 +3384,11 @@ class MooncakeNativeKVObjectStore:
             release()
             raise
         elapsed_ms = (time.perf_counter() - start) * 1000.0
+        logger.warning(
+            "PIC-DIRECT receive status=%s keys=%d",
+            result,
+            len(keys),
+        )
         if not self._store_batch_succeeded(result, len(keys)):
             release()
             raise RuntimeError("Mooncake native KV batch receive failed")

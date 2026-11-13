@@ -70,7 +70,7 @@ python3 -c "import vllm.v1.pic.state, vllm.v1.pic.native_kv, vllm.v1.pic.mooncak
 
 | 开关 | 关掉后行为 |
 |---|---|
-| llm/config/pic.py: async_import | **默认已改为 True**（阻塞式导入是它替换掉的旧行为）；要回到 C1b 的阻塞路径，把它改成 False 并重启 |
+| `vllm/config/pic.py: async_import` | **默认已改为 True**（阻塞式导入是它替换掉的旧行为）；要回到 C1b 的阻塞路径，把它改成 False 并重启 |
 | `--pic-enable`（去掉） | 整条 PIC 关闭，等同全量 prefill |
 | `HYPIC_PIC_DEBUG`（unset） | 诊断日志全关（生产默认） |
 
