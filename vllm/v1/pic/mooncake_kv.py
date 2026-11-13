@@ -1371,6 +1371,9 @@ class MooncakeNativeKVObjectStore:
         self.store = store
         self.key_prefix = prefix
         self._registered_buffer_ptrs: set[int] = set()
+        # Registered (address, length) ranges: a slice inside one is inside the region, which is
+        # what a batched call needs when several layers share one scratch allocation.
+        self._registered_regions: list[tuple[int, int]] = []
         # One device buffer, grown on demand, that the store can write into directly.  The host
         # staging pool stays for the paths that still need bytes in hand (fallback and checksum).
         self._gpu_scratch: dict[str, Any] = {}
@@ -1527,34 +1530,165 @@ class MooncakeNativeKVObjectStore:
         self._gpu_scratch[role] = (tensor, int(tensor.numel()))
         return tensor
 
-    def _put_layer_from_device(self, key: str, tensor: Any, nbytes: int) -> bool:
-        """Store one layer's bytes straight from device memory."""
-        if not self._gpu_direct_enabled() or not tensor.is_contiguous():
+    def _layer_block_segments(
+        self, kv_cache: Any, ids: Sequence[int], layout: str, *, for_device: Any
+    ) -> list[tuple[int, int]] | None:
+        """One (address, bytes) per block, in the order ``index_select`` would produce.
+
+        A block slice is contiguous, so a segment list is all the store needs: there is nothing to gather.
+        The order is not block-major in every layout - with the KV axis leading, all key blocks come
+        before all value blocks - so it is derived from the axes rather than assumed.
+        """
+        if not kv_cache.is_contiguous():
+            return None
+        if int(kv_cache.data_ptr()) == 0:
+            return None
+        if not self._ensure_registered(kv_cache, role="kv-cache"):
+            return None
+        if kv_cache.device != for_device:
+            return None
+        kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
+        element = kv_cache.element_size()
+        strides = [int(stride) * element for stride in kv_cache.stride()]
+        tail = 1
+        for dimension in kv_cache.shape[block_axis + 1 :]:
+            tail *= int(dimension)
+        base = int(kv_cache.data_ptr())
+        segments: list[tuple[int, int]] = []
+        if kv_axis < block_axis:
+            # KV axis outside the block axis: every key block, then every value block.
+            per_block = tail * element
+            for kv in range(int(kv_cache.shape[kv_axis])):
+                kv_offset = kv * strides[kv_axis]
+                for block_id in ids:
+                    segments.append(
+                        (base + kv_offset + int(block_id) * strides[block_axis], per_block)
+                    )
+        else:
+            # Block axis outside the KV axis: one segment per block, both halves together.
+            per_block = tail * element
+            for block_id in ids:
+                segments.append((base + int(block_id) * strides[block_axis], per_block))
+        return segments
+
+    def _ensure_registered(self, tensor: Any, *, role: str) -> bool:
+        """Register a tensor's range once, keyed by its base address."""
+        address = int(tensor.data_ptr())
+        nbytes = int(tensor.numel()) * int(tensor.element_size())
+        if address in self._registered_buffer_ptrs and self._is_device_registered(
+            address, nbytes
+        ):
+            return True
+        return self._register_store_buffer_best_effort(
+            address=address, nbytes=nbytes, role=role
+        )
+
+    def _put_batch_from_segments(
+        self, entries: Sequence[tuple[str, Sequence[tuple[int, int]]]]
+    ) -> bool:
+        """Store several objects, each described by its own list of source segments."""
+        if not self._gpu_direct_enabled() or not entries:
             return False
-        if tensor.data_ptr() not in self._registered_buffer_ptrs:
+        for _, segments in entries:
+            if not segments:
+                return False
+            for address, nbytes in segments:
+                if not self._is_device_registered(address, nbytes):
+                    return False
+        put = getattr(self.store, "batch_put_from_multi_buffers", None)
+        try:
+            status = put(
+                [key for key, _ in entries],
+                [[address for address, _ in segments] for _, segments in entries],
+                [[nbytes for _, nbytes in segments] for _, segments in entries],
+            )
+        except Exception:  # noqa: BLE001 - fall back to the staged path
+            return False
+        return (
+            status is not None
+            and len(status) == len(entries)
+            and all(int(value) >= 0 for value in status)
+        )
+
+    def _get_batch_into_segments(
+        self, entries: Sequence[tuple[str, Sequence[tuple[int, int]]]]
+    ) -> bool:
+        """Read several objects straight into their destination segments."""
+        if not self._gpu_direct_enabled() or not entries:
+            return False
+        for _, segments in entries:
+            if not segments:
+                return False
+            for address, nbytes in segments:
+                if not self._is_device_registered(address, nbytes):
+                    return False
+        get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
+        try:
+            status = get_into(
+                [key for key, _ in entries],
+                [[address for address, _ in segments] for _, segments in entries],
+                [[nbytes for _, nbytes in segments] for _, segments in entries],
+            )
+        except Exception:  # noqa: BLE001 - fall back to the staged path
+            return False
+        return (
+            status is not None
+            and len(status) == len(entries)
+            and all(int(value) >= 0 for value in status)
+        )
+
+    def _is_device_registered(self, address: int, nbytes: int) -> bool:
+        """Whether a range sits inside a buffer the store was told about."""
+        for base, size in self._registered_regions:
+            if base <= address and address + nbytes <= base + size:
+                return True
+        return False
+
+    def _put_batch_from_device(
+        self, entries: Sequence[tuple[str, int, int]]
+    ) -> bool:
+        """Store several objects' bytes straight from device memory, in one call."""
+        if not self._gpu_direct_enabled() or not entries:
+            return False
+        if not all(self._is_device_registered(address, nbytes) for _, address, nbytes in entries):
             return False
         put = getattr(self.store, "batch_put_from_multi_buffers", None)
         try:
-            status = put([key], [[tensor.data_ptr()]], [[int(nbytes)]])
+            status = put(
+                [key for key, _, _ in entries],
+                [[address] for _, address, _ in entries],
+                [[nbytes] for _, _, nbytes in entries],
+            )
         except Exception:  # noqa: BLE001 - fall back to the host path
             return False
-        return bool(status) and all(int(value) >= 0 for value in status)
+        return (
+            status is not None
+            and len(status) == len(entries)
+            and all(int(value) >= 0 for value in status)
+        )
 
-    def _get_layer_into_device(self, key: str, nbytes: int, dtype: Any, shape: Any) -> Any | None:
-        """Read one layer's bytes straight into device memory, as a view of the scratch."""
-        if not self._gpu_direct_enabled():
-            return None
-        scratch = self._scratch_for(nbytes, "import")
-        if scratch is None:
-            return None
+    def _get_batch_into_device(
+        self, entries: Sequence[tuple[str, int, int]]
+    ) -> bool:
+        """Read several objects' bytes straight into device memory, in one call."""
+        if not self._gpu_direct_enabled() or not entries:
+            return False
+        if not all(self._is_device_registered(address, nbytes) for _, address, nbytes in entries):
+            return False
         get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
         try:
-            status = get_into([key], [[scratch.data_ptr()]], [[int(nbytes)]])
+            status = get_into(
+                [key for key, _, _ in entries],
+                [[address] for _, address, _ in entries],
+                [[nbytes] for _, _, nbytes in entries],
+            )
         except Exception:  # noqa: BLE001 - fall back to the host path
-            return None
-        if not status or any(int(value) < 0 for value in status):
-            return None
-        return scratch.view(dtype).reshape(shape)
+            return False
+        return (
+            status is not None
+            and len(status) == len(entries)
+            and all(int(value) >= 0 for value in status)
+        )
 
     def _register_store_buffer_best_effort(
         self, *, address: int, nbytes: int, role: str
@@ -1592,6 +1726,7 @@ class MooncakeNativeKVObjectStore:
                 )
             return False
         self._registered_buffer_ptrs.add(int(address))
+        self._registered_regions.append((int(address), int(nbytes)))
         return True
 
     def _unregister_store_buffer(self, address: int) -> None:
@@ -1763,7 +1898,11 @@ class MooncakeNativeKVObjectStore:
         layers: list[PICNativeKVLayerObject] = []
         first_dtype: str | None = None
         try:
-            for layer_name, kv_cache in sorted(kv_caches.items()):
+            ordered = sorted(kv_caches.items())
+            # Pass one: validate every layer and work out how much device staging the batch needs.
+            planned: list[tuple[str, Any, int, Any, tuple[int, ...], str, int]] = []
+            total_bytes = 0
+            for layer_name, kv_cache in ordered:
                 kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
                 if max(ids) >= kv_cache.shape[block_axis]:
                     raise ValueError("native KV block ID exceeds cache capacity")
@@ -1774,33 +1913,110 @@ class MooncakeNativeKVObjectStore:
                     first_dtype = dtype
                 elif first_dtype != dtype:
                     raise ValueError("native KV layers have different dtypes")
-                index = _torch().tensor(
-                    ids, dtype=_torch().long, device=kv_cache.device
+                # The published shape is what index_select produces: the block axis replaced by the
+                # number of blocks taken, every other axis unchanged.  With the blocks-first layout that
+                # axis is not the first one, so it is replaced where it sits.
+                shape = tuple(
+                    len(ids) if position == block_axis else int(size)
+                    for position, size in enumerate(kv_cache.shape)
                 )
-                selected = kv_cache.index_select(block_axis, index).contiguous()
+                nbytes = 1
+                for dimension in shape:
+                    nbytes *= int(dimension)
+                nbytes *= kv_cache.element_size()
+                planned.append(
+                    (layer_name, kv_cache, block_axis, kv_axis, shape, dtype, nbytes)
+                )
+                total_bytes += nbytes
+
+            # Pass two: send the blocks where they are, or fall back to staging them.
+            staging = None
+            sent_all = False
+            offsets: list[int] = []
+            if self._gpu_scratch_device is None and planned:
+                self._gpu_scratch_device = planned[0][1].device
+            # The device path cannot hash bytes it never holds, so taking it is a choice about the
+            # checksum, not about profiling.
+            if not _pic_payload_checksum_enabled() and planned:
+                device = planned[0][1].device
+                entries: list[tuple[str, list[tuple[int, int]]]] = []
+                for layer_name, kv_cache, _, _, _, _, _ in planned:
+                    segments = self._layer_block_segments(
+                        kv_cache, ids, layout, for_device=device
+                    )
+                    if segments is None:
+                        entries = []
+                        break
+                    entries.append((f"{base_key}/layers/{layer_name}", segments))
+                if entries:
+                    sent_all = self._put_batch_from_segments(entries)
+            if not sent_all and not _pic_payload_checksum_enabled():
+                staging = self._scratch_for(int(total_bytes), "publish")
+            if staging is not None and not sent_all:
+                offset = 0
+                for _, kv_cache, block_axis, _, shape, _, nbytes in planned:
+                    index = _torch().tensor(
+                        ids, dtype=_torch().long, device=kv_cache.device
+                    )
+                    selected = kv_cache.index_select(block_axis, index).contiguous()
+                    staging[offset : offset + nbytes].view(kv_cache.dtype).reshape(
+                        shape
+                    ).copy_(selected)
+                    offsets.append(offset)
+                    offset += nbytes
+                entries_staged = [
+                    (
+                        f"{base_key}/layers/{layer_name}",
+                        int(staging.data_ptr()) + offset,
+                        nbytes,
+                    )
+                    for offset, (layer_name, _, _, _, _, _, nbytes) in zip(
+                        offsets, planned
+                    )
+                ]
+                sent_all = self._put_batch_from_device(entries_staged)
+
+            for position, (
+                layer_name,
+                kv_cache,
+                block_axis,
+                kv_axis,
+                shape,
+                dtype,
+                nbytes,
+            ) in enumerate(planned):
                 layer_key = f"{base_key}/layers/{layer_name}"
-                layer_nbytes = selected.numel() * selected.element_size()
                 payload: bytes | None = None
-                if self._gpu_scratch_device is None:
-                    self._gpu_scratch_device = selected.device
-                # The gathered tensor is a fresh allocation, so it is not a registered buffer.  Copy it
-                # into the registered scratch instead of registering every publication.
-                scratch = self._scratch_for(layer_nbytes, "publish")
-                sent = False
-                if scratch is not None:
-                    scratch.view(selected.dtype).reshape(selected.shape).copy_(selected)
-                    sent = self._put_layer_from_device(layer_key, scratch, layer_nbytes)
-                if not sent:
-                    payload = _tensor_bytes(selected)
+                if not sent_all:
+                    if staging is not None:
+                        # The batch was refused: the bytes are already on device, so the fallback only
+                        # pays the copy back to the host instead of gathering again.
+                        offset = offsets[position]
+                        payload = (
+                            staging[offset : offset + nbytes]
+                            .view(kv_cache.dtype)
+                            .reshape(shape)
+                            .cpu()
+                            .numpy()
+                            .tobytes()
+                        )
+                    else:
+                        index = _torch().tensor(
+                            ids, dtype=_torch().long, device=kv_cache.device
+                        )
+                        selected = kv_cache.index_select(block_axis, index).contiguous()
+                        payload = _tensor_bytes(selected)
                     self._put_layer_until_present(layer_key, payload)
-                written.append(layer_key)
+                    written.append(layer_key)
+                else:
+                    written.append(layer_key)
                 layers.append(
                     PICNativeKVLayerObject(
                         layer_name=layer_name,
                         key=layer_key,
-                        shape=tuple(int(item) for item in selected.shape),
+                        shape=tuple(int(item) for item in shape),
                         dtype=dtype,
-                        nbytes=layer_nbytes,
+                        nbytes=int(nbytes),
                         checksum=(
                             None
                             if payload is None
@@ -2514,6 +2730,76 @@ class MooncakeNativeKVObjectStore:
         total_checksum_ms = 0.0
         total_cpu_ms = 0.0
         total_h2d_ms = 0.0
+        # Straight into the request's blocks when the store can address them: the destination is a list
+        # of per-block segments, so there is nothing to stage.  Validation runs first - a mismatch must
+        # fail before a byte is written.
+        if not profile and not verify_checksum:
+            direct_entries: list[tuple[str, list[tuple[int, int]]]] = []
+            for member in obj.layers:
+                target = kv_caches.get(member.layer_name)
+                if target is None:
+                    direct_entries = []
+                    break
+                _, target_block_axis = _native_cache_axes(target, layout=obj.layout)
+                if len(target.shape) != len(member.shape) or any(
+                    left != right
+                    for position, (left, right) in enumerate(
+                        zip(target.shape, member.shape)
+                    )
+                    if position != target_block_axis
+                ):
+                    direct_entries = []
+                    break
+                if _dtype_name(target.dtype) != member.dtype:
+                    direct_entries = []
+                    break
+                segments = self._layer_block_segments(
+                    target, ids, obj.layout, for_device=target.device
+                )
+                if segments is None:
+                    direct_entries = []
+                    break
+                direct_entries.append((member.key, segments))
+            if direct_entries and self._get_batch_into_segments(direct_entries):
+                if profile:
+                    logger.warning(
+                        "[PIC-PROFILE] native-direct key=%s layers=%d bytes=%d",
+                        obj.external_key,
+                        len(direct_entries),
+                        sum(int(member.nbytes) for member in obj.layers),
+                    )
+                return
+
+        # One call for the whole group when the store can write into device memory; the offsets are
+        # reused per layer below.
+        device_staging = None
+        device_batch_offsets: dict[str, int] | None = None
+        if not profile:
+            total_device_bytes = sum(int(member.nbytes) for member in obj.layers)
+            if self._gpu_scratch_device is None and obj.layers:
+                first_layer = kv_caches.get(obj.layers[0].layer_name)
+                self._gpu_scratch_device = (
+                    first_layer.device if first_layer is not None else None
+                )
+            device_staging = self._scratch_for(int(total_device_bytes), "import")
+            if device_staging is not None:
+                device_batch_offsets = {}
+                entries: list[tuple[str, int, int]] = []
+                offset = 0
+                for member in obj.layers:
+                    device_batch_offsets[member.key] = offset
+                    entries.append(
+                        (
+                            member.key,
+                            int(device_staging.data_ptr()) + offset,
+                            int(member.nbytes),
+                        )
+                    )
+                    offset += int(member.nbytes)
+                if not self._get_batch_into_device(entries):
+                    device_staging = None
+                    device_batch_offsets = None
+
         for member in obj.layers:
             kv_cache = kv_caches.get(member.layer_name)
             if kv_cache is None:
@@ -2529,15 +2815,12 @@ class MooncakeNativeKVObjectStore:
                 raise ValueError("native KV layer dtype is incompatible")
             get_start = time.perf_counter() if profile else 0.0
             device_values = None
-            if self._gpu_scratch_device is None:
-                self._gpu_scratch_device = kv_cache.device
-            if not profile:
-                device_values = self._get_layer_into_device(
-                    member.key,
-                    int(member.nbytes),
-                    _dtype_from_name(member.dtype),
-                    member.shape,
-                )
+            if device_batch_offsets is not None:
+                offset = device_batch_offsets.get(member.key)
+                if offset is not None:
+                    device_values = device_staging[
+                        offset : offset + int(member.nbytes)
+                    ].view(_dtype_from_name(member.dtype)).reshape(member.shape)
             if device_values is not None:
                 index = torch.tensor(ids, dtype=torch.long, device=kv_cache.device)
                 kv_cache.index_copy_(block_axis, index, device_values)
