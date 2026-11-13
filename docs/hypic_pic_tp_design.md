@@ -55,15 +55,20 @@
 
 ## 4. 设计
 
-### 4.1 键 schema v2：加 TP 段
+### 4.1 键 schema v2：每个键都带 rank
 
 ```
 segment/<hash>/group-<gid>/tp-<rank>-of-<size>
 segment/<hash>/hybrid-state/tp-<rank>-of-<size>
 ```
 
-- `size` 写进键里，使 TP=1 的旧键与新键**不会误命中**（旧键没有 tp 段 → 直接不匹配，自然失效）；
-- 读侧必须用**自己的 rank** 去查；查不到就是 miss（不做"取任意一个 rank 的"这种容错——那是错数据）。
+- **每个 TP 大小都带后缀，包括 TP=1**（`tp-0-of-1`）。理由与原生 connector 一致：它对 rank 是
+  **无条件感知**的——用 `hostname:port` 定位 rank（`remote_session = f"{meta.remote_hostname}:{meta.remote_port}"`），
+  `remote_tp_size` / `remote_tp_rank` 永远在元数据里，没有 `size == 1` 的特殊分支，TP=1 只是退化情形。
+  我们的寻址靠共享 object store 的键，所以 rank 只能写进键里。
+- 副作用（可接受）：TP=1 的键格式变了一次，已发布的旧对象自然 miss——缓存，代价是一次重算。
+- 读侧必须用**自己的 rank** 去查；查不到就是 miss（不做"取任意一个 rank 的"这种容错——那是错数据）；
+  且不同 TP 大小的缓存**不会互相误命中**（`of-<size>` 不同）。
 
 ### 4.2 发布：每 rank 各自发布自己那片
 
