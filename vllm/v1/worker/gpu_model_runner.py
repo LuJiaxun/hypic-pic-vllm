@@ -196,6 +196,8 @@ from vllm.v1.pic.live_capture import (
 )
 from vllm.v1.pic.metrics import PICMetrics
 from vllm.v1.pic.mooncake_kv import (
+    pic_hybrid_state_key,
+    pic_native_kv_key,
     MooncakeNativeKVObjectStore,
     connect_mooncake_native_kv_store,
 )
@@ -3611,9 +3613,7 @@ class GPUModelRunner(
                 )
                 self.pic_metrics.record_materialization(kind="alias")
                 if self.pic_mooncake_object_store is not None:
-                    external_key = (
-                        f"segment/{segment.seg_hash.hex()}/group-{group_id}"
-                    )
+                    external_key = pic_native_kv_key(segment.seg_hash, group_id)
                     group_kv_caches = {
                         layer_name: getattr(
                             self.compilation_config.static_forward_context[layer_name],
@@ -3764,9 +3764,7 @@ class GPUModelRunner(
             )
             self.pic_metrics.record_materialization(kind="public")
             if self.pic_mooncake_object_store is not None:
-                external_key = (
-                    f"segment/{segment.seg_hash.hex()}/group-{group_id}"
-                )
+                external_key = pic_native_kv_key(segment.seg_hash, group_id)
                 group_kv_caches = {
                     layer_name: getattr(
                         self.compilation_config.static_forward_context[layer_name],
@@ -4066,7 +4064,7 @@ class GPUModelRunner(
                     seam,
                     span_end,
                 )
-        external_key = f"segment/{segment.seg_hash.hex()}/hybrid-state"
+        external_key = pic_hybrid_state_key(segment.seg_hash)
         try:
             manifest = self.pic_mooncake_object_store.load_transition_manifest(
                 external_key
@@ -11507,7 +11505,7 @@ class GPUModelRunner(
         logger.info(
             "PIC Stage 9-A/9-B/10-A capability check: capability=%s reasons=%s "
             "zero_copy=%s single_request=%s "
-            "spec_decode=%s pp=%s "
+            "spec_decode=%s pp=%s tp=%s "
             "hybrid_state_supported=%s model_supports_mm=%s "
             "model_supports_prompt_embeds=%s pooling=%s "
             "attention_block_layouts=%s",
@@ -11517,6 +11515,7 @@ class GPUModelRunner(
             pic_config.single_request,
             self.speculative_config is not None,
             self.parallel_config.pipeline_parallel_size,
+            self.parallel_config.tensor_parallel_size,
             hybrid_state_supported,
             self.supports_mm_inputs,
             self.enable_prompt_embeds,

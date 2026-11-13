@@ -1259,6 +1259,51 @@ class _PinnedStagingPool:
             return self.allocations, self._capacity, len(self._free) + self._busy
 
 
+def _pic_tp_rank_and_size() -> tuple[int, int]:
+    """This rank's tensor-parallel identity, or (0, 1) before the groups exist."""
+    try:
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+
+        return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
+    except Exception:  # noqa: BLE001 - a missing group means "not sharded"
+        return 0, 1
+
+
+def pic_tp_key_suffix() -> str:
+    """Key suffix naming this rank's shard, empty at TP=1.
+
+    At TP=1 nothing is sharded, so the empty suffix keeps every key exactly as it was and the
+    single-GPU path is untouched.  Above 1 a segment's KV and its transition are per-rank - the state is
+    sharded by head, the convolution by channel - and two ranks writing one key would overwrite each
+    other's shard.
+    """
+    rank, size = _pic_tp_rank_and_size()
+    if size <= 1:
+        return ""
+    return f"/tp-{rank}-of-{size}"
+
+
+def pic_peer_tp_suffixes() -> tuple[str, ...]:
+    """Suffixes of the other ranks' shards, empty at TP=1."""
+    rank, size = _pic_tp_rank_and_size()
+    if size <= 1:
+        return ()
+    return tuple(f"/tp-{other}-of-{size}" for other in range(size) if other != rank)
+
+
+def pic_native_kv_key(seg_hash: Any, group_id: int) -> str:
+    """Store key for one KV group of one segment, on this rank."""
+    return f"segment/{seg_hash.hex()}/group-{int(group_id)}{pic_tp_key_suffix()}"
+
+
+def pic_hybrid_state_key(seg_hash: Any) -> str:
+    """Store key for the recurrent transition of one segment, on this rank."""
+    return f"segment/{seg_hash.hex()}/hybrid-state{pic_tp_key_suffix()}"
+
+
 class MooncakeNativeKVObjectStore:
     """Persist exact native KV blocks through a Mooncake object store."""
 
@@ -1343,6 +1388,21 @@ class MooncakeNativeKVObjectStore:
         if key == self.key_prefix or key.startswith(prefix):
             return key
         return f"{prefix}{key}"
+
+    def _tp_peers_published(self, key_without_suffix: str) -> bool:
+        """Whether every other rank published its shard of this key.
+
+        A segment is only reusable when all ranks published: applying the shards of two ranks out of four
+        would be wrong in a way no shape check catches.  At TP=1 there is nothing to wait for.
+        """
+        for suffix in pic_peer_tp_suffixes():
+            try:
+                raw = self.store.get(f"{self._key(key_without_suffix + suffix)}/manifest")
+            except Exception:  # noqa: BLE001 - absent is the answer
+                return False
+            if not isinstance(raw, (bytes, bytearray, memoryview)) or not raw:
+                return False
+        return True
 
     @staticmethod
     def _store_layout_keys(value: Any) -> tuple[str, ...]:
@@ -2928,7 +2988,15 @@ class PICMooncakeReferenceIndex:
                     block_size=block_size,
                 )
                 return None
-            external_key = f"segment/{segment.seg_hash.hex()}/group-{int(group_id)}"
+            external_key = pic_native_kv_key(segment.seg_hash, group_id)
+            base_key = f"segment/{segment.seg_hash.hex()}/group-{int(group_id)}"
+            if pic_peer_tp_suffixes() and not self._tp_peers_published(base_key):
+                _pic_lookup_miss(
+                    "tp_shard_missing",
+                    key=base_key,
+                    group=int(group_id),
+                )
+                return None
             try:
                 obj = self.object_store.load(external_key)
             except Exception as exc:  # noqa: BLE001 - the miss is what matters
@@ -3003,8 +3071,17 @@ class PICMooncakeReferenceIndex:
                 length=segment.length,
             )
             return None
-        transition_key = f"segment/{segment.seg_hash.hex()}/hybrid-state"
+        transition_key = pic_hybrid_state_key(segment.seg_hash)
         if self.require_hybrid_state:
+            base_transition_key = f"segment/{segment.seg_hash.hex()}/hybrid-state"
+            if pic_peer_tp_suffixes() and not self._tp_peers_published(
+                base_transition_key
+            ):
+                _pic_lookup_miss(
+                    "tp_shard_missing",
+                    key=base_transition_key,
+                )
+                return None
             try:
                 state = self.object_store.load_transition_manifest(transition_key)
             except Exception as exc:  # noqa: BLE001 - the miss is what matters
