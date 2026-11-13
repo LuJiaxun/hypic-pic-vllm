@@ -1501,10 +1501,18 @@ class MooncakeNativeKVObjectStore:
     def _gpu_direct_enabled(self) -> bool:
         """Whether the store can move bytes to and from a device buffer directly."""
         if not self._gpu_direct_available:
+            logger.warning("PIC-DIRECT enabled=False reason=_gpu_direct_available")
             return False
-        return callable(getattr(self.store, "batch_get_into_multi_buffers", None)) and callable(
-            getattr(self.store, "batch_put_from_multi_buffers", None)
-        )
+        get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
+        put = getattr(self.store, "batch_put_from_multi_buffers", None)
+        if not callable(get_into) or not callable(put):
+            logger.warning(
+                "PIC-DIRECT enabled=False reason=api get_into=%s put=%s",
+                callable(get_into),
+                callable(put),
+            )
+            return False
+        return True
 
     def _scratch_for(self, nbytes: int, role: str) -> Any | None:
         """A registered device buffer of at least ``nbytes``, kept per role.
@@ -1598,8 +1606,21 @@ class MooncakeNativeKVObjectStore:
                 [[address for address, _ in segments] for _, segments in entries],
                 [[nbytes for _, nbytes in segments] for _, segments in entries],
             )
-        except Exception:  # noqa: BLE001 - fall back to the staged path
+        except Exception as exc:  # noqa: BLE001 - fall back to the staged path
+            logger.warning(
+                "PIC-DIRECT put raised entries=%d segments=%d error=%r",
+                len(entries),
+                sum(len(segments) for _, segments in entries),
+                exc,
+            )
             return False
+        logger.warning(
+            "PIC-DIRECT put status=%s entries=%d segments=%d first_key=%s",
+            status,
+            len(entries),
+            sum(len(segments) for _, segments in entries),
+            entries[0][0] if entries else "",
+        )
         return (
             status is not None
             and len(status) == len(entries)
@@ -1622,8 +1643,21 @@ class MooncakeNativeKVObjectStore:
                 [[address for address, _ in segments] for _, segments in entries],
                 [[nbytes for _, nbytes in segments] for _, segments in entries],
             )
-        except Exception:  # noqa: BLE001 - fall back to the staged path
+        except Exception as exc:  # noqa: BLE001 - fall back to the staged path
+            logger.warning(
+                "PIC-DIRECT get_into raised entries=%d segments=%d error=%r",
+                len(entries),
+                sum(len(segments) for _, segments in entries),
+                exc,
+            )
             return False
+        logger.warning(
+            "PIC-DIRECT get_into status=%s entries=%d segments=%d first_key=%s",
+            status,
+            len(entries),
+            sum(len(segments) for _, segments in entries),
+            entries[0][0] if entries else "",
+        )
         return (
             status is not None
             and len(status) == len(entries)
@@ -1937,8 +1971,16 @@ class MooncakeNativeKVObjectStore:
                         entries = []
                         break
                     entries.append((f"{base_key}/layers/{layer_name}", segments))
+                logger.warning(
+                    "PIC-DIRECT publish planned=%d entries=%d segments=%d ids=%s",
+                    len(planned),
+                    len(entries),
+                    sum(len(segments) for _, segments in entries),
+                    list(ids),
+                )
                 if entries:
                     sent_all = self._put_batch_from_segments(entries)
+                logger.warning("PIC-DIRECT publish sent_all=%s", sent_all)
             if not sent_all and not _pic_payload_checksum_enabled():
                 staging = self._scratch_for(int(total_bytes), "publish")
             if staging is not None and not sent_all:
@@ -2722,11 +2764,21 @@ class MooncakeNativeKVObjectStore:
         # Straight into the request's blocks when the store can address them: the destination is a list
         # of per-block segments, so there is nothing to stage.  Validation runs first - a mismatch must
         # fail before a byte is written.
+        logger.warning(
+            "PIC-DIRECT restore profile=%s verify_checksum=%s layers=%d",
+            profile,
+            verify_checksum,
+            len(obj.layers),
+        )
         if not profile and not verify_checksum:
             direct_entries: list[tuple[str, list[tuple[int, int]]]] = []
             for member in obj.layers:
                 target = kv_caches.get(member.layer_name)
                 if target is None:
+                    logger.warning(
+                        "PIC-DIRECT restore break: no target layer=%s",
+                        member.layer_name,
+                    )
                     direct_entries = []
                     break
                 _, target_block_axis = _native_cache_axes(target, layout=obj.layout)
@@ -2737,18 +2789,41 @@ class MooncakeNativeKVObjectStore:
                     )
                     if position != target_block_axis
                 ):
+                    logger.warning(
+                        "PIC-DIRECT restore break: shape layer=%s target=%s want=%s",
+                        member.layer_name,
+                        tuple(target.shape),
+                        tuple(member.shape),
+                    )
                     direct_entries = []
                     break
                 if _dtype_name(target.dtype) != member.dtype:
+                    logger.warning(
+                        "PIC-DIRECT restore break: dtype layer=%s target=%s want=%s",
+                        member.layer_name,
+                        _dtype_name(target.dtype),
+                        member.dtype,
+                    )
                     direct_entries = []
                     break
                 segments = self._layer_block_segments(
                     target, ids, obj.layout, for_device=target.device
                 )
                 if segments is None:
+                    logger.warning(
+                        "PIC-DIRECT restore break: segments layer=%s contiguous=%s device=%s",
+                        member.layer_name,
+                        target.is_contiguous(),
+                        target.device,
+                    )
                     direct_entries = []
                     break
                 direct_entries.append((member.key, segments))
+            logger.warning(
+                "PIC-DIRECT restore direct_entries=%d segments=%d",
+                len(direct_entries),
+                sum(len(segments) for _, segments in direct_entries),
+            )
             if direct_entries and self._get_batch_into_segments(direct_entries):
                 if profile:
                     logger.warning(
