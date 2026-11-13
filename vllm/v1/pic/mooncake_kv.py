@@ -1273,16 +1273,17 @@ def _pic_tp_rank_and_size() -> tuple[int, int]:
 
 
 def pic_tp_key_suffix() -> str:
-    """Key suffix naming this rank's shard, empty at TP=1.
+    """Key suffix naming this rank's shard, present at every TP size.
 
-    At TP=1 nothing is sharded, so the empty suffix keeps every key exactly as it was and the
-    single-GPU path is untouched.  Above 1 a segment's KV and its transition are per-rank - the state is
-    sharded by head, the convolution by channel - and two ranks writing one key would overwrite each
-    other's shard.
+    Always present, including TP=1, so one key format describes every deployment: the native Mooncake
+    connector is rank-aware unconditionally too - it addresses a rank by host and port rather than by
+    special-casing size one.  A single-GPU deployment therefore writes tp-0-of-1, and a segment published
+    there simply misses for a reader at another size instead of being mistaken for its shard.
+
+    Above one rank the shard is real: the recurrent state is split by head and the convolution by channel,
+    so two ranks writing one key would overwrite each other with no shape check to notice.
     """
     rank, size = _pic_tp_rank_and_size()
-    if size <= 1:
-        return ""
     return f"/tp-{rank}-of-{size}"
 
 
