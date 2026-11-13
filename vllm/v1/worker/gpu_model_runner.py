@@ -198,6 +198,7 @@ from vllm.v1.pic.metrics import PICMetrics
 from vllm.v1.pic.mooncake_kv import (
     pic_hybrid_state_key,
     pic_native_kv_key,
+    pic_set_tp_kv_heads,
     MooncakeNativeKVObjectStore,
     connect_mooncake_native_kv_store,
 )
@@ -758,6 +759,9 @@ class GPUModelRunner(
             tuple[str, int], deque[tuple[int, ...]]
         ] = {}
         pic_config = self.vllm_config.pic_config
+        # How many KV heads the model has decides how many ranks share a shard, which the store keys
+        # encode; the model config is the only place that knows.
+        pic_set_tp_kv_heads(self.model_config.get_total_num_kv_heads())
         if pic_config.enabled and (
             pic_config.capture_live or pic_config.restore_live
         ):

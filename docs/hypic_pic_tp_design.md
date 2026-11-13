@@ -55,20 +55,33 @@
 
 ## 4. 设计
 
-### 4.1 键 schema v2：每个键都带 rank
+### 4.1 键：与 MooncakeStoreConnector 对齐
 
-```
-segment/<hash>/group-<gid>/tp-<rank>-of-<size>
-segment/<hash>/hybrid-state/tp-<rank>-of-<size>
-```
+参考对象是 llm/distributed/kv_transfer/kv_connector/v1/mooncake/store/（**KV store 版**，不是 P/D 的
+TransferEngine）。它的键是：
 
-- **每个 TP 大小都带后缀，包括 TP=1**（`tp-0-of-1`）。理由与原生 connector 一致：它对 rank 是
-  **无条件感知**的——用 `hostname:port` 定位 rank（`remote_session = f"{meta.remote_hostname}:{meta.remote_port}"`），
-  `remote_tp_size` / `remote_tp_rank` 永远在元数据里，没有 `size == 1` 的特殊分支，TP=1 只是退化情形。
-  我们的寻址靠共享 object store 的键，所以 rank 只能写进键里。
-- 副作用（可接受）：TP=1 的键格式变了一次，已发布的旧对象自然 miss——缓存，代价是一次重算。
-- 读侧必须用**自己的 rank** 去查；查不到就是 miss（不做"取任意一个 rank 的"这种容错——那是错数据）；
-  且不同 TP 大小的缓存**不会互相误命中**（`of-<size>` 不同）。
+`python
+# store/data.py:58-67
+f"{model_name}@tp_rank:{tp_rank}@pcp{pcp_rank}@dcp{dcp_rank}@pp_rank:{pp_rank}@group:{group_id}@{chunk_hash}"
+`
+
+我们沿用它的**组件顺序与写法**，保留可读的段前缀：
+
+`
+segment/<hash>/group-<gid>@tp_rank:<shard>@pp_rank:0
+segment/<hash>/hybrid-state@tp_rank:<shard>@tp_size:<n>@pp_rank:0
+`
+
+- **rank 恒在键里**（含 TP=1），与原生一致：原生靠 host:port 寻址，我们靠键，所以只能写进键。
+- **状态多加 @tp_size**：KV 的分片索引在折叠后等价于 head 索引，跨 TP 大小是同内容；而状态是
+  
+um_v_heads / tp 个 head 一片，四卡算出的 transition 不是两卡要的那份，所以大小必须进键。
+- **复制折叠**（store/worker.py:960-965）：
+um_kv_heads < tp_size 时
+  put_step = tp_size // num_kv_heads、shard = tp_rank // put_step——多个 rank 写同一个键、同一份
+  字节，store 里只留一份。
+- **查找要全员到齐**（store/worker.py:1402-1408）：expected_per_key = tp_count * pp_size，
+  我们用 atch_is_exist 一次问所有 shard，缺一即 miss。
 
 ### 4.2 发布：每 rank 各自发布自己那片
 

@@ -1259,6 +1259,18 @@ class _PinnedStagingPool:
             return self.allocations, self._capacity, len(self._free) + self._busy
 
 
+# The number of key/value heads the model has, set once at start-up.  When it is smaller than the tensor
+# parallel size several ranks hold the same KV shard, and the connector this follows writes one copy:
+# ``put_step = tp_size // num_kv_heads``, with ``tp_rank // put_step`` naming the shard.
+_TP_NUM_KV_HEADS = 0
+
+
+def pic_set_tp_kv_heads(num_kv_heads: int) -> None:
+    """Tell the key builder how many KV heads the model has."""
+    global _TP_NUM_KV_HEADS
+    _TP_NUM_KV_HEADS = max(0, int(num_kv_heads))
+
+
 def _pic_tp_rank_and_size() -> tuple[int, int]:
     """This rank's tensor-parallel identity, or (0, 1) before the groups exist."""
     try:
@@ -1272,37 +1284,72 @@ def _pic_tp_rank_and_size() -> tuple[int, int]:
         return 0, 1
 
 
-def pic_tp_key_suffix() -> str:
-    """Key suffix naming this rank's shard, present at every TP size.
+def _pic_tp_put_step(tp_size: int, num_kv_heads: int) -> int:
+    """Ranks that share one KV shard, mirroring MooncakeStoreConnector."""
+    if num_kv_heads <= 0 or num_kv_heads >= tp_size:
+        return 1
+    return max(1, tp_size // num_kv_heads)
 
-    Always present, including TP=1, so one key format describes every deployment: the native Mooncake
-    connector is rank-aware unconditionally too - it addresses a rank by host and port rather than by
-    special-casing size one.  A single-GPU deployment therefore writes tp-0-of-1, and a segment published
-    there simply misses for a reader at another size instead of being mistaken for its shard.
 
-    Above one rank the shard is real: the recurrent state is split by head and the convolution by channel,
-    so two ranks writing one key would overwrite each other with no shape check to notice.
+def pic_tp_shard_rank() -> int:
+    """Index of this rank's KV shard.
+
+    Mirrors ``head_or_tp_rank`` in MooncakeStoreConnector: with fewer KV heads than ranks the shard index
+    is the head index, so several ranks write the same key with the same bytes and the store keeps one.
     """
     rank, size = _pic_tp_rank_and_size()
-    return f"/tp-{rank}-of-{size}"
+    return rank // _pic_tp_put_step(size, _TP_NUM_KV_HEADS)
+
+
+def pic_tp_shard_count() -> int:
+    """How many distinct KV shards exist at this tensor-parallel size."""
+    _, size = _pic_tp_rank_and_size()
+    return max(1, size // _pic_tp_put_step(size, _TP_NUM_KV_HEADS))
+
+
+def pic_tp_key_suffix() -> str:
+    """Key components naming the shard, in the order MooncakeStoreConnector uses.
+
+    ``@tp_rank:<shard>@pp_rank:<rank>`` - always present, at every TP size, because the addressing here is
+    a key in a shared store rather than a peer address, and a shard written at one size must never be read
+    as a shard at another.
+    """
+    _, size = _pic_tp_rank_and_size()
+    if size <= 1:
+        return "@tp_rank:0@pp_rank:0"
+    return f"@tp_rank:{pic_tp_shard_rank()}@pp_rank:0"
+
+
+def pic_tp_state_suffix() -> str:
+    """Suffix for the recurrent transition.
+
+    The state is split ``num_v_heads / tp`` heads per rank, which is not the same partition as the KV
+    shard index, so the size is part of the key: a transition computed by four ranks is not the transition
+    a two-rank deployment needs.
+    """
+    _, size = _pic_tp_rank_and_size()
+    return f"@tp_rank:{pic_tp_shard_rank()}@tp_size:{size}@pp_rank:0"
 
 
 def pic_peer_tp_suffixes() -> tuple[str, ...]:
-    """Suffixes of the other ranks' shards, empty at TP=1."""
-    rank, size = _pic_tp_rank_and_size()
-    if size <= 1:
+    """Suffixes of the other shards, empty when there is only one."""
+    count = pic_tp_shard_count()
+    if count <= 1:
         return ()
-    return tuple(f"/tp-{other}-of-{size}" for other in range(size) if other != rank)
+    own = pic_tp_shard_rank()
+    return tuple(
+        f"@tp_rank:{other}@pp_rank:0" for other in range(count) if other != own
+    )
 
 
 def pic_native_kv_key(seg_hash: Any, group_id: int) -> str:
-    """Store key for one KV group of one segment, on this rank."""
+    """Store key for one KV group of one segment, on this rank's shard."""
     return f"segment/{seg_hash.hex()}/group-{int(group_id)}{pic_tp_key_suffix()}"
 
 
 def pic_hybrid_state_key(seg_hash: Any) -> str:
     """Store key for the recurrent transition of one segment, on this rank."""
-    return f"segment/{seg_hash.hex()}/hybrid-state{pic_tp_key_suffix()}"
+    return f"segment/{seg_hash.hex()}/hybrid-state{pic_tp_state_suffix()}"
 
 
 class MooncakeNativeKVObjectStore:
@@ -1390,15 +1437,33 @@ class MooncakeNativeKVObjectStore:
             return key
         return f"{prefix}{key}"
 
-    def _tp_peers_published(self, key_without_suffix: str) -> bool:
-        """Whether every other rank published its shard of this key.
+    def _tp_peers_published(self, key_without_suffix: str, suffix_for: Any) -> bool:
+        """Whether every other shard of this key was published.
 
-        A segment is only reusable when all ranks published: applying the shards of two ranks out of four
-        would be wrong in a way no shape check catches.  At TP=1 there is nothing to wait for.
+        A segment is only reusable when all of its shards exist: applying two shards out of four would be
+        wrong in a way no shape check catches.  One ``batch_is_exist`` asks the store once, which is how
+        MooncakeStoreConnector does it; stores without that call fall back to one probe per shard.
         """
-        for suffix in pic_peer_tp_suffixes():
+        key = self._key(key_without_suffix)
+        peers = [f"{key}{other}/manifest" for other in suffix_for()]
+        if not peers:
+            return True
+        batch = getattr(self.store, "batch_is_exist", None)
+        if callable(batch):
             try:
-                raw = self.store.get(f"{self._key(key_without_suffix + suffix)}/manifest")
+                found = batch(peers)
+            except Exception:  # noqa: BLE001 - a failed probe is a miss
+                return False
+            return all(bool(value) for value in found)
+        probe = getattr(self.store, "is_exist", None)
+        if callable(probe):
+            try:
+                return all(bool(probe(item)) for item in peers)
+            except Exception:  # noqa: BLE001 - a failed probe is a miss
+                return False
+        for item in peers:
+            try:
+                raw = self.store.get(item)
             except Exception:  # noqa: BLE001 - absent is the answer
                 return False
             if not isinstance(raw, (bytes, bytearray, memoryview)) or not raw:
@@ -2991,7 +3056,9 @@ class PICMooncakeReferenceIndex:
                 return None
             external_key = pic_native_kv_key(segment.seg_hash, group_id)
             base_key = f"segment/{segment.seg_hash.hex()}/group-{int(group_id)}"
-            if pic_peer_tp_suffixes() and not self._tp_peers_published(base_key):
+            if pic_peer_tp_suffixes() and not self._tp_peers_published(
+                base_key, pic_peer_tp_suffixes
+            ):
                 _pic_lookup_miss(
                     "tp_shard_missing",
                     key=base_key,
@@ -3076,7 +3143,7 @@ class PICMooncakeReferenceIndex:
         if self.require_hybrid_state:
             base_transition_key = f"segment/{segment.seg_hash.hex()}/hybrid-state"
             if pic_peer_tp_suffixes() and not self._tp_peers_published(
-                base_transition_key
+                base_transition_key, pic_peer_tp_suffixes
             ):
                 _pic_lookup_miss(
                     "tp_shard_missing",
