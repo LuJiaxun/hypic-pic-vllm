@@ -57,31 +57,29 @@
 
 ### 4.1 键：与 MooncakeStoreConnector 对齐
 
-参考对象是 llm/distributed/kv_transfer/kv_connector/v1/mooncake/store/（**KV store 版**，不是 P/D 的
+参考对象是 `vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/`（**KV store 版**，不是 P/D 的
 TransferEngine）。它的键是：
 
-`python
+```python
 # store/data.py:58-67
 f"{model_name}@tp_rank:{tp_rank}@pcp{pcp_rank}@dcp{dcp_rank}@pp_rank:{pp_rank}@group:{group_id}@{chunk_hash}"
-`
+```
 
-我们沿用它的**组件顺序与写法**，保留可读的段前缀：
+我们沿用它的**组件写法**，保留可读的段前缀：
 
-`
+```
 segment/<hash>/group-<gid>@tp_rank:<shard>@pp_rank:0
 segment/<hash>/hybrid-state@tp_rank:<shard>@tp_size:<n>@pp_rank:0
-`
+```
 
-- **rank 恒在键里**（含 TP=1），与原生一致：原生靠 host:port 寻址，我们靠键，所以只能写进键。
-- **状态多加 @tp_size**：KV 的分片索引在折叠后等价于 head 索引，跨 TP 大小是同内容；而状态是
-  
-um_v_heads / tp 个 head 一片，四卡算出的 transition 不是两卡要的那份，所以大小必须进键。
-- **复制折叠**（store/worker.py:960-965）：
-um_kv_heads < tp_size 时
-  put_step = tp_size // num_kv_heads、shard = tp_rank // put_step——多个 rank 写同一个键、同一份
+- **rank 恒在键里**（含 TP=1）：原生靠 `host:port` 寻址，我们靠键，所以只能写进键。
+- **状态多加 `@tp_size`**：KV 的分片索引折叠后等价于 head 索引，跨 TP 大小是同内容；而状态是
+  `num_v_heads / tp` 个 head 一片，四卡算出的 transition 不是两卡要的那份，所以大小必须进键。
+- **复制折叠**（`store/worker.py:960-965`）：`num_kv_heads < tp_size` 时
+  `put_step = tp_size // num_kv_heads`、`shard = tp_rank // put_step`——多个 rank 写同一个键、同一份
   字节，store 里只留一份。
-- **查找要全员到齐**（store/worker.py:1402-1408）：expected_per_key = tp_count * pp_size，
-  我们用 atch_is_exist 一次问所有 shard，缺一即 miss。
+- **查找要全员到齐**（`store/worker.py:1402-1408`）：原生要求
+  `expected_per_key = tp_count * pp_size`；我们用 `batch_is_exist` 一次问所有 shard，缺一即 miss。
 
 ### 4.2 发布：每 rank 各自发布自己那片
 
