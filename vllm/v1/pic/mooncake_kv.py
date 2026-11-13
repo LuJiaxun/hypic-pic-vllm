@@ -1383,6 +1383,9 @@ class MooncakeNativeKVObjectStore:
         # binding does not expose it, in which case the three-argument form is tried.
         self._replicate_config_ready = False
         self._replicate_config_value: Any = None
+        # Layer name to KV tensor, handed over once by the worker.  A receive that can address the
+        # destination blocks needs them; without them it falls back to the host arena.
+        self._kv_cache_layers: dict[str, Any] = {}
         # One arena per import thread, all grown to the largest object seen: the
         # pin and the registration are paid once instead of once per object.
         staging_slots = 4
@@ -1501,6 +1504,15 @@ class MooncakeNativeKVObjectStore:
     def _check_status(result: Any, operation: str) -> None:
         if result not in (None, 0):
             raise RuntimeError(f"Mooncake {operation} failed: {result}")
+
+    def set_kv_caches(self, kv_caches: Mapping[str, Any]) -> None:
+        """Remember the layer tensors so a receive can address its destination directly."""
+        self._kv_cache_layers = {
+            str(name): tensor for name, tensor in kv_caches.items()
+        }
+        logger.warning(
+            "PIC-DIRECT kv-layers registered layers=%d", len(self._kv_cache_layers)
+        )
 
     def _replicate_config(self) -> Any:
         """The store's replicate config, or None when the binding does not have one."""
@@ -1680,7 +1692,11 @@ class MooncakeNativeKVObjectStore:
     def _get_batch_into_segments(
         self, entries: Sequence[tuple[str, Sequence[tuple[int, int]]]]
     ) -> bool:
-        """Read several objects straight into their destination segments."""
+        """Read several objects straight into their destination segments.
+
+        The store answers with the bytes it moved for each key - not a status - so a negative value is the
+        failure signal and anything else is a count.
+        """
         if not self._gpu_direct_enabled() or not entries:
             return False
         for _, segments in entries:
@@ -3209,6 +3225,35 @@ class MooncakeNativeKVObjectStore:
         ids = tuple(int(block_id) for block_id in block_ids)
         if len(ids) != obj.block_count or len(set(ids)) != len(ids):
             raise ValueError("native KV destination block span does not match object")
+        # Straight into the destination blocks when the worker handed over the layers: the blocks are the
+        # same span the publisher wrote, so the segment list is computable on this side too.
+        if self._kv_cache_layers and self._gpu_direct_enabled():
+            direct: list[tuple[str, list[tuple[int, int]]]] = []
+            for member in obj.layers:
+                target = self._kv_cache_layers.get(member.layer_name)
+                if target is None:
+                    logger.warning(
+                        "PIC-DIRECT receive break: no layer %s", member.layer_name
+                    )
+                    direct = []
+                    break
+                segments = self._layer_block_segments(
+                    target, ids, obj.layout, for_device=target.device
+                )
+                if segments is None:
+                    logger.warning(
+                        "PIC-DIRECT receive break: segments %s", member.layer_name
+                    )
+                    direct = []
+                    break
+                direct.append((member.key, segments))
+            logger.warning(
+                "PIC-DIRECT receive direct_layers=%d segments=%d",
+                len(direct),
+                sum(len(segments) for _, segments in direct),
+            )
+            if direct and self._get_batch_into_segments(direct):
+                return PICNativeKVReceived(obj=obj)
         plan, total = self._native_host_plan(obj)
         arena, release = self._rent_native_arena(obj.external_key, total)
         base = int(arena.data_ptr())
