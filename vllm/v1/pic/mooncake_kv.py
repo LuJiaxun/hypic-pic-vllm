@@ -2637,6 +2637,47 @@ class MooncakeNativeKVObjectStore:
         targets: dict[str, Any] = {}
         representation = "store-host-staging"
         elapsed_ms = 0.0
+        # Every tensor's dtype and shape is in the layout, so the destinations can be device allocations
+        # handed to the store: one call, nothing staged on the host.
+        if getattr(device, "type", None) == "cuda" and self._gpu_direct_enabled():
+            direct: dict[str, Any] = {}
+            direct_addrs: list[list[int]] = []
+            direct_sizes: list[list[int]] = []
+            usable = True
+            for role, record in records:
+                try:
+                    dtype = _dtype_from_name(str(record["dtype"]))
+                    shape = tuple(int(size) for size in record["shape"])
+                    nbytes = int(record["nbytes"])
+                    tensor = _torch().empty(shape, dtype=dtype, device=device)
+                except Exception:  # noqa: BLE001 - fall back to the host path
+                    usable = False
+                    break
+                if int(tensor.numel()) * int(tensor.element_size()) != nbytes:
+                    usable = False
+                    break
+                direct[role] = tensor
+                direct_addrs.append([int(tensor.data_ptr())])
+                direct_sizes.append([nbytes])
+            if usable and direct:
+                try:
+                    start = time.perf_counter()
+                    result = batch_get(keys, direct_addrs, direct_sizes)
+                    elapsed_ms = (time.perf_counter() - start) * 1000.0
+                except Exception:  # noqa: BLE001 - fall back to the host path
+                    result = None
+                if result is not None and self._store_batch_succeeded(
+                    result, len(keys)
+                ):
+                    targets = direct
+                    representation = "device-direct"
+                    logger.warning(
+                        "PIC-DIRECT transition representation=device-direct tensors=%d bytes=%d "
+                        "status=%s",
+                        len(keys),
+                        sum(int(record["nbytes"]) for _, record in records),
+                        result,
+                    )
         if not targets:
             host_plan, total = self._store_state_host_layout(records=records)
             on_cuda = getattr(device, "type", None) == "cuda"
