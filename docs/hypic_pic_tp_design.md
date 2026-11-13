@@ -151,13 +151,40 @@ block id、segment 划分、seam、窗口都在 scheduler 侧算一次，各 ran
 
 ---
 
-## 8. 开放问题（实现前必须回答）
+## 8. Qwen3.5 的切分维度（已确认）
 
-1. Qwen3.5 的 GDN 在 TP=2 下，recurrent state 是否按 head 切？——**决定矩阵是否 per-rank**
-   （本设计的假设是"切"，需要在 `qwen_gdn_linear_attn.py` 里确认 `num_v_heads` 的切分）。
-2. 全注意力层的 KV 在 TP=2 下是否按 KV head 切？——GQA 下是（`num_kv_heads` 切），
-   MLA 可能不是。
-3. block id 在 TP 下是否全 rank 一致？——**是**（block table 由 scheduler 分配，各 rank 复制），
-   但要在代码里确认 `block_table` 没有被切成 per-rank。
-4. 发布时的 D2H 带宽：TP=2 时每个 rank 各发一半，**总时间应该不变**；若变慢，说明 staging 池
-   被两倍数量的对象打散（可参考现有 `slots=4` 预热逻辑）。
+**GDN 的时序状态按 head 切；卷积状态按 channel 切；`head_v_dim` / `head_k_dim` 不切。**
+
+```python
+# vllm/model_executor/layers/mamba/mamba_utils.py:229-233
+temporal_state_shape = (
+    divide(num_v_heads, tp_world_size),   # heads 切成每 rank
+    head_v_dim,                            # v 维整块
+    head_k_dim,                            # k 维整块
+)
+```
+
+```python
+# vllm/model_executor/layers/mamba/mamba_utils.py:223-227
+conv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads
+conv_state_shape = _orient_conv_shape(divide(conv_dim, tp_world_size), ...)
+```
+
+图层侧处处是 `num_v_heads // self.tp_size`（`qwen_gdn_linear_attn.py:1100-1101`、`:1418`、
+`:1577-1578`），与上面的状态形状一致。
+
+**对本设计的影响**：
+
+| 状态 | 每 rank 形状 | 迁移算子 | 是否精确 |
+|---|---|---|---|
+| 时序状态 `h` | `[heads/tp, v, k]` | `h @ T_r + C_r`，`T_r=[heads/tp,k,k]` | **是**（按 head 块对角） |
+| 卷积状态 | `[tokens, channels/tp]` | 滚动窗口，逐 channel，无通道间耦合 | **是**（depthwise） |
+
+所以第 3 节的公式**直接成立**：`T` 无需广播、无需 gather，`C` 也无需按 v 分段。
+
+### 仍需确认的
+
+1. **全注意力层的 KV**：GQA 下按 `num_kv_heads` 切；若目标是 MLA 类模型需另行确认。
+2. **block id 全 rank 一致**：block table 由 scheduler 分配、各 rank 复制（预期一致，实现时加断言）。
+3. **D2H 带宽**：TP=2 每 rank 各发一半，**总时间应不变**；若变慢，说明 staging 池被两倍数量的
+   对象打散（可参考现有 `slots=4` 预热逻辑）。
