@@ -1553,9 +1553,6 @@ class MooncakeNativeKVObjectStore:
         self._kv_cache_layers = {
             str(name): tensor for name, tensor in kv_caches.items()
         }
-        logger.warning(
-            "PIC-DIRECT kv-layers registered layers=%d", len(self._kv_cache_layers)
-        )
 
     def _replicate_config(self) -> Any:
         """The store's replicate config, or None when the binding does not have one."""
@@ -1572,16 +1569,10 @@ class MooncakeNativeKVObjectStore:
     def _gpu_direct_enabled(self) -> bool:
         """Whether the store can move bytes to and from a device buffer directly."""
         if not self._gpu_direct_available:
-            logger.warning("PIC-DIRECT enabled=False reason=_gpu_direct_available")
             return False
         get_into = getattr(self.store, "batch_get_into_multi_buffers", None)
         put = getattr(self.store, "batch_put_from_multi_buffers", None)
         if not callable(get_into) or not callable(put):
-            logger.warning(
-                "PIC-DIRECT enabled=False reason=api get_into=%s put=%s",
-                callable(get_into),
-                callable(put),
-            )
             return False
         return True
 
@@ -1618,14 +1609,8 @@ class MooncakeNativeKVObjectStore:
         before all value blocks - so it is derived from the axes rather than assumed.
         """
         if int(kv_cache.data_ptr()) == 0:
-            logger.warning("PIC-DIRECT segments=None reason=data_ptr == 0")
             return None
         if kv_cache.device != for_device:
-            logger.warning(
-                "PIC-DIRECT segments=None reason=device %s != %s",
-                kv_cache.device,
-                for_device,
-            )
             return None
         kv_axis, block_axis = _native_cache_axes(kv_cache, layout=layout)
         element = kv_cache.element_size()
@@ -1635,14 +1620,6 @@ class MooncakeNativeKVObjectStore:
         expected = element
         for axis in range(len(kv_cache.shape) - 1, block_axis, -1):
             if strides[axis] != expected:
-                logger.warning(
-                    "PIC-DIRECT segments=None reason=block tail not contiguous shape=%s strides=%s "
-                    "axis=%d expected=%d",
-                    tuple(kv_cache.shape),
-                    tuple(strides),
-                    axis,
-                    expected,
-                )
                 return None
             expected *= int(kv_cache.shape[axis])
         # Pinning this range is optional; the call below is what decides whether the store can take it.
@@ -1719,28 +1696,9 @@ class MooncakeNativeKVObjectStore:
             try:
                 status = put(keys, addrs, sizes)
             except Exception as exc:  # noqa: BLE001 - fall back to the staged path
-                logger.warning(
-                    "PIC-DIRECT put raised entries=%d segments=%d error=%r",
-                    len(entries),
-                    sum(len(segments) for _, segments in entries),
-                    exc,
-                )
                 return False
         except Exception as exc:  # noqa: BLE001 - fall back to the staged path
-            logger.warning(
-                "PIC-DIRECT put raised entries=%d segments=%d error=%r",
-                len(entries),
-                sum(len(segments) for _, segments in entries),
-                exc,
-            )
             return False
-        logger.warning(
-            "PIC-DIRECT put status=%s entries=%d segments=%d first_key=%s",
-            status,
-            len(entries),
-            sum(len(segments) for _, segments in entries),
-            entries[0][0] if entries else "",
-        )
         return (
             status is not None
             and len(status) == len(entries)
@@ -1768,20 +1726,7 @@ class MooncakeNativeKVObjectStore:
                 [[nbytes for _, nbytes in segments] for _, segments in entries],
             )
         except Exception as exc:  # noqa: BLE001 - fall back to the staged path
-            logger.warning(
-                "PIC-DIRECT get_into raised entries=%d segments=%d error=%r",
-                len(entries),
-                sum(len(segments) for _, segments in entries),
-                exc,
-            )
             return False
-        logger.warning(
-            "PIC-DIRECT get_into status=%s entries=%d segments=%d first_key=%s",
-            status,
-            len(entries),
-            sum(len(segments) for _, segments in entries),
-            entries[0][0] if entries else "",
-        )
         return (
             status is not None
             and len(status) == len(entries)
@@ -2107,22 +2052,11 @@ class MooncakeNativeKVObjectStore:
                             kv_cache, ids, layout, for_device=device
                         )
                     if segments is None:
-                        logger.warning(
-                            "PIC-DIRECT publish plan abandoned layer=%s", layer_name
-                        )
                         entries = []
                         break
                     entries.append((f"{base_key}/layers/{layer_name}", segments))
-                logger.warning(
-                    "PIC-DIRECT publish planned=%d entries=%d segments=%d ids=%s",
-                    len(planned),
-                    len(entries),
-                    sum(len(segments) for _, segments in entries),
-                    list(ids),
-                )
                 if entries:
                     sent_all = self._put_batch_from_segments(entries)
-                logger.warning("PIC-DIRECT publish sent_all=%s", sent_all)
             if not sent_all and not _pic_payload_checksum_enabled():
                 staging = self._scratch_for(int(total_bytes), "publish")
             if staging is not None and not sent_all:
@@ -2486,19 +2420,6 @@ class MooncakeNativeKVObjectStore:
 
     def _store_state_cache_key(self, external_key: str, device: Any) -> str:
         return f"{external_key}|device={device}"
-
-    def _release_store_state_entry(
-        self, cache_key: str, entry: dict[str, Any]
-    ) -> None:
-        current = self._store_state_buffers.get(cache_key)
-        if current is not entry:
-            return
-        entry["users"] = int(entry.get("users", 1)) - 1
-        if entry["users"] > 0:
-            return
-        self._store_state_buffers.pop(cache_key, None)
-        self._release_store_state_buffers(entry)
-
     def _discard_store_state_entry(self, cache_key: str) -> None:
         entry = self._store_state_buffers.get(cache_key)
         if entry is None or int(entry.get("users", 0)) != 0:
@@ -2563,66 +2484,6 @@ class MooncakeNativeKVObjectStore:
         if len(statuses) != expected:
             return False
         return all(int(status) >= 0 for status in statuses)
-
-    def _store_state_host_layout(
-        self,
-        *,
-        records: Sequence[tuple[str, Mapping[str, Any]]],
-    ) -> tuple[dict[str, tuple[int, int]], int]:
-        """Compute aligned offsets for one packed state transfer.
-
-        The arena itself comes from the staging pool, so this stays a pure layout
-        step: it runs once per object and must not allocate anything.
-        """
-        plan: dict[str, tuple[int, int]] = {}
-        total = 0
-        alignment = _COMPACT_TRANSITION_ALIGNMENT
-        for role, record in records:
-            nbytes = int(record["nbytes"])
-            if nbytes <= 0:
-                raise ValueError(f"invalid Store transition tensor metadata: {role}")
-            offset = ((total + alignment - 1) // alignment) * alignment
-            plan[role] = (offset, nbytes)
-            total = offset + nbytes
-        return plan, total
-
-    def _store_state_host_targets(
-        self,
-        *,
-        entry: dict[str, Any],
-        records: Sequence[tuple[str, Mapping[str, Any]]],
-        host_plan: Mapping[str, tuple[int, int]],
-        host: Any,
-        device: Any,
-    ) -> dict[str, Any]:
-        """Upload the arena once and build aligned device views."""
-        cache = entry.setdefault("host_staging", {})
-        device_tensor = cache.get("device")
-        self._last_transition_upload_ms = 0.0
-        if device_tensor is None or str(device_tensor.device) != str(device):
-            # Blocking on purpose: the operator becomes visible to the caller
-            # right after this, and a same-stream ordering assumption would
-            # break as soon as the forward runs on a non-default stream.
-            upload_start = time.perf_counter()
-            device_tensor = _h2d_on_private_stream(host, device)
-            self._last_transition_upload_ms = (
-                time.perf_counter() - upload_start
-            ) * 1000.0
-            cache["device"] = device_tensor
-        targets: dict[str, Any] = {}
-        for role, record in records:
-            offset, nbytes = host_plan[role]
-            targets[role] = _compact_arena_tensor(
-                device_tensor,
-                {
-                    "dtype": record["dtype"],
-                    "shape": record["shape"],
-                    "offset": offset,
-                    "nbytes": nbytes,
-                },
-            )
-        return targets
-
     def _load_transition_operator_store(
         self, manifest: PICHybridStateObject, *, device: Any
     ) -> PICTransitionOperator:
@@ -2656,12 +2517,7 @@ class MooncakeNativeKVObjectStore:
             except Exception:  # noqa: BLE001 - fall back to the host arena
                 slab = None
             if slab is not None:
-                logger.warning(
-                    "PIC-DIRECT transition representation=device-direct tensors=%d bytes=%d status=%s",
-                    len(records),
-                    total,
-                    result,
-                )
+                pass
         if slab is None:
             representation = "store-host-staging"
             host = _torch().empty(total, dtype=_torch().uint8, pin_memory=on_cuda)
@@ -2911,21 +2767,11 @@ class MooncakeNativeKVObjectStore:
         # Straight into the request's blocks when the store can address them: the destination is a list
         # of per-block segments, so there is nothing to stage.  Validation runs first - a mismatch must
         # fail before a byte is written.
-        logger.warning(
-            "PIC-DIRECT restore profile=%s verify_checksum=%s layers=%d",
-            profile,
-            verify_checksum,
-            len(obj.layers),
-        )
         if not profile and not verify_checksum:
             direct_entries: list[tuple[str, list[tuple[int, int]]]] = []
             for member in obj.layers:
                 target = kv_caches.get(member.layer_name)
                 if target is None:
-                    logger.warning(
-                        "PIC-DIRECT restore break: no target layer=%s",
-                        member.layer_name,
-                    )
                     direct_entries = []
                     break
                 _, target_block_axis = _native_cache_axes(target, layout=obj.layout)
@@ -2936,41 +2782,18 @@ class MooncakeNativeKVObjectStore:
                     )
                     if position != target_block_axis
                 ):
-                    logger.warning(
-                        "PIC-DIRECT restore break: shape layer=%s target=%s want=%s",
-                        member.layer_name,
-                        tuple(target.shape),
-                        tuple(member.shape),
-                    )
                     direct_entries = []
                     break
                 if _dtype_name(target.dtype) != member.dtype:
-                    logger.warning(
-                        "PIC-DIRECT restore break: dtype layer=%s target=%s want=%s",
-                        member.layer_name,
-                        _dtype_name(target.dtype),
-                        member.dtype,
-                    )
                     direct_entries = []
                     break
                 segments = self._layer_block_segments(
                     target, ids, obj.layout, for_device=target.device
                 )
                 if segments is None:
-                    logger.warning(
-                        "PIC-DIRECT restore break: segments layer=%s contiguous=%s device=%s",
-                        member.layer_name,
-                        target.is_contiguous(),
-                        target.device,
-                    )
                     direct_entries = []
                     break
                 direct_entries.append((member.key, segments))
-            logger.warning(
-                "PIC-DIRECT restore direct_entries=%d segments=%d",
-                len(direct_entries),
-                sum(len(segments) for _, segments in direct_entries),
-            )
             if direct_entries and self._get_batch_into_segments(direct_entries):
                 if profile:
                     logger.warning(
@@ -3327,9 +3150,6 @@ class MooncakeNativeKVObjectStore:
             for member in obj.layers:
                 target = self._kv_cache_layers.get(member.layer_name)
                 if target is None:
-                    logger.warning(
-                        "PIC-DIRECT receive break: no layer %s", member.layer_name
-                    )
                     direct = []
                     break
                 flat = _pic_flat_run(target, ids, obj.layout)
@@ -3345,17 +3165,9 @@ class MooncakeNativeKVObjectStore:
                         target, ids, obj.layout, for_device=target.device
                     )
                 if segments is None:
-                    logger.warning(
-                        "PIC-DIRECT receive break: segments %s", member.layer_name
-                    )
                     direct = []
                     break
                 direct.append((member.key, segments))
-            logger.warning(
-                "PIC-DIRECT receive direct_layers=%d segments=%d",
-                len(direct),
-                sum(len(segments) for _, segments in direct),
-            )
             if direct and self._get_batch_into_segments(direct):
                 return PICNativeKVReceived(obj=obj)
         plan, total = self._native_host_plan(obj)
@@ -3371,12 +3183,6 @@ class MooncakeNativeKVObjectStore:
             addrs.append([base + offset])
             sizes.append([nbytes])
             layout.append((member.layer_name, offset, nbytes))
-        logger.warning(
-            "PIC-DIRECT receive arena=host layers=%d bytes=%d roles=%s",
-            len(keys),
-            total,
-            "host-arena",
-        )
         start = time.perf_counter()
         try:
             result = batch_get(keys, addrs, sizes)
@@ -3384,11 +3190,6 @@ class MooncakeNativeKVObjectStore:
             release()
             raise
         elapsed_ms = (time.perf_counter() - start) * 1000.0
-        logger.warning(
-            "PIC-DIRECT receive status=%s keys=%d",
-            result,
-            len(keys),
-        )
         if not self._store_batch_succeeded(result, len(keys)):
             release()
             raise RuntimeError("Mooncake native KV batch receive failed")
