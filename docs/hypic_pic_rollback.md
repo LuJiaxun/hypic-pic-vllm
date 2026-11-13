@@ -73,6 +73,9 @@ python3 -c "import vllm.v1.pic.state, vllm.v1.pic.native_kv, vllm.v1.pic.mooncak
 | `vllm/config/pic.py: async_import` | **默认已改为 True**（阻塞式导入是它替换掉的旧行为）；要回到 C1b 的阻塞路径，把它改成 False 并重启 |
 | `--pic-enable`（去掉） | 整条 PIC 关闭，等同全量 prefill |
 | `HYPIC_PIC_DEBUG`（unset） | 诊断日志全关（生产默认） |
+| ~~`HYPIC_PIC_NATIVE_KV_DIRECT`~~ | **已删除**：直连不再有开关，store 有 API 就走直连 |
+| ~~`HYPIC_PIC_NATIVE_ARENA_CACHE_BYTES`~~ / ~~`HYPIC_PIC_KV_ARENA_BYTES`~~ | **已删除**：host arena 整条移除 |
+| `PIC_TP` / `PIC_CUDA_A` / `PIC_CUDA_B` | 测试脚本用：TP 大小与两侧设备 |
 
 守卫已删除，**默认值就是安全阀**。
 
@@ -89,3 +92,15 @@ python3 -c "import vllm.v1.pic.state, vllm.v1.pic.native_kv, vllm.v1.pic.mooncak
 5. **已知剩余成本**（tail 61 ms、物化 10–17 ms、每请求 91 MB 传输）。
 
 **第 3 条最重要**：一个封版如果只写“跑通了”，下一个人会把“执行正确”读成“结果正确”。
+
+## 5. 当前传输形态（2026-11-13 起）
+
+| 方向 | 路径 |
+|---|---|
+| 发布 | `batch_put_from_multi_buffers`：连续块是一段物理连续区，**每层 1 段、无 gather** |
+| 接收 | `batch_get_into_multi_buffers`：**直接写目标块**，`host_staging=None`，无 H2D |
+| transition | **1 个对象 / 1 块 36.6 MB 设备 slab**，按偏移切 54 个视图 |
+| 失败语义 | store 无 API 或返回负值 → **抛错**（不再静默走 host） |
+
+**host staging 已删除**（`_PinnedStagingPool`、arena 租还/预热、`PICNativeKVHostStaging`），
+见 `hypic_pic_tp_design.md` §9。
