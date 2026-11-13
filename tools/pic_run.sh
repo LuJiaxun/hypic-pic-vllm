@@ -26,7 +26,7 @@ VLLM_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"           # <repo>
 BASE="${PIC_BASE:-$VLLM_DIR/tests/v1/pic/fixtures/a}"
 TRACE_DIR="${PIC_TRACE_DIR:-$VLLM_DIR/tests/v1/pic/trace}"
 LOG_DIR="${PIC_LOG_DIR:-$VLLM_DIR/tests/v1/pic/logs}"
-MODEL="${PIC_MODEL:-}"
+MODEL="${PIC_MODEL:-/path/to/Qwen3.5-2B}"
 MOONCAKE_CONFIG="${PIC_MOONCAKE:-$LOG_DIR/mooncake_config.json}"
 mkdir -p "$TRACE_DIR" "$LOG_DIR"
 

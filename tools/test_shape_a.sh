@@ -12,7 +12,7 @@ FIX="$REPO_ROOT/tests/v1/pic/fixtures/a"
 LOG_DIR="${PIC_LOG_DIR:-$REPO_ROOT/tests/v1/pic/logs}"
 mkdir -p "$LOG_DIR"
 
-export PIC_MODEL="${PIC_MODEL:?set PIC_MODEL to the directory holding the model}"
+export PIC_MODEL="${PIC_MODEL:-/path/to/Qwen3.5-2B}"
 export PIC_BASE="$FIX"
 export PIC_DEBUG=1
 export PIC_LOG_DIR="$LOG_DIR"
