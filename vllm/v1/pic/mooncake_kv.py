@@ -2364,22 +2364,29 @@ class MooncakeNativeKVObjectStore:
         call into GPU destinations instead of reading and deserializing the
         large compact operator blob.
         """
-        objects: list[tuple[str, bytes]] = []
+        blob_key = f"{source_prefix}/store/state"
+        # Every tensor goes into one blob at a recorded offset: the store charges per object, and fifty
+        # of them cost more than the bytes they carry.
+        chunks: list[bytes] = []
+        cursor = 0
 
         def add_tensor(tensor: Any, role: str) -> dict[str, Any]:
+            nonlocal cursor
             if tensor is None:
                 raise ValueError("transition Store layout contains a null tensor")
             tensor = tensor.detach().contiguous()
             raw = _tensor_bytes(tensor)
             if not raw:
                 raise ValueError("transition Store layout contains an empty tensor")
-            key = f"{source_prefix}/store/{role}"
-            objects.append((key, raw))
+            offset = cursor
+            chunks.append(raw)
+            cursor += len(raw)
             return {
-                "key": key,
+                "key": blob_key,
                 "shape": [int(item) for item in tensor.shape],
                 "dtype": _dtype_name(tensor.dtype),
                 "nbytes": len(raw),
+                "offset": offset,
             }
 
         transitions: list[dict[str, Any]] = []
@@ -2449,14 +2456,16 @@ class MooncakeNativeKVObjectStore:
                 }
             )
 
+        blob = b"".join(chunks)
         return (
             {
                 "version": 1,
                 "token_count": operator.token_end - operator.token_start,
+                "blob": {"key": blob_key, "nbytes": len(blob)},
                 "transitions": transitions,
                 "conv_transitions": conv_transitions,
             },
-            tuple(objects),
+            ((blob_key, blob),),
         )
 
     def load_transition_manifest(self, external_key: str) -> PICHybridStateObject:
@@ -2626,124 +2635,72 @@ class MooncakeNativeKVObjectStore:
         if not callable(batch_get):
             raise NotImplementedError("Mooncake Store batch receive is unavailable")
 
-        cache_key = self._store_state_cache_key(manifest.external_key, device)
-        entry = self._store_state_buffers.get(cache_key)
-        if entry is None:
-            entry = {"buffers": {}, "users": 0}
-            self._store_state_buffers[cache_key] = entry
-
         records = self._store_layout_tensor_records(layout)
-        keys = [str(record["key"]) for _, record in records]
-        targets: dict[str, Any] = {}
-        representation = "store-host-staging"
+        blob = layout.get("blob") or {}
+        blob_key = str(blob.get("key") or "")
+        total = int(blob.get("nbytes") or 0)
+        if not blob_key or total <= 0:
+            raise ValueError("Store transition descriptor has no blob")
+        on_cuda = getattr(device, "type", None) == "cuda"
+        slab = None
+        representation = "device-direct"
         elapsed_ms = 0.0
-        # Every tensor's dtype and shape is in the layout, so the destinations can be device allocations
-        # handed to the store: one call, nothing staged on the host.
-        if getattr(device, "type", None) == "cuda" and self._gpu_direct_enabled():
-            direct: dict[str, Any] = {}
-            direct_addrs: list[list[int]] = []
-            direct_sizes: list[list[int]] = []
-            usable = True
-            for role, record in records:
-                try:
-                    dtype = _dtype_from_name(str(record["dtype"]))
-                    shape = tuple(int(size) for size in record["shape"])
-                    nbytes = int(record["nbytes"])
-                    tensor = _torch().empty(shape, dtype=dtype, device=device)
-                except Exception:  # noqa: BLE001 - fall back to the host path
-                    usable = False
-                    break
-                if int(tensor.numel()) * int(tensor.element_size()) != nbytes:
-                    usable = False
-                    break
-                direct[role] = tensor
-                direct_addrs.append([int(tensor.data_ptr())])
-                direct_sizes.append([nbytes])
-            if usable and direct:
-                try:
-                    start = time.perf_counter()
-                    result = batch_get(keys, direct_addrs, direct_sizes)
-                    elapsed_ms = (time.perf_counter() - start) * 1000.0
-                except Exception:  # noqa: BLE001 - fall back to the host path
-                    result = None
-                if result is not None and self._store_batch_succeeded(
-                    result, len(keys)
-                ):
-                    targets = direct
-                    representation = "device-direct"
-                    logger.warning(
-                        "PIC-DIRECT transition representation=device-direct tensors=%d bytes=%d "
-                        "status=%s",
-                        len(keys),
-                        sum(int(record["nbytes"]) for _, record in records),
-                        result,
-                    )
-        if not targets:
-            host_plan, total = self._store_state_host_layout(records=records)
-            on_cuda = getattr(device, "type", None) == "cuda"
-            if self._shared_staging:
-                host = self._staging_pool.acquire(total, pin=on_cuda)
-            else:
-                # Per-object arena, the behaviour before the pool existed.
-                cache = entry.setdefault("host_staging", {})
-                host = cache.get("host")
-                if host is None or int(host.numel()) < total:
-                    host = _torch().empty(
-                        total, dtype=_torch().uint8, pin_memory=on_cuda
-                    )
-                    cache["host"] = host
-                    cache["host_registered"] = (
-                        self._register_store_buffer_best_effort(
-                            address=int(host.data_ptr()),
-                            nbytes=int(host.numel()),
-                            role="transition-host-arena",
-                        )
-                    )
-                    cache["device"] = None
+        if on_cuda and self._gpu_direct_enabled():
             try:
-                addrs = [
-                    [int(host.data_ptr()) + host_plan[role][0]]
-                    for role, _ in records
-                ]
-                sizes = [[host_plan[role][1]] for role, _ in records]
+                slab = _torch().empty(total, dtype=_torch().uint8, device=device)
                 start = time.perf_counter()
-                result = batch_get(keys, addrs, sizes)
+                result = batch_get([blob_key], [[int(slab.data_ptr())]], [[total]])
                 elapsed_ms = (time.perf_counter() - start) * 1000.0
-                if not self._store_batch_succeeded(result, len(keys)):
-                    raise RuntimeError("Mooncake Store transition receive failed")
-                views_start = time.perf_counter()
-                targets = self._store_state_host_targets(
-                    entry=entry,
-                    records=records,
-                    host_plan=host_plan,
-                    host=host,
-                    device=device,
-                )
-            finally:
-                # The device copy is what the caller keeps, but the copy engine is still reading the
-                # host arena, so the arena goes back to the pool only once that copy is done - tracked
-                # by the pool, not waited for here, which is what made the upload synchronous.
-                if self._shared_staging:
-                    self._staging_pool.release(host, _h2d_last_upload.get("event"))
-            upload_ms = float(getattr(self, "_last_transition_upload_ms", 0.0) or 0.0)
-            views_ms = (time.perf_counter() - views_start) * 1000.0 - upload_ms
-            if _pic_import_profile_enabled():
-                # Splitting receive, upload and view construction is the only way
-                # to tell a slow link from a slow host-to-device copy: the two
-                # hide behind the same total and need different fixes.
-                last_upload = dict(_h2d_last_upload)
+                if not self._store_batch_succeeded(result, 1):
+                    slab = None
+            except Exception:  # noqa: BLE001 - fall back to the host arena
+                slab = None
+            if slab is not None:
                 logger.warning(
-                    "[PIC-PROFILE] transition-phases key=%s receive_ms=%.3f "
-                    "upload_ms=%.3f views_ms=%.3f total_ms=%.3f pinned=%s "
-                    "upload_device_ms=%.3f",
-                    manifest.external_key,
-                    elapsed_ms,
-                    upload_ms,
-                    max(views_ms, 0.0),
-                    elapsed_ms + upload_ms + max(views_ms, 0.0),
-                    last_upload.get("pinned"),
-                    float(last_upload.get("device_ms", 0.0) or 0.0),
+                    "PIC-DIRECT transition representation=device-direct tensors=%d bytes=%d status=%s",
+                    len(records),
+                    total,
+                    result,
                 )
+        if slab is None:
+            representation = "store-host-staging"
+            host = _torch().empty(total, dtype=_torch().uint8, pin_memory=on_cuda)
+            self._register_store_buffer_best_effort(
+                address=int(host.data_ptr()),
+                nbytes=int(host.numel()),
+                role="transition-host-arena",
+            )
+            start = time.perf_counter()
+            result = batch_get([blob_key], [[int(host.data_ptr())]], [[total]])
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if not self._store_batch_succeeded(result, 1):
+                raise RuntimeError("Mooncake Store transition receive failed")
+            slab = _h2d_on_private_stream(host, device)
+
+        targets: dict[str, Any] = {}
+        torch = _torch()
+        views_start = time.perf_counter()
+        for role, record in records:
+            offset = int(record["offset"])
+            nbytes = int(record["nbytes"])
+            dtype = _dtype_from_name(str(record["dtype"]))
+            shape = tuple(int(size) for size in record["shape"])
+            targets[role] = (
+                slab[offset : offset + nbytes]
+                .view(dtype)
+                .reshape(shape)
+            )
+        views_ms = (time.perf_counter() - views_start) * 1000.0
+        if _pic_import_profile_enabled():
+            logger.warning(
+                "[PIC-PROFILE] transition-phases key=%s receive_ms=%.3f "
+                "upload_ms=0.000 views_ms=%.3f total_ms=%.3f representation=%s",
+                manifest.external_key,
+                elapsed_ms,
+                views_ms,
+                elapsed_ms + views_ms,
+                representation,
+            )
 
         transitions: list[PICStateTransition] = []
         for index, item in enumerate(layout.get("transitions", ())):
@@ -2781,11 +2738,8 @@ class MooncakeNativeKVObjectStore:
             token_start=manifest.span_start,
             token_end=manifest.span_start + manifest.token_count,
         )
-        entry["users"] = int(entry.get("users", 0)) + 1
-        finalize(operator, self._release_store_state_entry, cache_key, entry)
-        # The device tensors may still be in flight; the reader waits on this event where it first
-        # reads them, which is one forward pass later.
-        register_pending_upload(operator, _h2d_last_upload.get("event"))
+        # The slab belongs to this operator now: the views are slices of it, so holding the operator
+        # holds the bytes.
         if _pic_import_profile_enabled():
             logger.warning(
                 "[PIC-PROFILE] transition-store-total key=%s "
